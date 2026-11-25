@@ -1,4 +1,4 @@
-use crate::hub::{exlr8, safe_path, wanted};
+use crate::hub::{exlr8_files, manifest_widths, safe_path, wanted};
 
 fn owned(list: &[&str]) -> Vec<String> {
     list.iter().map(|n| n.to_string()).collect()
@@ -56,7 +56,7 @@ fn exlr8_one_width() {
         "hashes/exlr8-layer-001.k3.sha256",
         "index-slices/tp4/k3/rank0.safetensors",
     ]);
-    let at = |k| exlr8(&names, k).join(" ");
+    let at = |k| exlr8_files(&names, k, None).join(" ");
     let head = "config.json dense/exlr8-dense-000.safetensors dense/exlr8-vocab.safetensors \
                 manifests/exlr8-manifest-bit309.json";
     let experts = "experts/exlr8-layer-001";
@@ -69,5 +69,52 @@ fn exlr8_one_width() {
         format!(
             "{head} {experts}.index.safetensors {experts}.k2.safetensors {experts}.k3.safetensors"
         )
+    );
+}
+
+#[test]
+fn exlr8_manifest_widths() {
+    let manifest = r#"{
+        "layers": {
+            "3": { "gate": [2, 2], "up": 2, "down": 2, "shared": { "gate": 4, "up": 4, "down": 4 } },
+            "23": { "gate": 3, "up": 3, "down": 3, "shared": { "gate": 4, "up": 4, "down": 4 } },
+            "78": { "gate": 3, "up": 3, "down": 3 }
+        }
+    }"#;
+    let widths = manifest_widths(manifest).unwrap();
+    let names = owned(&[
+        "config.json",
+        "dense/exlr8-vocab.safetensors",
+        "manifests/exlr8-manifest-mixed.json",
+        "experts/exlr8-layer-003.index.safetensors",
+        "experts/exlr8-layer-003.k2.safetensors",
+        "experts/exlr8-layer-003.k3.safetensors",
+        "experts/exlr8-layer-003.k4.safetensors",
+        "experts/exlr8-layer-023.index.safetensors",
+        "experts/exlr8-layer-023.k2.safetensors",
+        "experts/exlr8-layer-023.k3.safetensors",
+        "experts/exlr8-layer-023.k4.safetensors",
+        "experts/exlr8-layer-078.index.safetensors",
+        "experts/exlr8-layer-078.k3.safetensors",
+    ]);
+    let got = exlr8_files(&names, 3, Some(&widths));
+    let want = [
+        "config.json",
+        "dense/exlr8-vocab.safetensors",
+        "manifests/exlr8-manifest-mixed.json",
+        "experts/exlr8-layer-003.index.safetensors",
+        "experts/exlr8-layer-003.k2.safetensors",
+        "experts/exlr8-layer-003.k4.safetensors",
+        "experts/exlr8-layer-023.index.safetensors",
+        "experts/exlr8-layer-023.k3.safetensors",
+        "experts/exlr8-layer-023.k4.safetensors",
+        "experts/exlr8-layer-078.index.safetensors",
+        "experts/exlr8-layer-078.k3.safetensors",
+    ];
+    assert_eq!(got, want);
+    assert!(
+        manifest_widths(r#"{"dense": {"0": {"q": 4}}}"#)
+            .unwrap()
+            .is_empty()
     );
 }

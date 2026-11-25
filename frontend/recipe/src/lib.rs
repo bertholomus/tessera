@@ -124,7 +124,14 @@ impl Recipe {
         match (&self.weights.path, &self.weights.hf) {
             (Some(path), None) => Ok(self.dir.join(path)),
             (None, Some(hf)) => {
-                hub::snapshot(hf, cache.ok_or(Error::NoCache)?, token, self.weights.width)
+                let manifest = self.serve.get("manifest").and_then(toml::Value::as_str);
+                hub::snapshot(
+                    hf,
+                    cache.ok_or(Error::NoCache)?,
+                    token,
+                    self.weights.width,
+                    manifest,
+                )
             }
             _ => Err(Error::Weights),
         }
@@ -138,7 +145,7 @@ impl Recipe {
     ) -> Result<Vec<(String, PathBuf)>, Error> {
         let mut flags = Vec::new();
         for (name, spec) in &self.weights.extra {
-            let dir = hub::snapshot(spec, cache.ok_or(Error::NoCache)?, token, None)?;
+            let dir = hub::snapshot(spec, cache.ok_or(Error::NoCache)?, token, None, None)?;
             flags.push((format!("--{}", name.replace('_', "-")), dir));
         }
         Ok(flags)

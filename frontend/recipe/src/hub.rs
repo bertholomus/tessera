@@ -2,7 +2,7 @@
 
 use crate::{Error, io, pinned};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -54,12 +54,12 @@ const LANES: usize = 4;
 pub fn fetch(spec: &str, cache: &Path, token: Option<&str>) -> Result<PathBuf, Error> {
     let (repo, revision) = spec.split_once('@').unwrap_or((spec, "main"));
     if pinned(revision) {
-        return snapshot(&format!("{repo}@{revision}"), cache, token, None);
+        return snapshot(&format!("{repo}@{revision}"), cache, token, None, None);
     }
     let info = lookup(repo, revision, token)?;
     let pinned = format!("{repo}@{}", info.sha);
     eprintln!("tesserax: model {pinned}");
-    snapshot(&pinned, cache, token, None)
+    snapshot(&pinned, cache, token, None, None)
 }
 
 /// Whether `owner/name[@revision]` exists with safetensors files.
@@ -142,22 +142,29 @@ fn get_from(url: &str, token: Option<&str>, from: u64) -> Result<ureq::Response,
     request.call().map_err(Box::new)
 }
 
-/// `owner/name@commit`, downloaded into `cache` once per `width`.
+/// `owner/name@commit`, downloaded into `cache` per width or manifest.
 pub(crate) fn snapshot(
     spec: &str,
     cache: &Path,
     token: Option<&str>,
     width: Option<u32>,
+    manifest: Option<&str>,
 ) -> Result<PathBuf, Error> {
     let refuse = || Error::Source(spec.into(), "hf weights are owner/name@<commit>");
     let (repo, commit) = spec.split_once('@').ok_or_else(refuse)?;
     if !pinned(commit) {
         return Err(refuse());
     }
+    if let Some(name) = manifest
+        && (name.is_empty() || name.contains('/') || !safe_path(name))
+    {
+        return Err(Error::Source(spec.into(), "unsafe manifest name"));
+    }
     let dir = cache.join("hf").join(repo).join(commit);
-    let done = dir.join(match width {
-        Some(k) => format!(".complete.k{k}"),
-        None => ".complete".into(),
+    let done = dir.join(match (manifest, width) {
+        (Some(name), _) => format!(".complete.{name}"),
+        (None, Some(k)) => format!(".complete.k{k}"),
+        (None, None) => ".complete".into(),
     });
     if done.is_file() {
         return Ok(dir);
@@ -172,8 +179,12 @@ pub(crate) fn snapshot(
     } else {
         None
     };
+    let layers = match manifest.filter(|_| names.iter().any(|n| n == EXLR8)) {
+        Some(name) => Some(read_manifest(repo, commit, name, &names, &dir, token)?),
+        None => None,
+    };
     let files = match names.iter().any(|n| n == EXLR8) {
-        true => exlr8(&names, width.unwrap_or(WIDTH)),
+        true => exlr8_files(&names, width.unwrap_or(WIDTH), layers.as_ref()),
         false => wanted(&names, folders.as_deref()),
     };
     if !files.iter().all(|name| safe_path(name)) {
@@ -249,13 +260,107 @@ pub(crate) fn wanted<'a>(names: &'a [String], folders: Option<&[String]>) -> Vec
     out
 }
 
-/// An exlr8 release's files, with experts at `width` only.
-pub(crate) fn exlr8(names: &[String], width: u32) -> Vec<&str> {
+/// Fetches one exlr8 manifest and reads its expert widths.
+fn read_manifest(
+    repo: &str,
+    commit: &str,
+    name: &str,
+    names: &[String],
+    dir: &Path,
+    token: Option<&str>,
+) -> Result<BTreeMap<usize, BTreeSet<u32>>, Error> {
+    let file = format!("manifests/exlr8-manifest-{name}.json");
+    if !names.iter().any(|n| n == &file) {
+        return Err(Error::Source(
+            repo.into(),
+            "manifest not found in repository",
+        ));
+    }
+    fetch_file(repo, commit, &file, dir, token)?;
+    let path = dir.join(&file);
+    let text = std::fs::read_to_string(&path).map_err(io(&path))?;
+    manifest_widths(&text).map_err(|e| Error::Http(path.display().to_string(), e))
+}
+
+/// Expert widths per layer from an exlr8 manifest JSON.
+pub(crate) fn manifest_widths(text: &str) -> Result<BTreeMap<usize, BTreeSet<u32>>, String> {
+    let manifest: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let mut out = BTreeMap::new();
+    let Some(layers) = manifest.get("layers").filter(|v| !v.is_null()) else {
+        return Ok(out);
+    };
+    let layers = layers.as_object().ok_or("layers must be an object")?;
+    for (key, spec) in layers {
+        let layer: usize = key.parse().map_err(|_| format!("layer {key}"))?;
+        let obj = spec
+            .as_object()
+            .ok_or_else(|| format!("layer {layer} must be an object"))?;
+        let mut widths = BTreeSet::new();
+        read_widths(obj, &mut widths)?;
+        match obj.get("shared").filter(|v| !v.is_null()) {
+            Some(shared) => {
+                let shared = shared
+                    .as_object()
+                    .ok_or_else(|| format!("layer {layer}.shared must be an object"))?;
+                read_widths(shared, &mut widths)?;
+            }
+            None => {
+                let shared: Vec<u32> = widths.iter().map(|&k| k.max(3)).collect();
+                widths.extend(shared);
+            }
+        }
+        out.insert(layer, widths);
+    }
+    Ok(out)
+}
+
+/// Widths of `gate`, `up` and `down` in one object.
+fn read_widths(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    out: &mut BTreeSet<u32>,
+) -> Result<(), String> {
+    for proj in ["gate", "up", "down"] {
+        if let Some(val) = obj.get(proj) {
+            collect_widths(val, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Collects positive integer widths from scalars or nested arrays.
+fn collect_widths(val: &serde_json::Value, out: &mut BTreeSet<u32>) -> Result<(), String> {
+    if let Some(n) = val.as_u64() {
+        let k = u32::try_from(n)
+            .ok()
+            .filter(|&k| k > 0)
+            .ok_or_else(|| format!("invalid width {n}"))?;
+        out.insert(k);
+        return Ok(());
+    }
+    let items = val.as_array().ok_or("expected integer or array width")?;
+    for item in items {
+        collect_widths(item, out)?;
+    }
+    Ok(())
+}
+
+/// Parses `(layer, width)` from `exlr8-layer-<NNN>.k<K>.safetensors`.
+fn parse_expert(file: &str) -> Option<(usize, u32)> {
+    let body = file
+        .strip_prefix("exlr8-layer-")?
+        .strip_suffix(".safetensors")?;
+    let (layer, width) = body.split_once(".k")?;
+    Some((layer.parse().ok()?, width.parse().ok()?))
+}
+
+/// An exlr8 release's files, filtered by width or manifest.
+pub(crate) fn exlr8_files<'a>(
+    names: &'a [String],
+    width: u32,
+    layers: Option<&BTreeMap<usize, BTreeSet<u32>>>,
+) -> Vec<&'a str> {
     // The shared expert has no K2 codes.
-    let codes = [
-        format!(".k{width}.safetensors"),
-        format!(".k{}.safetensors", width.max(3)),
-    ];
+    let fallback = [width, width.max(3)];
     let mut out = Vec::new();
     for name in names {
         let keep = match name.split_once('/') {
@@ -266,7 +371,11 @@ pub(crate) fn exlr8(names: &[String], width: u32) -> Vec<&str> {
             Some(("manifests", file)) => file.ends_with(".json"),
             Some(("experts", file)) => {
                 file.ends_with(".index.safetensors")
-                    || codes.iter().any(|c| file.ends_with(c.as_str()))
+                    || parse_expert(file).is_some_and(|(layer, k)| {
+                        layers
+                            .and_then(|m| m.get(&layer))
+                            .map_or_else(|| fallback.contains(&k), |ks| ks.contains(&k))
+                    })
             }
             Some(_) => false,
         };
