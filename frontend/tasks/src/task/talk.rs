@@ -30,9 +30,8 @@ impl Model {
         }
         let params = Params {
             max_tokens: max_tokens.map_or(room, |n| n.min(room)),
-            stop: Vec::new(),
             format,
-            raw: false,
+            ..Params::default()
         };
         let (sink, steps) = mpsc::channel();
         generator.generate(ids, params, Box::new(move |step| sink.send(step).is_ok()))?;

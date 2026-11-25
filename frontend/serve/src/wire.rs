@@ -7,6 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tessera_bundle::{FunctionCall, Message, ToolCall};
+use tessera_engine::Sampling;
 use tessera_tasks::api::Format;
 
 /// Why a request was refused, in OpenAI's error format.
@@ -61,10 +62,9 @@ pub(crate) fn now() -> u64 {
 /// Whether `value` changes nothing. `None`: an unknown field.
 fn neutral(key: &str, value: &Value) -> Option<bool> {
     let numbers: &[f64] = match key {
-        "seed" | "user" => return Some(true),
-        "temperature" | "presence_penalty" | "frequency_penalty" | "min_p" => &[0.0],
-        "top_p" | "n" | "best_of" | "repetition_penalty" => &[1.0],
-        "top_k" => &[-1.0, 0.0],
+        "user" => return Some(true),
+        "presence_penalty" | "frequency_penalty" => &[0.0],
+        "n" | "best_of" | "repetition_penalty" => &[1.0],
         "logprobs" | "echo" => return Some(value.is_null() || *value == json!(false)),
         "tools" | "functions" => return Some(value.is_null() || *value == json!([])),
         "tool_choice" => {
@@ -216,9 +216,42 @@ pub(crate) struct Common {
     pub(crate) stream_options: Option<StreamOptions>,
     pub(crate) stop: Option<Strings>,
     pub(crate) response_format: Option<ResponseFormat>,
+    pub(crate) temperature: Option<f32>,
+    pub(crate) top_p: Option<f32>,
+    pub(crate) top_k: Option<i64>,
+    pub(crate) min_p: Option<f32>,
+    pub(crate) seed: Option<i64>,
 }
 
 impl Common {
+    /// Validated sampling parameters for this request.
+    pub(crate) fn sampling(&self) -> Result<Sampling, Refusal> {
+        let temperature = self.temperature.unwrap_or(0.0);
+        if !temperature.is_finite() || temperature < 0.0 {
+            return Err(bad("temperature must be non-negative", "temperature"));
+        }
+        let top_p = self.top_p.unwrap_or(1.0);
+        if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
+            return Err(bad("top_p must be in (0, 1]", "top_p"));
+        }
+        let top_k = match self.top_k {
+            None | Some(-1) | Some(0) => 0,
+            Some(k) if k > 0 => k as usize,
+            Some(_) => return Err(bad("top_k must be -1 or non-negative", "top_k")),
+        };
+        let min_p = self.min_p.unwrap_or(0.0);
+        if !min_p.is_finite() || !(0.0..=1.0).contains(&min_p) {
+            return Err(bad("min_p must be in [0, 1]", "min_p"));
+        }
+        Ok(Sampling {
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            seed: self.seed.map(|s| s as u64),
+        })
+    }
+
     fn nested(&self) -> Vec<String> {
         let options = self.stream_options.as_ref().map(|o| &o.extra);
         let mut out: Vec<String> =

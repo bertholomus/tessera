@@ -65,10 +65,18 @@ fn refusals() {
         (json!({"model": "other", "prompt": "a"}), 404, "model"),
         (json!({"prompt": "a", "tools": [{}]}), 400, "tools"),
         (
-            json!({"prompt": "a", "temperature": 0.7}),
+            json!({"prompt": "a", "presence_penalty": 0.7}),
+            400,
+            "presence_penalty",
+        ),
+        (
+            json!({"prompt": "a", "temperature": -0.1}),
             400,
             "temperature",
         ),
+        (json!({"prompt": "a", "top_p": 0.0}), 400, "top_p"),
+        (json!({"prompt": "a", "top_k": -2}), 400, "top_k"),
+        (json!({"prompt": "a", "min_p": 1.5}), 400, "min_p"),
         (
             json!({"prompt": "abcd", "max_tokens": 13}),
             400,
@@ -138,4 +146,18 @@ fn chat_tool_calls() {
     let (s_status, sse) = call(&slot, "/v1/chat/completions", Some(body));
     assert_eq!(s_status, 200);
     assert!(sse.contains("\"tool_calls\"") && sse.contains("\"finish_reason\":\"tool_calls\""));
+}
+
+#[test]
+fn sampling_params_accepted() {
+    let slot = loaded(&Arc::new(MockGenerator::default()), true);
+    let body = json!({
+        "prompt": "a",
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.05,
+        "seed": 42,
+    });
+    assert_eq!(json(&slot, "/v1/completions", Some(body)).0, 200);
 }

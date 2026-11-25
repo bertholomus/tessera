@@ -2,6 +2,7 @@
 
 use crate::kept::{Kept, Totals};
 use crate::lanes::Lanes;
+use crate::sample::Sampler;
 use crate::{Allowed, Engine, Error, Event, Reason, Request, Row, ends};
 use std::collections::VecDeque;
 
@@ -28,6 +29,8 @@ pub struct Seq {
     made: usize,
     /// Choices for the next pick.
     next: Allowed,
+    /// Per-sequence token sampler.
+    sampler: Sampler,
 }
 
 impl Seq {
@@ -269,6 +272,7 @@ impl<'a> Batch<'a> {
         while let Some((slot, skip)) = self.place() {
             let (request, sink) = self.waiting.pop_front().expect("a waiting answer");
             PROMPT.add(request.tokens.len() as u64);
+            let sampler = Sampler::new(request.sampling);
             let mut seq = Seq {
                 slot,
                 pending: request.tokens[skip..].iter().copied().collect(),
@@ -278,6 +282,7 @@ impl<'a> Batch<'a> {
                 fed: skip,
                 made: 0,
                 next: Allowed::Any,
+                sampler,
             };
             if skip > 0 {
                 (seq.sink)(Event::Kept(skip));
@@ -441,9 +446,26 @@ impl<'a> Batch<'a> {
             }
         };
         let ends = ends(&rows);
-        let ids = match self.allowed(&rows, &ends) {
-            Some(allowed) => self.engine.last_guided(&rows, &allowed)?,
-            None => self.engine.last(&rows)?,
+        let sampling = self.active.iter().any(|s| !s.request.sampling.greedy());
+        let ids = match (sampling, self.allowed(&rows, &ends)) {
+            (true, allowed) => {
+                let (logits, vocab) = self.engine.last_logits(&rows)?;
+                let mut picked = Vec::with_capacity(ends.len());
+                for (k, &end) in ends.iter().enumerate() {
+                    let slot = rows[end as usize].slot;
+                    let seq = self
+                        .active
+                        .iter_mut()
+                        .find(|s| s.slot == slot)
+                        .expect("an active slot");
+                    let mask = allowed.as_ref().map(|a| &a[k]);
+                    let row = &logits[k * vocab..(k + 1) * vocab];
+                    picked.push(seq.sampler.pick(row, mask));
+                }
+                picked
+            }
+            (false, Some(allowed)) => self.engine.last_guided(&rows, &allowed)?,
+            (false, None) => self.engine.last(&rows)?,
         };
         // Each answer takes its rows and its last id.
         let mut i = 0;

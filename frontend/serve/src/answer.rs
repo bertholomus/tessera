@@ -130,11 +130,13 @@ fn start(
     if prompt.is_empty() {
         return Err(bad("the prompt is empty", "prompt"));
     }
+    let sampling = common.sampling()?;
     let params = Params {
         max_tokens: budget(model, prompt.len(), asked)?,
         stop: common.stop.map(wire::Strings::list).unwrap_or_default(),
         format: common.response_format.and_then(ResponseFormat::format),
         raw: parsing.parser.is_some(),
+        sampling,
     };
     let (sink, steps) = mpsc::channel();
     let prompt_tokens = prompt.len();

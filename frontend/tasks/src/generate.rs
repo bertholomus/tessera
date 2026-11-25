@@ -97,6 +97,7 @@ impl Generator for Queued {
             stop: self.generate.stop.clone(),
             guide,
             reads: Vec::new(),
+            sampling: params.sampling,
         };
         let generate = self.generate.clone();
         let raw = params.raw;

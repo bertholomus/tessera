@@ -25,6 +25,9 @@ mod model;
 mod mtp_draft;
 mod ple;
 mod ranks;
+mod sample;
+#[cfg(test)]
+mod sample_test;
 mod schedule;
 mod spec_len;
 mod spec_loop;
@@ -38,6 +41,7 @@ pub use model::Model;
 pub use mtp_draft::{MtpDrafter, MtpSpeculate};
 pub use ple::{PleConfig, PleStore};
 pub use ranks::Place;
+pub use sample::Sampling;
 pub use schedule::{Batch, Fair, Policy, Seq, Sink};
 pub use spec_len::{CostModel, SpecLen};
 pub use speculate::{Drafter, SpecStats, Speculate, accept_greedy, accept_sample};
@@ -71,6 +75,9 @@ pub struct Request {
     /// Prompt rows to score. Any reads replace decoding.
     #[serde(default)]
     pub reads: Vec<Read>,
+    /// Sampling parameters. Default is greedy argmax.
+    #[serde(default)]
+    pub sampling: Sampling,
 }
 
 /// The logits after prompt row `row`, over `ids`.
@@ -597,6 +604,19 @@ impl Engine {
     /// One launch: the likeliest token after each slot's last row.
     pub fn last(&mut self, rows: &[Row]) -> Result<Vec<u32>, Error> {
         self.launch(rows, &ends(rows), Head::Full(None))
+    }
+
+    /// One launch: full logits after each slot's last row.
+    pub fn last_logits(&mut self, rows: &[Row]) -> Result<(Vec<f32>, usize), Error> {
+        let picks = ends(rows);
+        let vocab = self.vocab.ok_or(Error::Scores)?;
+        let wants = Wants::role(&self.graph, self.full, Role::Logits);
+        let outputs = self.run(rows, &picks, Head::Full(None), wants)?;
+        let raw = self.runner.read(outputs[0])?;
+        let floats = raw.floats().map_err(tessera_run::Error::from)?;
+        let logits = floats[..picks.len() * vocab].to_vec();
+        self.report();
+        Ok((logits, vocab))
     }
 
     /// As `last`, each pick from its `allowed` set.

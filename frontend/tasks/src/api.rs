@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tessera_bundle::{Message, RenderOptions, ResponseParser};
 pub use tessera_engine::Read;
+use tessera_engine::Sampling;
 
 /// The served model's name and context size.
 #[derive(Clone, Debug)]
@@ -59,6 +60,8 @@ pub struct Params {
     pub format: Option<Format>,
     /// Keep special tokens in decoded output for response parsing.
     pub raw: bool,
+    /// Sampling parameters. Default is greedy.
+    pub sampling: Sampling,
 }
 
 /// A required shape for an answer.
