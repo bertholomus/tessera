@@ -722,10 +722,29 @@ impl<'a> Tree<'a> {
         P::find(self, t)
     }
 
+    /// Whether `t` closes a rotated matmul chain.
+    fn closes_turn(&self, t: T) -> bool {
+        let n = self.node(t);
+        if n.term != Term::Stage(Stage::Mul) {
+            return false;
+        }
+        let Some(&back) = n.args.first() else {
+            return false;
+        };
+        let b = self.node(back);
+        if !matches!(b.term, Term::Stage(Stage::Hadamard { .. })) {
+            return false;
+        }
+        let Some(&prod) = b.args.first() else {
+            return false;
+        };
+        self.node(prod).term == Term::Op(Op::Matmul)
+    }
+
     /// Whether `t` is an elementwise stage only its reader needs.
     pub(crate) fn joins(&self, t: T) -> bool {
         let map = matches!(&self.node(t).term, Term::Stage(s) if map_stage(s).is_some());
-        map && !self.root(t)
+        map && !self.root(t) && !self.closes_turn(t)
     }
 
     /// Region outputs a rule in `rules` covers become roots.
