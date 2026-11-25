@@ -77,6 +77,7 @@ pub struct DFlash {
     pub weights: Weights,
     pub pins: Pins,
     pub block: usize,
+    pub context: usize,
     pub mask_token: u32,
     pub causal: bool,
     /// 0-based target layer indices from the drafter config.
@@ -344,7 +345,9 @@ pub fn load(
 ) -> Result<DFlash> {
     let spec = target_spec(target_dir, overrides)?;
     let draft_over = overrides.under("draft");
-    let config = draft_over.config(draft_dir, |k| Config::read(k, &spec, slots, context))?;
+    let mut config = draft_over.config(draft_dir, |k| Config::read(k, &spec, slots, context))?;
+    let draft_ctx = draft_context(context, config.sliding_window);
+    config.stack.max_context = draft_ctx;
     let tap_layers = config.tap_layers();
     let stateful_target = std::fs::read_to_string(target_dir.join("config.json"))
         .map(|s| s.contains("linear_attention") || s.contains("qwen4_exp") || s.contains("qwen3_5"))
@@ -398,8 +401,17 @@ pub fn load(
         weights,
         pins: draft_pins,
         block: config.block_size as usize,
+        context: draft_ctx as usize,
         mask_token: config.mask_token,
         causal: config.causal,
         target_layers: config.target_layers,
     })
+}
+
+/// Drafter KV capacity for sliding-window models.
+pub(crate) fn draft_context(context: u64, sliding_window: Option<u64>) -> u64 {
+    match sliding_window {
+        Some(w) => context.min(w.saturating_add(32_768).next_power_of_two()),
+        None => context,
+    }
 }
