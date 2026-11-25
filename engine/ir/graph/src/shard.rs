@@ -202,21 +202,20 @@ fn returns(g: &Graph, id: NodeId) -> bool {
     node.op == Op::Matmul && whole_weight(g, node.args[1]) && summed(g, id)
 }
 
-/// Whether an add reads `id`, through scales at most.
+/// Whether an add reads `id`, through scales or gathers.
 fn summed(g: &Graph, id: NodeId) -> bool {
     let readers = (0..g.nodes.len())
         .map(|i| NodeId(i as u32))
         .filter(|n| g.node(*n).args.contains(&id));
     for reader in readers {
-        let Op::Row(r) = &g.node(reader).op else {
-            continue;
-        };
-        if r.0.contains(&Stage::Add) {
-            return true;
-        }
-        let scales = r.0.iter().all(|s| matches!(s, Stage::Scale(_)));
-        if scales && summed(g, reader) {
-            return true;
+        let node = g.node(reader);
+        match &node.op {
+            Op::Select(Select::Gather) if node.args[0] == id && summed(g, reader) => return true,
+            Op::Row(r) if r.0.contains(&Stage::Add) => return true,
+            Op::Row(r) if r.0.iter().all(|s| matches!(s, Stage::Scale(_))) && summed(g, reader) => {
+                return true;
+            }
+            _ => {}
         }
     }
     false

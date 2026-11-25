@@ -141,3 +141,31 @@ fn gather_leaves_region() {
         (gather, &vec![out])
     );
 }
+
+#[test]
+fn gathered_residual_splits() {
+    let mut g = graph(&[[Ffn, Hidden], [Hidden, Ffn]]);
+    g.dims.push(Dim::bounded(Picks, 4));
+    let ids_ty = TensorType::new([Picks], DType::U32);
+    g.entries[0].inputs.push(Port {
+        role: Role::Picks,
+        ty: ids_ty,
+    });
+    let ids = push(&mut g, Op::Input { entry: 0, port: 1 }, &[]);
+    let [x, w1, w2] = [NodeId(0), NodeId(1), NodeId(2)];
+    let up = push(&mut g, Op::Matmul, &[x, w1]);
+    let inner = push(&mut g, Op::Row(Row(vec![Stage::Act(Act::Silu)])), &[up]);
+    let down = push(&mut g, Op::Matmul, &[inner, w2]);
+    let x_pick = push(&mut g, Op::Select(Select::Gather), &[x, ids]);
+    let d_pick = push(&mut g, Op::Select(Select::Gather), &[down, ids]);
+    let out = push(&mut g, Op::Row(Row(vec![Stage::Add])), &[x_pick, d_pick]);
+    finish(&mut g, out);
+    let sharded = shard(&g, &Parts::even(2)).unwrap();
+    assert!(sharded.whole.is_empty(), "{:?}", sharded.whole);
+    assert_eq!(
+        placements(&sharded.graph),
+        [Split { axis: 0 }, Split { axis: 1 }]
+    );
+    let sums = |n: &Node| n.op == Op::Row(Row(vec![Stage::AllReduce]));
+    assert_eq!(sharded.graph.nodes.iter().filter(|n| sums(n)).count(), 1);
+}
