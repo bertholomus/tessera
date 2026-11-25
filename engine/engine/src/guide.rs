@@ -133,6 +133,82 @@ impl Allowed {
         }
         out
     }
+
+    /// Returns `self` with every id in `ids` banned.
+    pub(crate) fn ban(&self, ids: &[u32], words: Option<usize>) -> Self {
+        if ids.is_empty() {
+            return self.clone();
+        }
+        match self {
+            Allowed::Any => Allowed::Except(ids.to_vec()),
+            Allowed::One(id) => Allowed::One(*id),
+            Allowed::Except(cur) => {
+                let mut out = cur.clone();
+                for &id in ids {
+                    if !out.contains(&id) {
+                        out.push(id);
+                    }
+                }
+                Allowed::Except(out)
+            }
+            Allowed::Few(cur) => {
+                let kept: Vec<u32> = cur.iter().copied().filter(|id| !ids.contains(id)).collect();
+                match kept.is_empty() {
+                    true => self.clone(),
+                    false => Allowed::Few(kept),
+                }
+            }
+            Allowed::Bits(cur) => {
+                let mut out = cur.clone();
+                let n = words.unwrap_or(out.len());
+                if out.len() < n {
+                    out.resize(n, u32::MAX);
+                }
+                for &id in ids {
+                    let (w, b) = (id as usize / 32, id % 32);
+                    if let Some(word) = out.get_mut(w) {
+                        *word &= !(1 << b);
+                    }
+                }
+                Allowed::Bits(out)
+            }
+        }
+    }
+
+    /// Picks the highest-scoring allowed token from host `logits`.
+    pub(crate) fn pick_logits(&self, logits: &[f32]) -> u32 {
+        let argmax = |iter: &mut dyn Iterator<Item = usize>| -> Option<u32> {
+            let mut best: Option<(usize, f32)> = None;
+            for i in iter {
+                let v = logits[i];
+                if best.is_none_or(|(_, b)| v > b) {
+                    best = Some((i, v));
+                }
+            }
+            best.map(|(i, _)| i as u32)
+        };
+        let picked = match self {
+            Allowed::One(id) => Some(*id),
+            Allowed::Few(ids) => {
+                let mut it = ids
+                    .iter()
+                    .map(|&i| i as usize)
+                    .filter(|&i| i < logits.len());
+                argmax(&mut it)
+            }
+            Allowed::Except(ban) => {
+                let mut it = (0..logits.len()).filter(|&i| !ban.contains(&(i as u32)));
+                argmax(&mut it)
+            }
+            Allowed::Bits(bits) => {
+                let mut it = (0..logits.len())
+                    .filter(|&i| bits.get(i / 32).is_some_and(|w| (w >> (i % 32)) & 1 != 0));
+                argmax(&mut it)
+            }
+            Allowed::Any => None,
+        };
+        picked.unwrap_or_else(|| argmax(&mut (0..logits.len())).unwrap_or(0))
+    }
 }
 
 /// Divides positive logits by `rep`, multiplies others, adds `add`.
@@ -150,6 +226,31 @@ pub(crate) fn edit(row: &mut [f32], edits: &[Edit]) {
             let scaled = if *x > 0.0 { *x / e.rep } else { *x * e.rep };
             *x = scaled + e.add;
         }
+    }
+}
+
+/// Bans stop ids until `left` tokens have been accepted.
+#[derive(Clone)]
+pub(crate) struct MinTokens {
+    pub(crate) stop: Vec<u32>,
+    pub(crate) left: usize,
+}
+
+impl Guide for MinTokens {
+    fn allowed(&mut self) -> Result<Allowed, Fault> {
+        match self.left > 0 {
+            true => Ok(Allowed::Except(self.stop.clone())),
+            false => Ok(Allowed::Any),
+        }
+    }
+
+    fn accept(&mut self, _: u32) -> Result<(), Fault> {
+        self.left = self.left.saturating_sub(1);
+        Ok(())
+    }
+
+    fn fork(&self) -> Option<Box<dyn Guide>> {
+        Some(Box::new(self.clone()))
     }
 }
 
@@ -837,5 +938,28 @@ impl Runs {
             }
         }
         out
+    }
+}
+
+impl crate::Engine {
+    /// Picks guided ids from full logits without a mask port.
+    pub(crate) fn pick_unmasked(
+        &mut self,
+        rows: &[crate::Row],
+        picks: &[u32],
+        allowed: &[Allowed],
+    ) -> Result<Vec<u32>, crate::Error> {
+        let vocab = self.vocab.ok_or(crate::Error::Mask)?;
+        let wants = tessera_lower::Wants::role(&self.graph, self.full, tessera_graph::Role::Logits);
+        let outputs = self.run(rows, picks, crate::Head::Full(None), wants)?;
+        let raw = self.runner.read(outputs[0])?;
+        let floats = raw.floats().map_err(tessera_run::Error::from)?;
+        let out = floats
+            .chunks_exact(vocab)
+            .zip(allowed)
+            .map(|(row, allow)| allow.pick_logits(row))
+            .collect();
+        self.report();
+        Ok(out)
     }
 }

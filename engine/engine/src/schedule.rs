@@ -405,9 +405,14 @@ impl<'a> Batch<'a> {
         let mut out = vec![Allowed::Any; owners.len()];
         let mut limited = false;
         for (k, &(at, keep)) in owners.iter().enumerate() {
-            let next = &self.active[at].next;
-            if keep && *next != Allowed::Any {
-                out[k] = next.clone();
+            let seq = &self.active[at];
+            let hold = seq.made < seq.request.min_tokens && !seq.request.stop.is_empty();
+            if keep && (hold || seq.next != Allowed::Any) {
+                out[k] = if hold {
+                    seq.next.ban(&seq.request.stop, self.engine.words())
+                } else {
+                    seq.next.clone()
+                };
                 limited = true;
             }
         }

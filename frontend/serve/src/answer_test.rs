@@ -7,7 +7,8 @@ use tessera_bundle::ResponseParser;
 fn completion_whole() {
     let mock = Arc::new(MockGenerator::default());
     let slot = loaded(&mock, false);
-    let body = json!({"model": "m", "prompt": "abcd", "stop": "x", "temperature": 0});
+    let body =
+        json!({"model": "m", "prompt": "abcd", "stop": "x", "min_tokens": 2, "temperature": 0});
     let (status, got) = json(&slot, "/v1/completions", Some(body));
     assert_eq!(status, 200);
     assert_eq!(got["object"], "text_completion");
@@ -20,7 +21,10 @@ fn completion_whole() {
     );
     let asked = mock.asked.lock().unwrap().clone().unwrap();
     // The room the 16-token context leaves.
-    assert_eq!((asked.max_tokens, asked.stop), (12, vec!["x".to_string()]));
+    assert_eq!(
+        (asked.max_tokens, asked.min_tokens, asked.stop),
+        (12, 2, vec!["x".to_string()])
+    );
 }
 
 #[test]

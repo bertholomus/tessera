@@ -1,6 +1,6 @@
 //! Shared SPMD speculative decode loop and device tap helpers.
 
-use crate::guide::{Rules, settle, walk};
+use crate::guide::{MinTokens, Rules, Stacked, settle, walk};
 use crate::sample::{Sampler, Sampling, Target, accept, take};
 use crate::spec_len::SpecStats;
 use crate::{Allowed, Edit, Engine, Error, Event, Guide, Head, Reason, Request, Row};
@@ -148,7 +148,7 @@ pub(crate) fn start_req(
     extra: impl FnOnce(&mut Writer),
 ) -> Result<bool, Error> {
     let request = &spec_req.request;
-    if request.guide.is_some() && target.control.is_some() {
+    if (request.guide.is_some() || request.min_tokens > 0) && target.control.is_some() {
         return Err(Error::Guided);
     }
     if request.tokens.is_empty() || request.tokens.len() > target.context() {
@@ -373,7 +373,15 @@ pub(crate) fn run_speculate<D, S>(
     };
     let mut request = spec_req.request;
     let mut prompt = std::mem::take(&mut request.tokens);
-    let mut guided = request.guide.take().map(|guide| Guided {
+    let mut guide = request.guide.take();
+    if request.min_tokens > 0 && !request.stop.is_empty() {
+        let hold: Box<dyn Guide> = Box::new(MinTokens {
+            stop: request.stop.clone(),
+            left: request.min_tokens,
+        });
+        guide = Stacked::of(guide.into_iter().chain([hold]).collect());
+    }
+    let mut guided = guide.map(|guide| Guided {
         forks: guide.fork().is_some(),
         guide,
         queue: Vec::new(),

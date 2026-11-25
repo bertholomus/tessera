@@ -116,7 +116,13 @@ impl Generator for Queued {
         let made = match &self.generate.steer {
             Steer::Guided(made) => made.as_ref(),
             Steer::Unguided(mode) => {
-                match params.format.as_ref().map(|_| "response_format").or(key) {
+                match params
+                    .format
+                    .as_ref()
+                    .map(|_| "response_format")
+                    .or(key)
+                    .or((params.min_tokens > 0).then_some("min_tokens"))
+                {
                     Some(field) => {
                         let why = format!("{mode} does not support formats or penalties");
                         return Err(Box::new(Refused(why, field)));
@@ -149,6 +155,7 @@ impl Generator for Queued {
         let request = Request {
             tokens: prompt,
             max_tokens: params.max_tokens,
+            min_tokens: params.min_tokens,
             stop: self.generate.stop.clone(),
             guide: Stacked::of(guides),
             reads: Vec::new(),

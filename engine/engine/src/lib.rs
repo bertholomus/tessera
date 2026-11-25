@@ -80,6 +80,9 @@ pub use tessera_wasm as wasm;
 pub struct Request {
     pub tokens: Vec<u32>,
     pub max_tokens: usize,
+    /// Minimum tokens before stop ids end the answer.
+    #[serde(default)]
+    pub min_tokens: usize,
     /// Ids that end the answer, excluded from its text.
     pub stop: Vec<u32>,
     /// Rules on each token. Masks need a mask port.
@@ -691,7 +694,9 @@ impl Engine {
             .unwrap_or(1)
             .next_power_of_two();
         let gathered = picks.len().next_power_of_two() * k;
-        let words = self.words.ok_or(Error::Mask)?;
+        let Some(words) = self.words else {
+            return self.pick_unmasked(rows, &picks, allowed);
+        };
         // Past half the vocabulary, the full head reads less.
         if self.sparse.is_some() && lists.len() == allowed.len() && 2 * gathered <= 32 * words {
             let mut ids = Vec::with_capacity(lists.len() * k);
