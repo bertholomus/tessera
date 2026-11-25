@@ -1,14 +1,14 @@
 //! Plans for small graphs, with lower's own kernels.
 
 use tessera_graph::DimName::{self, Context, Hidden, Rows, Seqs};
-use tessera_graph::{Act, DType, Dim, Graph, TensorType};
+use tessera_graph::{Act, Composite, DType, Dim, Graph, Stage, TensorType};
 use tessera_interp::{Tensor, run};
 use tessera_lower::form::{BF16_FORM, F32_FORM, FP8_FORM, named};
 use tessera_lower::kernels::{Map, MapStage, Widen};
 use tessera_lower::sites;
 use tessera_lower::{
     Arg, Buffer, Compute, Device, Dialect, Draft, Error, Fit, Kernel, KernelRef, Pins, Plan,
-    Recipe, Site, Slot, Source, Step, T, Tree,
+    Recipe, Site, Slot, Source, Step, T, Term, Tree, Wants,
 };
 use tessera_lower::{assign, lower, peak, rules, schedule, select};
 use tessera_run::testing::{host, runs};
@@ -862,4 +862,33 @@ fn arenas_pack_zones() {
     }
     let s0 = plan.buffers[plan.inputs[0].buffer as usize];
     assert_eq!((s0, plan.outputs[0].slot.offset), (1024, 256));
+}
+
+#[test]
+fn router_pinned_adds() {
+    // A pinned router form also holds the adds inside MoE.
+    let m = Model::new(vec![Dim::bounded(Rows, 4), Dim::fixed(Hidden, 16)]);
+    let port = || floats([Rows, Hidden]);
+    let [x, y] = m.entry(EntryKind::Forward, [port(), port()]);
+    let [z] = m.composite(Composite::Moe, || [x.add(&y).act(Act::Silu)]);
+    let g = m.finish([(Role::Logits, &z)]);
+    let pins = (Pins::all(BF16_FORM).activations(BF16_FORM)).site(Site::Router, F32_FORM);
+    let dev = Device::guess(&host()).pinned(pins);
+    let parts = dev.division();
+    let tree = Tree::upto(
+        &g,
+        0,
+        Wants::ALL,
+        &[(Rows, 4)],
+        &[],
+        &dev.pins,
+        dev.kept,
+        &parts,
+        0,
+    );
+    let tree = tree.unwrap();
+    let add = (0..tree.len() as u32)
+        .map(T)
+        .find(|&t| tree.node(t).term == Term::Stage(Stage::Add));
+    assert_eq!(tree.node(add.unwrap()).form, F32_FORM);
 }

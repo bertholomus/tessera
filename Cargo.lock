@@ -1791,6 +1791,7 @@ dependencies = [
 name = "tessera-checkpoint"
 version = "0.1.0"
 dependencies = [
+ "ring",
  "serde",
  "serde_json",
  "tessera-engine",
@@ -1989,6 +1990,27 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "tessera-hessians"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tessera-bundle",
+ "tessera-checkpoint",
+ "tessera-device",
+ "tessera-engine-settings",
+ "tessera-gpukit",
+ "tessera-graph",
+ "tessera-interp",
+ "tessera-lower",
+ "tessera-mem",
+ "tessera-models",
+ "tessera-rules",
+ "tessera-run",
+ "tessera-testkit",
 ]
 
 [[package]]

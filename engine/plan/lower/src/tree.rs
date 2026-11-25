@@ -160,7 +160,13 @@ fn pinned_form(
                 Some(Site::Softmax)
             }
         }
-        (_, Pin::Residual) => Some(Site::Residual),
+        (_, Pin::Residual) => {
+            if in_moe && pins.site_form(Site::Router).is_some() {
+                Some(Site::Router)
+            } else {
+                Some(Site::Residual)
+            }
+        }
         (Op::Mix(_), _) => Some(Site::Router),
         (Op::Attend(_) | Op::Delta(_), _) => Some(Site::Attention),
         (Op::Matmul, _) => Some(Site::Matmul),
