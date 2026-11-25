@@ -28,6 +28,22 @@ struct alignas(16) mla_smem {
     u32 has_valid;
 };
 
+static __device__ __forceinline__ void mla_load_ids(const u32* ids, u32 row, u32 picks,
+                                                    u32 from_list, u32 from, u32 to, u32 p0,
+                                                    u32 p_end, u32 tid, mla_smem& sm) {
+    if (tid < 16u) {
+        u32 p = p0 + tid;
+        u32 j = 0xFFFFFFFFu;
+        if (p < p_end) {
+            u32 cand = (from_list == 1u) ? ids[u64(row) * picks + p] : p;
+            if (cand >= from && cand < to) j = cand;
+        }
+        sm.j[tid] = j;
+        u32 any = __any_sync(0xFFFFu, j != 0xFFFFFFFFu);
+        if (tid == 0u) sm.has_valid = any;
+    }
+}
+
 template <u32 KV_FMT>
 static __device__ __forceinline__ void mla_attend_body(const float* q, const void* kv_ptr,
                                                        const u32* ids, const u32* slots,
@@ -81,7 +97,9 @@ static __device__ __forceinline__ void mla_attend_body(const float* q, const voi
 
     u32 stop = sm.stop;
     u32 total_p = (stop > start) ? (stop - start) : 0u;
-    u32 per = (total_p + splits - 1u) / splits;
+    u32 tiles = (total_p + 15u) >> 4;
+    u32 tiles_per = (tiles + splits - 1u) / splits;
+    u32 per = tiles_per << 4;
     u32 p_begin = start + split * per;
     u32 p_end = p_begin + per;
     if (p_begin > stop) p_begin = stop;
@@ -96,16 +114,18 @@ static __device__ __forceinline__ void mla_attend_body(const float* q, const voi
         return;
     }
 
-    // Stage Q[16, 576] once as f16x2.
-    for (u32 qi = tid; qi < 16u * 144u; qi += 128u) {
-        u32 h = qi / 144u;
-        u32 q4 = qi % 144u;
-        u64 q_at = u64(row * heads + h0 + h) * 576ull + u64(q4) * 4ull;
-        float4 qv = *reinterpret_cast<const float4*>(q + q_at);
+    // Stage Q[16, 576] once as f16x2 (no div/mod).
+    u32 tk = tid >> 3;
+    u32 lane8 = tid & 7u;
+    const float* q_row = q + u64(row * heads + h0 + tk) * 576ull;
+#pragma unroll
+    for (u32 q4 = lane8; q4 < 144u; q4 += 8u) {
+        float4 qv = *reinterpret_cast<const float4*>(q_row + u64(q4) * 4ull);
         u32 f0 = trellis::f32x2_to_f16x2(qv.x, qv.y);
         u32 f1 = trellis::f32x2_to_f16x2(qv.z, qv.w);
-        *reinterpret_cast<uint2*>(&sm.q[h][q4 * 2u]) = make_uint2(f0, f1);
+        *reinterpret_cast<uint2*>(&sm.q[tk][q4 * 2u]) = make_uint2(f0, f1);
     }
+    mla_load_ids(ids, row, picks, from_list, from, to, p_begin, p_end, tid, sm);
     prim::block_sync();
 
     float o[18][4];
@@ -126,123 +146,136 @@ static __device__ __forceinline__ void mla_attend_body(const float* q, const voi
     u32 r1 = r0 + 8u;
 
     for (u32 p0 = p_begin; p0 < p_end; p0 += 16u) {
-        if (tid == 0u) sm.has_valid = 0u;
-        prim::block_sync();
-        if (tid < 16u) {
-            u32 p = p0 + tid;
-            u32 j = 0xFFFFFFFFu;
-            if (p < p_end) {
-                u32 cand = (from_list == 1u) ? ids[u64(row) * picks + p] : p;
-                if (cand >= from && cand < to) {
-                    j = cand;
-                    sm.has_valid = 1u;
-                }
-            }
-            sm.j[tid] = j;
-        }
-        prim::block_sync();
-        if (sm.has_valid == 0u) continue;
-
-        for (u32 qi = tid; qi < 16u * 144u; qi += 128u) {
-            u32 tk = qi / 144u;
-            u32 q4 = qi % 144u;
+        if (sm.has_valid != 0u) {
             u32 j = sm.j[tk];
-            u32 h0w = 0u;
-            u32 h1w = 0u;
-            if (j != 0xFFFFFFFFu) {
-                u64 base = (u64(slot) * context + j) * 576ull + u64(q4) * 4ull;
-                if constexpr (KV_FMT == 0u) {
-                    u32 raw = *reinterpret_cast<const u32*>(kv_u8 + base);
-                    h0w = mla_e4m3_f16x2(static_cast<u16>(raw));
-                    h1w = mla_e4m3_f16x2(static_cast<u16>(raw >> 16));
-                } else if constexpr (KV_FMT == 1u) {
-                    uint2 raw = *reinterpret_cast<const uint2*>(kv_u16 + base);
-                    h0w = trellis::f32x2_to_f16x2(__uint_as_float(raw.x << 16),
-                                                  __uint_as_float(raw.x & 0xFFFF0000u));
-                    h1w = trellis::f32x2_to_f16x2(__uint_as_float(raw.y << 16),
-                                                  __uint_as_float(raw.y & 0xFFFF0000u));
+            if constexpr (KV_FMT == 0u) {
+                if (j != 0xFFFFFFFFu) {
+                    const u8* row_u8 = kv_u8 + (u64(slot) * context + j) * 576ull;
+                    for (u32 q16 = lane8; q16 < 36u; q16 += 8u) {
+                        uint4 raw = *reinterpret_cast<const uint4*>(row_u8 + u64(q16) * 16ull);
+                        u32 h0 = mla_e4m3_f16x2(static_cast<u16>(raw.x));
+                        u32 h1 = mla_e4m3_f16x2(static_cast<u16>(raw.x >> 16));
+                        u32 h2 = mla_e4m3_f16x2(static_cast<u16>(raw.y));
+                        u32 h3 = mla_e4m3_f16x2(static_cast<u16>(raw.y >> 16));
+                        u32 h4 = mla_e4m3_f16x2(static_cast<u16>(raw.z));
+                        u32 h5 = mla_e4m3_f16x2(static_cast<u16>(raw.z >> 16));
+                        u32 h6 = mla_e4m3_f16x2(static_cast<u16>(raw.w));
+                        u32 h7 = mla_e4m3_f16x2(static_cast<u16>(raw.w >> 16));
+                        *reinterpret_cast<uint4*>(&sm.kv[tk][q16 * 8u]) =
+                            make_uint4(h0, h1, h2, h3);
+                        *reinterpret_cast<uint4*>(&sm.kv[tk][q16 * 8u + 4u]) =
+                            make_uint4(h4, h5, h6, h7);
+                    }
                 } else {
-                    float4 raw = *reinterpret_cast<const float4*>(kv_f32 + base);
-                    h0w = trellis::f32x2_to_f16x2(raw.x, raw.y);
-                    h1w = trellis::f32x2_to_f16x2(raw.z, raw.w);
+                    for (u32 q16 = lane8; q16 < 36u; q16 += 8u) {
+                        *reinterpret_cast<uint4*>(&sm.kv[tk][q16 * 8u]) =
+                            make_uint4(0u, 0u, 0u, 0u);
+                        *reinterpret_cast<uint4*>(&sm.kv[tk][q16 * 8u + 4u]) =
+                            make_uint4(0u, 0u, 0u, 0u);
+                    }
+                }
+            } else {
+                u64 row_base = (u64(slot) * context + j) * 576ull;
+                for (u32 q4 = lane8; q4 < 144u; q4 += 8u) {
+                    u32 h0w = 0u;
+                    u32 h1w = 0u;
+                    if (j != 0xFFFFFFFFu) {
+                        u64 base = row_base + u64(q4) * 4ull;
+                        if constexpr (KV_FMT == 1u) {
+                            uint2 raw = *reinterpret_cast<const uint2*>(kv_u16 + base);
+                            h0w = trellis::f32x2_to_f16x2(__uint_as_float(raw.x << 16),
+                                                          __uint_as_float(raw.x & 0xFFFF0000u));
+                            h1w = trellis::f32x2_to_f16x2(__uint_as_float(raw.y << 16),
+                                                          __uint_as_float(raw.y & 0xFFFF0000u));
+                        } else {
+                            float4 raw = *reinterpret_cast<const float4*>(kv_f32 + base);
+                            h0w = trellis::f32x2_to_f16x2(raw.x, raw.y);
+                            h1w = trellis::f32x2_to_f16x2(raw.z, raw.w);
+                        }
+                    }
+                    *reinterpret_cast<uint2*>(&sm.kv[tk][q4 * 2u]) = make_uint2(h0w, h1w);
                 }
             }
-            *reinterpret_cast<uint2*>(&sm.kv[tk][q4 * 2u]) = make_uint2(h0w, h1w);
-        }
-        prim::block_sync();
+            prim::block_sync();
 
-        float s0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        float s1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float s0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float s1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-        for (u32 step = 0u; step < 9u; step++) {
-            u32 k0 = (warp * 9u + step) * 8u;
-            u32 a[4];
-            a[0] = sm.q[g][k0 + t];
-            a[1] = sm.q[g + 8u][k0 + t];
-            a[2] = sm.q[g][k0 + t + 4u];
-            a[3] = sm.q[g + 8u][k0 + t + 4u];
-            u32 b0[2] = {sm.kv[g][k0 + t], sm.kv[g][k0 + t + 4u]};
-            u32 b1[2] = {sm.kv[g + 8u][k0 + t], sm.kv[g + 8u][k0 + t + 4u]};
-            trellis::mma_m16n8k16(s0, a, b0);
-            trellis::mma_m16n8k16(s1, a, b1);
-        }
-        sm.red[warp][g][t * 2u] = s0[0];
-        sm.red[warp][g][t * 2u + 1u] = s0[1];
-        sm.red[warp][g + 8u][t * 2u] = s0[2];
-        sm.red[warp][g + 8u][t * 2u + 1u] = s0[3];
-        sm.red[warp][g][8u + t * 2u] = s1[0];
-        sm.red[warp][g][8u + t * 2u + 1u] = s1[1];
-        sm.red[warp][g + 8u][8u + t * 2u] = s1[2];
-        sm.red[warp][g + 8u][8u + t * 2u + 1u] = s1[3];
-        prim::block_sync();
+            for (u32 step = 0u; step < 9u; step++) {
+                u32 k0 = (warp * 9u + step) * 8u;
+                u32 a[4];
+                a[0] = sm.q[g][k0 + t];
+                a[1] = sm.q[g + 8u][k0 + t];
+                a[2] = sm.q[g][k0 + t + 4u];
+                a[3] = sm.q[g + 8u][k0 + t + 4u];
+                u32 b0[2] = {sm.kv[g][k0 + t], sm.kv[g][k0 + t + 4u]};
+                u32 b1[2] = {sm.kv[g + 8u][k0 + t], sm.kv[g + 8u][k0 + t + 4u]};
+                trellis::mma_m16n8k16(s0, a, b0);
+                trellis::mma_m16n8k16(s1, a, b1);
+            }
+            sm.red[warp][g][t * 2u] = s0[0];
+            sm.red[warp][g][t * 2u + 1u] = s0[1];
+            sm.red[warp][g + 8u][t * 2u] = s0[2];
+            sm.red[warp][g + 8u][t * 2u + 1u] = s0[3];
+            sm.red[warp][g][8u + t * 2u] = s1[0];
+            sm.red[warp][g][8u + t * 2u + 1u] = s1[1];
+            sm.red[warp][g + 8u][8u + t * 2u] = s1[2];
+            sm.red[warp][g + 8u][8u + t * 2u + 1u] = s1[3];
+            prim::block_sync();
 
-        if (tid < 16u) {
-            float sc[16];
-            float tmax = mla_neg_inf();
+            if (tid < 16u) {
+                float sc[16];
+                float tmax = mla_neg_inf();
 #pragma unroll
-            for (u32 c = 0u; c < 16u; c++) {
-                if (sm.j[c] != 0xFFFFFFFFu) {
-                    float v = (sm.red[0][tid][c] + sm.red[1][tid][c] + sm.red[2][tid][c] +
-                               sm.red[3][tid][c]) *
-                              scale;
-                    sc[c] = v;
-                    if (v > tmax) tmax = v;
-                } else {
-                    sc[c] = mla_neg_inf();
+                for (u32 c = 0u; c < 16u; c++) {
+                    if (sm.j[c] != 0xFFFFFFFFu) {
+                        float v = (sm.red[0][tid][c] + sm.red[1][tid][c] + sm.red[2][tid][c] +
+                                   sm.red[3][tid][c]) *
+                                  scale;
+                        sc[c] = v;
+                        if (v > tmax) tmax = v;
+                    } else {
+                        sc[c] = mla_neg_inf();
+                    }
                 }
-            }
-            float old_m = sm.m[tid];
-            float old_l = sm.l[tid];
-            float next_m = (old_m > tmax) ? old_m : tmax;
-            float corr = (old_l > 0.0f) ? expf(old_m - next_m) : 0.0f;
-            float psum = 0.0f;
+                float old_m = sm.m[tid];
+                float old_l = sm.l[tid];
+                float next_m = (old_m > tmax) ? old_m : tmax;
+                float corr = (old_l > 0.0f) ? __expf(old_m - next_m) : 0.0f;
+                float psum = 0.0f;
 #pragma unroll
-            for (u32 c = 0u; c < 16u; c += 2u) {
-                float p0v = (sm.j[c] != 0xFFFFFFFFu) ? expf(sc[c] - next_m) : 0.0f;
-                float p1v = (sm.j[c + 1u] != 0xFFFFFFFFu) ? expf(sc[c + 1u] - next_m) : 0.0f;
-                psum += p0v + p1v;
-                sm.p16[tid][c >> 1] = trellis::f32x2_to_f16x2(p0v, p1v);
+                for (u32 c = 0u; c < 16u; c += 2u) {
+                    float p0v = (sm.j[c] != 0xFFFFFFFFu) ? __expf(sc[c] - next_m) : 0.0f;
+                    float p1v = (sm.j[c + 1u] != 0xFFFFFFFFu) ? __expf(sc[c + 1u] - next_m) : 0.0f;
+                    psum += p0v + p1v;
+                    sm.p16[tid][c >> 1] = trellis::f32x2_to_f16x2(p0v, p1v);
+                }
+                sm.m[tid] = next_m;
+                sm.l[tid] = old_l * corr + psum;
+                sm.corr[tid] = corr;
             }
-            sm.m[tid] = next_m;
-            sm.l[tid] = old_l * corr + psum;
-            sm.corr[tid] = corr;
-        }
-        prim::block_sync();
+            prim::block_sync();
 
-        u32 a_p[4] = {sm.p16[g][t], sm.p16[g + 8u][t], sm.p16[g][t + 4u], sm.p16[g + 8u][t + 4u]};
-        float c0 = sm.corr[g];
-        float c1 = sm.corr[g + 8u];
+            u32 a_p[4] = {sm.p16[g][t], sm.p16[g + 8u][t], sm.p16[g][t + 4u],
+                          sm.p16[g + 8u][t + 4u]};
+            float c0 = sm.corr[g];
+            float c1 = sm.corr[g + 8u];
 #pragma unroll
-        for (u32 nt = 0u; nt < 18u; nt++) {
-            o[nt][0] *= c0;
-            o[nt][1] *= c0;
-            o[nt][2] *= c1;
-            o[nt][3] *= c1;
-            u32 col = d_base + nt * 8u + g;
-            u32 b_v[2];
-            b_v[0] = u32(kv16[r0 * 584u + col]) | (u32(kv16[(r0 + 1u) * 584u + col]) << 16);
-            b_v[1] = u32(kv16[r1 * 584u + col]) | (u32(kv16[(r1 + 1u) * 584u + col]) << 16);
-            trellis::mma_m16n8k16(o[nt], a_p, b_v);
+            for (u32 nt = 0u; nt < 18u; nt++) {
+                o[nt][0] *= c0;
+                o[nt][1] *= c0;
+                o[nt][2] *= c1;
+                o[nt][3] *= c1;
+                u32 col = d_base + nt * 8u + g;
+                u32 b_v[2];
+                b_v[0] = u32(kv16[r0 * 584u + col]) | (u32(kv16[(r0 + 1u) * 584u + col]) << 16);
+                b_v[1] = u32(kv16[r1 * 584u + col]) | (u32(kv16[(r1 + 1u) * 584u + col]) << 16);
+                trellis::mma_m16n8k16(o[nt], a_p, b_v);
+            }
+        }
+        if (p0 + 16u < p_end) {
+            mla_load_ids(ids, row, picks, from_list, from, to, p0 + 16u, p_end, tid, sm);
+            prim::block_sync();
         }
     }
 
@@ -314,7 +347,7 @@ extern "C" __global__ __launch_bounds__(160, 4) void tessera_mla_reduce(
         }
         float denom = 0.0f;
         for (u32 s = 0u; s < splits; s++) {
-            float w = (s_l[s] > 0.0f) ? expf(s_m[s] - best) : 0.0f;
+            float w = (s_l[s] > 0.0f) ? __expf(s_m[s] - best) : 0.0f;
             s_w[s] = w;
             denom += s_l[s] * w;
         }

@@ -45,14 +45,12 @@ fn entry_for(kv: &str) -> Option<&'static str> {
 
 fn mla_splits(rows: usize, hgroups: usize) -> usize {
     let groups = rows * hgroups;
-    if groups <= 4 {
+    if groups <= 8 {
         16
-    } else if groups <= 8 {
-        8
     } else if groups <= 16 {
-        4
+        8
     } else {
-        2
+        4
     }
 }
 
