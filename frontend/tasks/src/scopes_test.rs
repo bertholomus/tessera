@@ -1,8 +1,8 @@
-use crate::api::Params;
-use crate::scopes::{Boost, Curve, Sequence, Thinking, guide};
+use crate::api::{Params, ToolChoice};
+use crate::scopes::{Boost, Curve, Sequence, Thinking, guide, tool_guide};
 use tessera_bundle::ResponseParser;
 use tessera_bundle::tokenize::hf::Hf;
-use tessera_engine::{Edit, Penalties};
+use tessera_engine::{Allowed, Edit, Penalties};
 
 #[test]
 fn boost_specs() {
@@ -98,5 +98,33 @@ fn scoped_edits() {
     for (id, edits) in steps {
         guide.accept(id).unwrap();
         assert_eq!(guide.edits(), edits, "after {id}");
+    }
+}
+
+#[test]
+fn tool_guide_forces_prefix() {
+    let vocab = r#"{"model":{"type":"WordLevel","unk_token":"a","vocab":{"a":0,"<think>":1,"</think>":2,"<tool_call>":3,"ping":4}},"pre_tokenizer":{"type":"WhitespaceSplit"}}"#;
+    let cfg = r#"{"response_template":{"fields":{"thinking":{"open":"<think>","close":"</think>"},"tool_calls":{"open_pattern":"<tool_call>\\s*(?P<name>[^<\\s]+)","call_prefix":"<tool_call> {name}","close":"</tool_call>","content":"tags","content_args":{"pattern":"<arg_key>(?P<key>.*)</arg_key><arg_value>(?P<value>.*)</arg_value>"}}}}}"#;
+    let tok = Hf::from_json(vocab.as_bytes()).unwrap();
+    let p = ResponseParser::from_config(cfg).unwrap();
+    let direct = Params {
+        tool_choice: ToolChoice::Function("ping".into()),
+        ..Params::default()
+    };
+    let mut g = tool_guide(p.as_ref(), &tok, &direct).unwrap().unwrap();
+    for want in [3, 4] {
+        assert_eq!(g.allowed().unwrap(), Allowed::One(want));
+        g.accept(want).unwrap();
+    }
+    assert_eq!(g.allowed().unwrap(), Allowed::Any);
+    let think = Params {
+        starts_thinking: true,
+        tool_choice: ToolChoice::Required,
+        ..Params::default()
+    };
+    let mut g = tool_guide(p.as_ref(), &tok, &think).unwrap().unwrap();
+    for (tok_id, next) in [(0, Allowed::Any), (2, Allowed::One(3)), (3, Allowed::Any)] {
+        g.accept(tok_id).unwrap();
+        assert_eq!(g.allowed().unwrap(), next);
     }
 }

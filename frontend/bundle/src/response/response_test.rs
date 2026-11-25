@@ -272,3 +272,39 @@ fn parses_open_blocks() {
     assert_eq!(round.tool_calls.len(), 2);
     assert_eq!(round.tool_calls[1].function.name, "ping");
 }
+
+#[test]
+fn call_prefix_round_trips() {
+    let cases = [
+        (
+            "glm53",
+            "<tool_call><arg_key>",
+            "\n<arg_key>x</arg_key><arg_value>1</arg_value></tool_call>",
+        ),
+        ("qwen3", "<tool_call>", "{\"x\": 1}}</tool_call>"),
+        (
+            "qwen35",
+            "<tool_call><function=",
+            "\n<parameter=x>1</parameter></function></tool_call>",
+        ),
+        ("gemma4", "<|tool_call>call:", "{x:1}<tool_call|>"),
+        (
+            "deepseek",
+            "<｜tool▁call▁begin｜>",
+            "{\"x\": 1}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+        ),
+        ("granite", "<|tool_call|>", "{\"x\": 1}}"),
+        ("smollm2", "<tool_call>[", "{\"x\": 1}}</tool_call>"),
+    ];
+    for (name, hint, suffix) in cases {
+        let tmpl = crate::Template::new(hint.into()).unwrap();
+        let parser = ResponseParser::builtin(&tmpl).unwrap().expect(name);
+        let req = parser.call_prefix(None).expect(name);
+        assert!(!req.is_empty(), "{name} required prefix empty");
+        let named = parser.call_prefix(Some("get_weather")).expect(name);
+        let raw = format!("{named}{suffix}");
+        let parsed = parser.parse(&raw, true, false);
+        assert_eq!(parsed.tool_calls.len(), 1, "{name}: raw={raw:?}");
+        assert_eq!(parsed.tool_calls[0].function.name, "get_weather", "{name}");
+    }
+}

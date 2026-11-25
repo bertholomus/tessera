@@ -1,9 +1,9 @@
 //! Logit programs over answer, thinking and tool-call scopes.
 
-use crate::api::{Params, Refused};
+use crate::api::{Params, Refused, ToolChoice};
 use tessera_bundle::tokenize::hf::Hf;
 use tessera_bundle::{Markers, ResponseParser};
-use tessera_engine::{Guide, Move, Penalties, Program, Scoped, Term};
+use tessera_engine::{Allowed, Guide, Move, Penalties, Program, Scoped, Term};
 
 const ANSWER: u8 = 0;
 const THINKING: u8 = 1;
@@ -297,4 +297,95 @@ fn program(penalties: Penalties, thinking: Thinking, marks: Marks, max_tokens: u
         });
     }
     Program { moves, terms }
+}
+
+#[derive(Clone)]
+struct ToolGuide {
+    closes: Vec<Vec<u32>>,
+    max_close: usize,
+    recent: Vec<u32>,
+    prefix: Vec<u32>,
+    pos: usize,
+    forcing: bool,
+}
+
+impl Guide for ToolGuide {
+    fn allowed(&mut self) -> Result<Allowed, Box<dyn std::error::Error + Send + Sync>> {
+        if self.forcing && self.pos < self.prefix.len() {
+            Ok(Allowed::One(self.prefix[self.pos]))
+        } else {
+            Ok(Allowed::Any)
+        }
+    }
+
+    fn accept(&mut self, token: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !self.forcing {
+            self.recent.push(token);
+            if self.recent.len() > self.max_close {
+                let drop = self.recent.len() - self.max_close;
+                self.recent.drain(..drop);
+            }
+            if self.closes.iter().any(|c| self.recent.ends_with(c)) {
+                self.forcing = true;
+            }
+        } else if self.pos < self.prefix.len() {
+            self.pos += 1;
+        }
+        Ok(())
+    }
+
+    fn fork(&self) -> Option<Box<dyn Guide>> {
+        Some(Box::new(self.clone()))
+    }
+}
+
+/// Builds a guide that forces a tool-call prefix for `params.tool_choice`.
+pub(crate) fn tool_guide(
+    parser: Option<&ResponseParser>,
+    tokenizer: &Hf,
+    params: &Params,
+) -> Result<Option<Box<dyn Guide>>, Refused> {
+    let name = match &params.tool_choice {
+        ToolChoice::Auto => return Ok(None),
+        ToolChoice::Required => None,
+        ToolChoice::Function(name) => Some(name.as_str()),
+    };
+    let parser = parser.ok_or_else(|| {
+        Refused(
+            "this model does not support tool calling".into(),
+            "tool_choice",
+        )
+    })?;
+    let text = parser
+        .call_prefix(name)
+        .ok_or_else(|| Refused("this model cannot force a tool call".into(), "tool_choice"))?;
+    let prefix = tokenizer
+        .encode(&text)
+        .map_err(|e| Refused(e.to_string(), "tool_choice"))?;
+    if prefix.is_empty() {
+        return Err(Refused(
+            "tool call prefix encoded to no tokens".into(),
+            "tool_choice",
+        ));
+    }
+    let closes: Vec<Vec<u32>> = if params.starts_thinking {
+        parser
+            .markers()
+            .think_close
+            .into_iter()
+            .filter_map(|m| tokenizer.encode(m).ok().filter(|ids| !ids.is_empty()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let max_close = closes.iter().map(Vec::len).max().unwrap_or(0);
+    let forcing = closes.is_empty();
+    Ok(Some(Box::new(ToolGuide {
+        closes,
+        max_close,
+        recent: Vec::new(),
+        prefix,
+        pos: 0,
+        forcing,
+    })))
 }

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use tessera_bundle::{ResponseEvent, ResponseParser, ResponseStream, ToolCall};
 use tessera_engine::Ask;
-use tessera_tasks::api::{Finish, Params, Refused, Step};
+use tessera_tasks::api::{Finish, Params, Refused, Step, ToolChoice};
 
 /// An answer's OpenAI shape.
 #[derive(Clone, Copy, PartialEq)]
@@ -22,6 +22,7 @@ struct Parsing {
     parser: Option<ResponseParser>,
     tools: bool,
     thinking: bool,
+    tool_choice: ToolChoice,
 }
 
 impl Parsing {
@@ -30,6 +31,7 @@ impl Parsing {
             parser: None,
             tools: false,
             thinking: false,
+            tool_choice: ToolChoice::Auto,
         }
     }
 }
@@ -152,6 +154,7 @@ fn start(
         thinking,
         sequence,
         starts_thinking: parsing.thinking,
+        tool_choice: parsing.tool_choice.clone(),
     };
     let (sink, steps) = mpsc::channel();
     let prompt_tokens = prompt.len();
@@ -208,12 +211,19 @@ fn complete(model: &Model, body: &[u8], ask: Option<Ask>) -> Result<Started, Ref
 
 fn chat(model: &Model, body: &[u8], ask: Option<Ask>) -> Result<Started, Refusal> {
     let c: Chat = wire::parse(model, body)?;
-    let allow_tools = match &c.tool_choice {
-        Some(choice) => choice.allow()?,
-        None => true,
+    let given_tools = c.messages.tools.as_deref().unwrap_or(&[]);
+    let (allow_tools, tool_choice) = match &c.tool_choice {
+        Some(choice) => choice.resolve(given_tools)?,
+        None => (true, ToolChoice::Auto),
     };
+    if tool_choice != ToolChoice::Auto && c.common.response_format.is_some() {
+        return Err(bad(
+            "`tool_choice` cannot force a tool call with `response_format`",
+            "tool_choice",
+        ));
+    }
     let parser = model.chat.as_ref().and_then(|ch| ch.response().cloned());
-    let has_tools = allow_tools && c.messages.tools.as_ref().is_some_and(|t| !t.is_empty());
+    let has_tools = allow_tools && !given_tools.is_empty();
     if has_tools && parser.as_ref().is_none_or(|p| !p.supports_tools()) {
         return Err(bad("this model does not support tool calling", "tools"));
     }
@@ -228,6 +238,7 @@ fn chat(model: &Model, body: &[u8], ask: Option<Ask>) -> Result<Started, Refusal
         parser,
         tools,
         thinking,
+        tool_choice,
     };
     start(model, Kind::Chat, prompt, asked, c.common, parsing, ask)
 }

@@ -15,6 +15,7 @@
         "<｜tool▁calls▁end｜>"
       ],
       "open_pattern": "<｜tool▁call▁begin｜>(?:function<｜tool▁sep｜>)?(?P<name>[^\\n<]+)(?:\\n(?:```json\\n)?|<｜tool▁sep｜>)",
+      "call_prefix": "<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\n",
       "close": [
         "```<｜tool▁call▁end｜>",
         "<｜tool▁call▁end｜>"

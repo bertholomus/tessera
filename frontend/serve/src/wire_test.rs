@@ -128,3 +128,43 @@ fn reasoning_effort_forwards() {
     );
     assert_eq!(json(&slot, "/tokenize", Some(body)).0, 200);
 }
+
+#[test]
+fn tool_choice_validation() {
+    let slot = loaded(&Arc::new(MockGenerator::default()), true);
+    let tool = json!({"type": "function", "function": {"name": "ping"}});
+    let bad_cases = [
+        json!({"messages": [{"role": "user", "content": "hi"}], "tool_choice": "bogus"}),
+        json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [tool],
+            "tool_choice": {"type": "function", "function": {"name": "other"}},
+        }),
+        json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [tool],
+            "tool_choice": {"type": "function", "function": {"name": ""}},
+        }),
+        json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [tool],
+            "tool_choice": "required",
+            "response_format": {"type": "json_object"},
+        }),
+    ];
+    for body in bad_cases {
+        let (status, error) = json(&slot, "/v1/chat/completions", Some(body));
+        assert_eq!(
+            (status, &error["error"]["param"]),
+            (400, &json!("tool_choice"))
+        );
+    }
+    // Model without tool parser still rejects forced tool_choice on tools.
+    let req_body = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [tool],
+        "tool_choice": {"type": "function", "function": {"name": "ping"}},
+    });
+    let (status, error) = json(&slot, "/v1/chat/completions", Some(req_body));
+    assert_eq!((status, &error["error"]["param"]), (400, &json!("tools")));
+}
