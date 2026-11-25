@@ -157,8 +157,16 @@ impl Held {
 
     /// `bytes`, packed in the form, into the slot.
     pub fn upload(&mut self, slot: Slot, bytes: &[u8]) -> Result<(), Error> {
+        self.upload_at(slot, 0, bytes)
+    }
+
+    /// `bytes` into `slot` starting at byte `offset`.
+    pub fn upload_at(&mut self, slot: Slot, offset: usize, bytes: &[u8]) -> Result<(), Error> {
+        assert!(offset + bytes.len() <= slot.bytes(), "upload_at past slot");
         let at = self.bound[slot.buffer as usize];
-        Ok(self.all[at].backing_mut().upload(slot.start(), bytes)?)
+        Ok(self.all[at]
+            .backing_mut()
+            .upload(slot.start() + offset, bytes)?)
     }
 
     /// Reads raw bytes from `slot` starting `offset` bytes in.

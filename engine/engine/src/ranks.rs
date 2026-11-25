@@ -1,5 +1,6 @@
 //! An engine as one rank of several.
 
+use crate::lanes::{decode_patches, encode_patches};
 use crate::{Engine, Error, Head, Row};
 use std::path::Path;
 use tessera_engine_comm::{Reader, Transport, Writer};
@@ -170,8 +171,8 @@ impl Engine {
             let Some(t) = decode(&told) else {
                 return Ok(());
             };
-            if let (Some(lanes), false) = (&mut self.lanes, t.table.is_empty()) {
-                lanes.replace(t.table);
+            if let (Some(lanes), false) = (&mut self.lanes, t.patches.is_empty()) {
+                lanes.apply(&t.patches);
             }
             self.run(&t.rows, &t.picks, t.head, t.wants)?;
             self.report();
@@ -309,12 +310,12 @@ impl Engine {
             Some(control) if control.rank() == 0 => {}
             _ => return Ok(()),
         }
-        let table = self
+        let patches = self
             .lanes
             .as_ref()
-            .and_then(crate::lanes::Lanes::pending)
-            .unwrap_or(&[]);
-        let bytes = encode(rows, picks, head, wants, table);
+            .map(crate::lanes::Lanes::pending)
+            .unwrap_or_default();
+        let bytes = encode(rows, picks, head, wants, &patches);
         self.told(&bytes).map(|_| ())
     }
 
@@ -374,22 +375,26 @@ const LAUNCH: u32 = 0;
 const PROFILE_ON: u32 = 1;
 const PROFILE_OFF: u32 = 2;
 
-/// A launch as words: head, wants, table, rows, picks, lists.
-fn encode(rows: &[Row], picks: &[u32], head: &Head, wants: Wants, table: &[u32]) -> Vec<u8> {
+/// A launch as words: head, wants, patches, rows, picks, lists.
+fn encode(
+    rows: &[Row],
+    picks: &[u32],
+    head: &Head,
+    wants: Wants,
+    patches: &[(u32, &[u32])],
+) -> Vec<u8> {
     let (tag, k, list, edits): (u32, usize, &[u32], &[u32]) = match head {
         Head::Full(None) => (0, 0, &[], &[]),
         Head::Full(Some(masks)) => (1, 0, masks, &[]),
         Head::Sparse(ids, k) => (2, *k, ids, &[]),
         Head::Edited(masks, edits, k) => (3, *k, masks, edits),
     };
-    let count = 8 + table.len() + rows.len() * 3 + picks.len() + list.len() + edits.len();
+    let pwords: usize = patches.iter().map(|(_, v)| 2 + v.len()).sum();
+    let count = 8 + pwords + rows.len() * 3 + picks.len() + list.len() + edits.len();
     let mut words = Writer(Vec::with_capacity(count * 4));
-    words
-        .u32(tag)
-        .u32(k as u32)
-        .u32(wants.0)
-        .u32s(table)
-        .u32((rows.len() * 3) as u32);
+    words.u32(tag).u32(k as u32).u32(wants.0);
+    encode_patches(&mut words, patches);
+    words.u32((rows.len() * 3) as u32);
     for r in rows {
         words.u32(r.slot).u32(r.token).u32(r.position);
     }
@@ -403,15 +408,16 @@ struct Told {
     picks: Vec<u32>,
     head: Head,
     wants: Wants,
-    /// The page table, or empty if it did not change.
-    table: Vec<u32>,
+    /// Changed page-table slices, empty if unchanged.
+    patches: Vec<(u32, Vec<u32>)>,
 }
 
 /// The launch `bytes` hold, if they hold one.
 fn decode(bytes: &[u8]) -> Option<Told> {
     let mut words = Reader(bytes);
     let (tag, k) = (words.u32()?, words.u32()?);
-    let (wants, table) = (Wants(words.u32()?), words.u32s()?);
+    let wants = Wants(words.u32()?);
+    let patches = decode_patches(&mut words)?;
     let count = words.u32()? as usize;
     let mut raw = Reader(words.take(count.checked_mul(4)?)?);
     let mut rows = Vec::with_capacity(count / 3);
@@ -434,7 +440,7 @@ fn decode(bytes: &[u8]) -> Option<Told> {
         picks,
         head,
         wants,
-        table,
+        patches,
     })
 }
 

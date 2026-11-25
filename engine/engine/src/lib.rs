@@ -902,9 +902,10 @@ impl Engine {
         let outputs = plan.outputs.iter().map(|o| o.slot).collect();
         self.runner.replan(plan)?;
         let planned = Instant::now();
-        let table = plan.table.zip(self.lanes.as_mut());
-        if let Some((table, bytes)) = table.and_then(|(t, l)| Some((t, l.changed()?))) {
-            self.runner.held_mut().upload(table, &bytes)?;
+        if let (Some(table), Some(lanes)) = (plan.table, self.lanes.as_mut()) {
+            for (offset, bytes) in lanes.take_dirty() {
+                self.runner.held_mut().upload_at(table, offset, &bytes)?;
+            }
         }
         self.runner.bind_all(&bound);
         let views: Vec<_> = feeds.iter().map(Tensor::view).collect();
