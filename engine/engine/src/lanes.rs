@@ -4,6 +4,8 @@
 pub(crate) struct Lanes {
     /// Rows per page.
     pub page: usize,
+    /// Physical pages in the shared pool.
+    pool: usize,
     /// Entries per slot.
     width: usize,
     table: Vec<u32>,
@@ -12,24 +14,43 @@ pub(crate) struct Lanes {
 }
 
 impl Lanes {
-    /// Each slot owns its own pages, in order.
-    pub fn new(page: usize, entries: usize, slots: usize) -> Self {
+    /// Page table for `slots`, backed by `pool` physical pages.
+    pub fn new(page: usize, entries: usize, slots: usize, pool: usize) -> Self {
+        let pool = pool.max(1);
+        let table = match pool < entries {
+            true => vec![0; entries],
+            false => (0..entries as u32).collect(),
+        };
         Self {
             page,
+            pool,
             width: entries / slots,
-            table: (0..entries as u32).collect(),
+            table,
             stale: true,
         }
     }
 
-    /// Pages in the table.
+    /// Physical pages in the pool.
     pub fn pages(&self) -> usize {
-        self.table.len()
+        self.pool
     }
 
-    /// Gives each slot its own pages again.
+    /// Whether slots share fewer physical pages than full capacity.
+    pub fn shared(&self) -> bool {
+        self.pool < self.table.len()
+    }
+
+    /// Resets the table to its initial page map.
     pub fn reset(&mut self) {
-        let own = 0..self.table.len() as u32;
+        let len = self.table.len();
+        if self.shared() {
+            if self.table.iter().any(|&p| p != 0) {
+                self.table.fill(0);
+                self.stale = true;
+            }
+            return;
+        }
+        let own = 0..len as u32;
         if !own.clone().eq(self.table.iter().copied()) {
             self.table = own.collect();
             self.stale = true;

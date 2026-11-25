@@ -335,7 +335,11 @@ impl Engine {
         let (sizes, _) = launch_of(&first, &[0], slots, context);
         let plan = plans.lower(&graph, full, &sizes, &device)?;
         let lanes = plan.table.zip(recipe.kept.page());
-        let lanes = lanes.map(|(table, page)| lanes::Lanes::new(page, table.len, slots));
+        let pool = plan.pool_pages;
+        let lanes = lanes.map(|(table, page)| {
+            let pages = if pool > 0 { pool } else { table.len };
+            lanes::Lanes::new(page, table.len, slots, pages)
+        });
         let mut runner = run(plan)?;
         runner.launching(recipe.launch);
         runner.profiling(settings.profile.is_some());

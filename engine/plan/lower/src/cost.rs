@@ -73,6 +73,9 @@ pub struct Device {
     /// Where kept rows lie.
     #[serde(skip, default = "dense")]
     pub kept: &'static dyn Layout,
+    /// Shared paged KV row capacity across all slots.
+    #[serde(skip)]
+    pub kept_rows: Option<usize>,
     /// Model config JSON for runtime rules.
     #[serde(skip)]
     pub config: Option<String>,
@@ -160,6 +163,7 @@ impl Default for Device {
             pins: Pins::default(),
             compute: Compute::default(),
             kept: dense(),
+            kept_rows: None,
             config: None,
             generation: 0,
             memo: RefCell::default(),
@@ -248,6 +252,7 @@ impl Device {
         self.barred = recipe.barred.clone();
         self.made = recipe.rules.clone();
         self.kept = recipe.kept;
+        self.kept_rows = recipe.kept_rows;
         self.config = recipe.config.clone();
         self.changed()
     }

@@ -1,6 +1,7 @@
 //! Many answers in flight, one step feeding them all.
 
 use crate::kept::{Kept, Totals};
+use crate::lanes::Lanes;
 use crate::{Allowed, Engine, Error, Event, Reason, Request, Row, ends};
 use std::collections::VecDeque;
 
@@ -154,6 +155,8 @@ pub struct Batch<'a> {
     engine: &'a mut Engine,
     policy: Box<dyn Policy>,
     waiting: VecDeque<(Request, Sink)>,
+    /// Active answers paused when the shared pool filled.
+    paused: VecDeque<Seq>,
     active: Vec<Seq>,
     /// Admitted reads, run before the next step.
     reading: Vec<Seq>,
@@ -167,20 +170,26 @@ pub struct Batch<'a> {
 impl<'a> Batch<'a> {
     pub fn new(engine: &'a mut Engine, policy: Box<dyn Policy>) -> Self {
         let free = (0..engine.slots as u32).rev().collect();
+        let shared = engine.lanes.as_ref().is_some_and(Lanes::shared);
         if let Some(lanes) = &mut engine.lanes {
             lanes.reset();
         }
         let budget = engine.context;
-        Self {
+        let mut batch = Self {
             engine,
             policy,
             waiting: VecDeque::new(),
+            paused: VecDeque::new(),
             active: Vec::new(),
             reading: Vec::new(),
             free,
             kept: None,
             budget,
+        };
+        if shared {
+            batch.reuse();
         }
+        batch
     }
 
     /// Finished answers keep rows. Set it before any step.
@@ -216,7 +225,7 @@ impl<'a> Batch<'a> {
 
     /// Whether any answer is queued or in flight.
     pub fn busy(&self) -> bool {
-        !self.waiting.is_empty() || !self.active.is_empty()
+        !self.waiting.is_empty() || !self.paused.is_empty() || !self.active.is_empty()
     }
 
     /// A slot for the next answer, and its kept rows.
@@ -235,8 +244,28 @@ impl<'a> Batch<'a> {
         }
     }
 
-    /// Admits waiting answers while slots are free.
+    /// Resumes paused answers, then admits waiting ones.
     fn admit(&mut self) {
+        while let Some(front) = self.paused.front() {
+            let tokens: Vec<u32> = front.pending.iter().copied().collect();
+            let limit = match self.engine.stateful() {
+                true => 0,
+                false => tokens.len().saturating_sub(1),
+            };
+            let placed = match &mut self.kept {
+                Some(kept) => kept.admit(&tokens, limit),
+                None => self.free.pop().map(|slot| (slot, 0)),
+            };
+            let Some((slot, skip)) = placed else {
+                return;
+            };
+            let mut seq = self.paused.pop_front().expect("a paused answer");
+            seq.slot = slot;
+            seq.history = tokens[..skip].to_vec();
+            seq.pending = tokens[skip..].iter().copied().collect();
+            seq.fed = skip;
+            self.active.push(seq);
+        }
         while let Some((slot, skip)) = self.place() {
             let (request, sink) = self.waiting.pop_front().expect("a waiting answer");
             PROMPT.add(request.tokens.len() as u64);
@@ -326,6 +355,25 @@ impl<'a> Batch<'a> {
         self.retire(seq);
     }
 
+    /// Pauses the newest active answer to free shared pages.
+    fn preempt(&mut self) -> bool {
+        if self.active.len() <= 1 {
+            return false;
+        }
+        let mut seq = self.active.pop().expect("an active answer");
+        let mut all = std::mem::take(&mut seq.history);
+        let kept_tokens = all.clone();
+        all.extend(seq.pending.drain(..));
+        match &mut self.kept {
+            Some(kept) => kept.finish(seq.slot, kept_tokens),
+            None => self.free.push(seq.slot),
+        }
+        seq.pending = all.into();
+        seq.fed = 0;
+        self.paused.push_front(seq);
+        true
+    }
+
     /// Frees an answer's slot, or keeps its rows.
     fn retire(&mut self, seq: Seq) {
         match &mut self.kept {
@@ -381,11 +429,17 @@ impl<'a> Batch<'a> {
         self.admit();
         let read = self.read()?;
         self.fit();
-        let rows = self.policy.pick(&self.active, self.budget);
-        if rows.is_empty() {
-            return Ok(read);
-        }
-        self.page(&rows)?;
+        let rows = loop {
+            let rows = self.policy.pick(&self.active, self.budget);
+            if rows.is_empty() {
+                return Ok(read);
+            }
+            match self.page(&rows) {
+                Ok(()) => break rows,
+                Err(Error::Kept(tessera_kv::Error::NoRoom(_))) if self.preempt() => continue,
+                Err(e) => return Err(e),
+            }
+        };
         let ends = ends(&rows);
         let ids = match self.allowed(&rows, &ends) {
             Some(allowed) => self.engine.last_guided(&rows, &allowed)?,

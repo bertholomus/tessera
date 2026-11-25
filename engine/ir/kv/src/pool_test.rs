@@ -81,7 +81,8 @@ fn random_calls() {
             let pick = (seed >> 33) as usize;
             let run = runs.get(pick / 8 % runs.len().max(1)).copied();
             let before = pool.digest();
-            let done = match (pick % 7, run) {
+            let done = match (pick % 8, run) {
+                (7, Some(r)) => pool.widen(r, 8 + pick % 17),
                 (1, Some(r)) => pool.fork(r, pick % 9, 16).map(|r| runs.push(r)),
                 (2, Some(r)) => pool.grow(r, pick % 17).map(drop),
                 (3, Some(r)) => pool.truncate(r, pick % 9),
@@ -100,4 +101,17 @@ fn random_calls() {
             }
         }
     }
+}
+
+#[test]
+fn widen_shares_pool() {
+    let mut pool = Pool::new(3, 4);
+    let a = pool.reserve(T, 4, 4).unwrap();
+    let b = pool.reserve(T, 4, 4).unwrap();
+    pool.widen(a, 8).unwrap();
+    pool.grow(a, 8).unwrap();
+    assert_eq!(pool.widen(b, 8), Err(Error::NoRoom(1)));
+    pool.release(a).unwrap();
+    pool.widen(b, 12).unwrap();
+    pool.grow(b, 12).unwrap();
 }

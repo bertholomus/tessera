@@ -239,9 +239,21 @@ impl Emit {
                 let node = tree.node(t);
                 let all = &node.shape;
                 let width: usize = all[2..].iter().product();
-                let room = tree.kept.rows(all[0], context) * width;
+                let (rows, pool_pages) = match (tree.kept.page(), tree.kept_rows) {
+                    (Some(page), Some(cap)) => {
+                        let pages = cap.max(context).div_ceil(page);
+                        (pages * page, pages)
+                    }
+                    (Some(page), None) => {
+                        let rows = tree.kept.rows(all[0], context);
+                        (rows, rows / page)
+                    }
+                    (None, _) => (tree.kept.rows(all[0], context), 0),
+                };
+                let room = rows * width;
                 let entries = kept::entries(tree.kept, all[0], context);
                 self.out.table = self.out.table.max(entries);
+                self.out.pool_pages = self.out.pool_pages.max(pool_pages);
                 let len: usize = all.iter().product();
                 let interleaved = tree.kept.name() == "interleaved";
                 let page_rows = match (tree.kept.page(), interleaved) {

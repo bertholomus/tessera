@@ -76,6 +76,8 @@ pub struct Selected {
     pub outputs: Vec<(Val, Vec<usize>)>,
     /// Page table entries, when kept rows are paged.
     pub table: usize,
+    /// Physical pages in the kept pool, when paged.
+    pub pool_pages: usize,
     /// Rules that competed with another at some site.
     pub contested: BTreeSet<&'static str>,
     /// Each rule's runnable ways, as the kernels they launch.
@@ -160,6 +162,7 @@ fn select_with(
     )?
     .with_compute(device.compute);
     tree.config = device.config.clone();
+    tree.kept_rows = device.kept_rows;
     let whole: Vec<&Rule> = rules
         .iter()
         .copied()

@@ -46,3 +46,13 @@ fn flags_pick_entries() {
     o.flag("--task", "image".into()).unwrap();
     assert!(pick(&o).is_err());
 }
+
+#[test]
+fn kv_cache_tokens_pages() {
+    let mut opts = Options::default();
+    assert!(opts.flag("--kv-cache-tokens", "0".into()).is_none());
+    assert!(opts.flag("--kv-cache-tokens", "1024".into()).is_some());
+    let recipe = super::generate::lowering(&opts, None);
+    assert_eq!(recipe.kept.name(), "paged");
+    assert_eq!(recipe.kept_rows, Some(1024));
+}

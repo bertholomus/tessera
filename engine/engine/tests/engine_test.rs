@@ -960,3 +960,39 @@ fn cpu_row_stages() {
         assert!(off < 1e-4, "{act:?}: off by {off:e}");
     }
 }
+
+#[test]
+fn shared_pool_preempts() {
+    let mut cfg = mla::Config::glm53_small();
+    cfg.stack.max_context = 32;
+    let g = mla::stepper::<mla::RotatedMoe>(&cfg);
+    let weights = weights(&g, &mut Noise(11));
+    let stored: Vec<Weight> = weights.iter().cloned().map(Weight::Floats).collect();
+    let prompts: [&[u32]; 4] = [
+        &[3, 9, 4, 11, 2, 7, 5, 1, 8, 6],
+        &[5, 2, 8, 1, 9, 3, 4, 6, 7, 10],
+        &[12, 1, 6, 7, 10, 2, 3, 8, 5, 4],
+        &[2, 14, 1, 5, 9, 4, 7, 3, 6, 8],
+    ];
+    let settings = Settings::default();
+    let mut solo = Engine::open(g.clone(), 32, &Recipe::default(), &settings).unwrap();
+    solo.load(&stored).unwrap();
+    let want: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|p| {
+            let mut b = Batch::new(&mut solo, Box::new(Fair));
+            asked(&mut b, &[p]).0.pop().unwrap()
+        })
+        .collect();
+    let recipe = Recipe {
+        kept: &kept::PAGED16,
+        kept_rows: Some(32),
+        ..Recipe::default()
+    };
+    let mut shared = Engine::open(g, 32, &recipe, &settings).unwrap();
+    shared.load(&stored).unwrap();
+    let mut batch = Batch::new(&mut shared, Box::new(Fair));
+    let (got, _) = asked(&mut batch, &prompts);
+    assert_eq!(got, want);
+    assert_eq!(batch.totals().unwrap().pool.size, 32);
+}

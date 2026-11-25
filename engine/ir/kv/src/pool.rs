@@ -189,6 +189,20 @@ impl Pool {
         Ok(self.add(run))
     }
 
+    /// Raises a live run's worst-case row limit when room allows.
+    pub fn widen(&mut self, run: RunId, worst: usize) -> Result<(), Error> {
+        let at = self.live_at(run)?;
+        let cur = self.run_at(at).worst;
+        if worst <= cur {
+            return Ok(());
+        }
+        let extra = self.span(worst).saturating_sub(self.span(cur));
+        self.fits(extra, 0)?;
+        self.run_mut(at).worst = worst;
+        debug_assert!(self.consistent());
+        Ok(())
+    }
+
     /// Grows a live run. Make the copies before the launch.
     pub fn grow(&mut self, run: RunId, rows: usize) -> Result<Vec<PageCopy>, Error> {
         let at = self.live_at(run)?;

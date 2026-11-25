@@ -184,6 +184,8 @@ pub struct Plan {
     pub kept_info: Vec<KeptInfo>,
     /// Each slot's pages, when kept rows are paged.
     pub table: Option<Slot>,
+    /// Physical pages in the kept pool, when paged.
+    pub pool_pages: usize,
     /// One per input port of the entry.
     pub inputs: Vec<Slot>,
     pub outputs: Vec<Output>,

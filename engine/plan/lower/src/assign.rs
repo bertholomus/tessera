@@ -257,6 +257,7 @@ impl Buffers<'_> {
                     dims,
                     shape,
                 });
+                self.plan.pool_pages = self.s.pool_pages;
             }
         }
         for (buffer, size) in arenas.into_values() {

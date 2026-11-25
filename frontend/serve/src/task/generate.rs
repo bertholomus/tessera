@@ -55,6 +55,9 @@ pub(super) fn lowering(options: &Options, pins: Option<Pins>) -> Recipe {
         }
     }
     recipe.pins = kv_pin(options, recipe.pins);
+    if let Some(tokens) = options.kv_cache_tokens {
+        recipe.share_kept(tokens);
+    }
     if options.require_favored {
         recipe.require_favored = true;
     }

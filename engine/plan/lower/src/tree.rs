@@ -85,6 +85,8 @@ pub struct Tree<'a> {
     pub(crate) sizes: Vec<(DimName, u64)>,
     /// Where kept rows lie.
     pub kept: &'static dyn Layout,
+    /// Shared paged KV row capacity across all slots.
+    pub kept_rows: Option<usize>,
     /// Operand precision for matrix-unit kernels.
     pub compute: Compute,
     /// Model config JSON for runtime rules.
@@ -336,6 +338,7 @@ impl<'a> Tree<'a> {
             ports: Vec::new(),
             sizes: sizes.to_vec(),
             kept,
+            kept_rows: None,
             compute: Compute::default(),
             config: None,
             parts: parts.clone(),

@@ -45,6 +45,9 @@ pub struct Recipe {
     /// Where kept rows lie, by slot and position.
     #[serde(default = "dense", with = "by_name")]
     pub kept: &'static dyn Layout,
+    /// Shared paged KV row capacity across all slots.
+    #[serde(default)]
+    pub kept_rows: Option<usize>,
     /// Rules made at run time, beside the linked ones.
     #[serde(skip)]
     pub rules: Vec<&'static Rule>,
@@ -144,6 +147,7 @@ impl Default for Recipe {
             barred: Vec::new(),
             launch: Launching::default(),
             kept: dense(),
+            kept_rows: None,
             rules: Vec::new(),
             config: None,
         }
@@ -151,6 +155,14 @@ impl Default for Recipe {
 }
 
 impl Recipe {
+    /// Shares a paged KV pool of `rows` rows across slots.
+    pub fn share_kept(&mut self, rows: usize) {
+        self.kept_rows = Some(rows);
+        if self.kept.page().is_none() {
+            self.kept = kept::named("paged").expect("paged layout");
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self, std::io::Error> {
         let text = std::fs::read_to_string(path)?;
         serde_json::from_str(&text).map_err(std::io::Error::other)

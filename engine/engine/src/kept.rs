@@ -35,6 +35,8 @@ pub(crate) struct Kept {
     free: Vec<u32>,
     /// Paged: the pages each slot's lane names.
     laned: Option<Vec<usize>>,
+    /// Paged: slots share fewer physical pages than full capacity.
+    shared: bool,
     hits: u64,
     misses: u64,
 }
@@ -48,6 +50,7 @@ impl Kept {
             runs: vec![None; slots],
             free: Vec::new(),
             laned: None,
+            shared: false,
             hits: 0,
             misses: 0,
         }
@@ -60,6 +63,7 @@ impl Kept {
             index: Prefixes::new(page),
             free: (0..slots as u32).rev().collect(),
             laned: Some(vec![0; slots]),
+            shared: pages < slots * context.div_ceil(page),
             ..Self::new(slots, context)
         }
     }
@@ -83,13 +87,17 @@ impl Kept {
             return Some((slot, skip));
         };
         let slot = *self.free.last()?;
+        let need = match self.shared {
+            true => prompt.len().max(1).min(worst),
+            false => worst,
+        };
         let forked = hit.and_then(|(run, skip)| {
-            let run = self.pool.fork(run, skip, worst).ok()?;
+            let run = self.pool.fork(run, skip, need).ok()?;
             Some((run, skip))
         });
         let (run, skip) = match forked {
             Some(found) => found,
-            None => (self.pool.reserve(TAG, 0, worst).ok()?, 0),
+            None => (self.pool.reserve(TAG, 0, need).ok()?, 0),
         };
         self.free.pop();
         self.runs[slot as usize] = Some(run);
@@ -129,6 +137,9 @@ impl Kept {
             return Ok(None);
         };
         let run = self.runs[slot as usize].ok_or(Error::RowPlace)?;
+        if self.shared {
+            self.pool.widen(run, rows)?;
+        }
         // Runs share only whole pages, so no row moves.
         if !self.pool.grow(run, rows)?.is_empty() {
             return Err(Error::SharedPage);
