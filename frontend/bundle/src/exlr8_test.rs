@@ -147,3 +147,23 @@ fn ple_sizes_from_config() {
     assert!(ple(&ask, &ints(3)).is_err());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn module_picks_manifest() {
+    let dir = tessera_testkit::scratch(&format!("{}-module-manifest", std::process::id()));
+    std::fs::create_dir_all(dir.join("dense")).unwrap();
+    std::fs::create_dir_all(dir.join("manifests")).unwrap();
+    let header = br#"{"__metadata__":{"format":"pt"}}"#;
+    let mut st = Vec::from((header.len() as u64).to_le_bytes());
+    st.extend_from_slice(header);
+    std::fs::write(dir.join("dense/exlr8-vocab.safetensors"), &st).unwrap();
+    std::fs::write(dir.join("manifests/exlr8-manifest-a.json"), "{}").unwrap();
+    std::fs::write(dir.join("manifests/exlr8-manifest-b.json"), "{}").unwrap();
+    let overrides = Overrides::default();
+    let none = crate::module_ask(&dir, [1, 16], &[], &overrides, "{}", None);
+    let err = crate::offer(none.dir, none.manifest).err().unwrap();
+    assert!(err.to_string().contains("pick one"), "got: {err}");
+    let picked = crate::module_ask(&dir, [1, 16], &[], &overrides, "{}", Some("a"));
+    assert!(crate::offer(picked.dir, picked.manifest).is_ok());
+    std::fs::remove_dir_all(dir).unwrap();
+}

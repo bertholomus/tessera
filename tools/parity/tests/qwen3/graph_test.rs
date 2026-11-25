@@ -22,6 +22,7 @@ fn module_generates() {
     };
     let (model, prompt) = (dir.join("model"), "The capital of France is");
     let want = answer(tessera_bundle::load(&model, 1, 64).unwrap(), prompt);
-    let built = tessera_bundle::load_module(&model, [1, 64], &[], &Overrides::default(), &module());
+    let built =
+        tessera_bundle::load_module(&model, [1, 64], &[], &Overrides::default(), None, &module());
     assert_eq!(answer(built.unwrap().unwrap(), prompt), want);
 }

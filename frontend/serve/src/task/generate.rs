@@ -132,7 +132,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     let manifest = load.given("--manifest");
     let module = o.module.as_deref();
     let reading = o.progress.step("read model", Unit::Items, None);
-    let built = module.map(|m| tessera_bundle::load_module(&o.model, at, &rules, &o.config, m));
+    let built = module.map(|m| tessera_bundle::load_module(&o.model, at, &rules, &o.config, manifest, m));
     let loaded = match built.transpose().map_err(|e| e.to_string())?.flatten() {
         Some(bundle) => bundle,
         None => tessera_bundle::load_named(&o.model, at, &rules, steps, &o.config, manifest)
