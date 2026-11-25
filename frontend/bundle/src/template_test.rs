@@ -141,3 +141,21 @@ fn forwards_clear_thinking() {
     assert_eq!(at(Some(false)), "False");
     assert_eq!(at(Some(true)), "True");
 }
+
+#[test]
+fn developer_role_maps() {
+    let sys_only = "{% for m in messages %}{% if m.role == 'system' %}<|sys|>{{ m.content }}{% elif m.role == 'user' %}<|usr|>{{ m.content }}{% endif %}{% endfor %}";
+    let msgs = [
+        Message::text("developer", "be brief"),
+        Message::text("user", "hi"),
+    ];
+    let t = Template::new(sys_only.into()).unwrap();
+    assert_eq!(t.render(&msgs, true).unwrap(), "<|sys|>be brief<|usr|>hi");
+
+    let with_dev = "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}{% if false %}developer{% endif %}";
+    let t2 = Template::new(with_dev.into()).unwrap();
+    assert_eq!(
+        t2.render(&msgs, true).unwrap(),
+        "developer:be brief;user:hi;"
+    );
+}

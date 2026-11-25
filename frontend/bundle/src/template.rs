@@ -379,28 +379,39 @@ impl Template {
         template.render(Value::from(ctx))
     }
 
-    /// `messages` with the tool prompt in the system message.
+    /// `messages` with `developer` normalized and any tool prompt added.
     fn prepared<'m>(
         &self,
         messages: &'m [Message],
         tools: &[serde_json::Value],
     ) -> Result<Cow<'m, [Message]>, minijinja::Error> {
-        if tools.is_empty() || !self.tool_prompt {
+        let remap = !self.mentions("developer") && messages.iter().any(|m| m.role == "developer");
+        let add_tools = !tools.is_empty() && self.tool_prompt;
+        if !remap && !add_tools {
             return Ok(Cow::Borrowed(messages));
         }
-        let tools = Value::from(Serde(tools));
-        let text = self
-            .env
-            .get_template("tools")?
-            .render(minijinja::context! { tools })?;
         let mut out = messages.to_vec();
-        match out.first_mut() {
-            Some(first) if first.role == "system" => {
-                let content = first.content.get_or_insert_default();
-                content.push_str("\n\n");
-                content.push_str(&text);
+        if remap {
+            for m in &mut out {
+                if m.role == "developer" {
+                    m.role = "system".into();
+                }
             }
-            _ => out.insert(0, Message::text("system", text)),
+        }
+        if add_tools {
+            let tools = Value::from(Serde(tools));
+            let text = self
+                .env
+                .get_template("tools")?
+                .render(minijinja::context! { tools })?;
+            match out.first_mut() {
+                Some(first) if first.role == "system" => {
+                    let content = first.content.get_or_insert_default();
+                    content.push_str("\n\n");
+                    content.push_str(&text);
+                }
+                _ => out.insert(0, Message::text("system", text)),
+            }
         }
         Ok(Cow::Owned(out))
     }
