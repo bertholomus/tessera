@@ -1,8 +1,10 @@
 //! An engine as one rank of several.
 
 use crate::{Engine, Error, Head, Row};
+use std::path::Path;
 use tessera_engine_comm::{Reader, Transport, Writer};
 use tessera_graph::{DType, Graph, Parts, Whole, shard_mode};
+use tessera_kv::{DiskKv, DiskMsg, StoreStats, decode_msg};
 use tessera_lower::{Cluster, Device, Pins, Recipe, Settings, Wants, Wires, ZoneKind};
 use tessera_run::{Profile, Rank, Ranks, Run, Sum, sum_wire};
 
@@ -161,6 +163,10 @@ impl Engine {
             let Some(told) = self.told(&held.map_or(Vec::new(), |(_, p)| p.to_bytes()))? else {
                 return Ok(());
             };
+            if let Some(d) = decode_msg(&told) {
+                let _ = self.disk_exec(d, false)?;
+                continue;
+            }
             let Some(t) = decode(&told) else {
                 return Ok(());
             };
@@ -303,6 +309,56 @@ impl Engine {
             .unwrap_or(&[]);
         let bytes = encode(rows, picks, head, wants, table);
         self.told(&bytes).map(|_| ())
+    }
+
+    /// Default paged KV layout for disk caching.
+    pub fn paged_layout() -> &'static dyn tessera_lower::kept::Layout {
+        tessera_lower::kept::named("paged").expect("paged layout")
+    }
+
+    /// Attaches an on-disk page cache under `dir` bounded to `max_bytes`.
+    pub fn set_kv_store(&mut self, dir: &Path, max_bytes: u64) -> Result<(), Error> {
+        if self.stateful {
+            return Err(Error::Stateful);
+        }
+        let page = self.lanes.as_ref().map(|l| l.page).ok_or(Error::RowPlace)?;
+        let (r, n) = (self.runner.plan().rank, self.runner.plan().ranks);
+        let meta = self.runner.kept_page_meta(page).ok_or(Error::RowPlace)?;
+        let d = DiskKv::open(dir, max_bytes, r, n, page, &meta).ok_or(Error::RowPlace)?;
+        self.disk = Some(d.map_err(Error::Store)?);
+        Ok(())
+    }
+
+    /// Disk KV cache stats, if a store is attached.
+    pub fn kv_store_stats(&self) -> Option<StoreStats> {
+        self.disk.as_ref().map(DiskKv::stats)
+    }
+
+    /// Runs a disk cache op locally, broadcasting when `lead`.
+    pub(crate) fn disk_exec(&mut self, msg: DiskMsg, lead: bool) -> Result<usize, Error> {
+        if msg.is_empty() || self.disk.is_none() {
+            return Ok(0);
+        }
+        if lead && self.control.as_ref().is_some_and(|c| c.rank() == 0) {
+            let _ = self.told(&msg.encode())?;
+        }
+        let (disk, run) = (self.disk.as_mut().expect("disk"), &mut self.runner);
+        let (mine, sync) = disk.exec(&msg, Error::Store, |up, p, g, b| {
+            let ok = if up {
+                run.upload_kept_page(p, g, b)?
+            } else {
+                run.download_kept_page(p, g, b)?
+            };
+            ok.then_some(()).ok_or(Error::RowPlace)
+        })?;
+        let Some(c) = self.control.as_mut().filter(|_| sync) else {
+            return Ok(if sync { mine as usize } else { 0 });
+        };
+        let parts = c
+            .exchange(&mine.to_le_bytes())
+            .map_err(tessera_run::Error::from)?;
+        let f = |p: Vec<u8>| p.try_into().ok().map(u32::from_le_bytes);
+        Ok(parts.into_iter().filter_map(f).fold(mine, u32::min) as usize)
     }
 }
 

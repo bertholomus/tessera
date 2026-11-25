@@ -150,6 +150,22 @@ pub trait Run {
     fn held_mut(&mut self) -> &mut Held {
         &mut self.base_mut().held
     }
+
+    /// Paged kept-slot metadata for `page` on this runner's plan.
+    fn kept_page_meta(&self, page: usize) -> Option<Vec<(u32, u32, usize, &'static str)>> {
+        Held::kept_page_meta(self.plan(), page)
+    }
+
+    /// Downloads one physical KV page from device memory.
+    fn download_kept_page(&self, phys: u32, page: usize, dst: &mut [u8]) -> Result<bool, Error> {
+        self.held().download_page(self.plan(), phys, page, dst)
+    }
+
+    /// Uploads one physical KV page into device memory.
+    fn upload_kept_page(&mut self, phys: u32, page: usize, src: &[u8]) -> Result<bool, Error> {
+        let plan = self.plan().clone();
+        self.held_mut().upload_page(&plan, phys, page, src)
+    }
     /// Takes up another plan. Weights and kept rows stay loaded.
     fn replan(&mut self, plan: &Plan) -> Result<(), Error>;
     /// Gives a runtime dimension its value for the next launches.

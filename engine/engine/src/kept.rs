@@ -176,6 +176,13 @@ impl Kept {
         Ok(more.then_some(pages))
     }
 
+    /// Physical pages currently assigned to `slot`, if paged.
+    pub fn pages(&self, slot: u32) -> Option<&[u32]> {
+        self.laned.as_ref()?;
+        let run = self.runs[slot as usize]?;
+        self.pool.pages(run).ok()
+    }
+
     /// Keeps a slot's rows under their tokens.
     pub fn finish(&mut self, slot: u32, history: Vec<u32>) {
         let Some(run) = self.runs[slot as usize].take() else {

@@ -147,6 +147,8 @@ pub enum Error {
     Mask,
     #[error("kept rows: {0}")]
     Kept(#[from] tessera_kv::Error),
+    #[error("kv store: {0}")]
+    Store(std::io::Error),
     #[error("a slot's next row is in another run's page")]
     SharedPage,
     #[error("the graph has no entry that scores these ids")]
@@ -246,6 +248,7 @@ pub struct Engine {
     ranks: Option<tessera_run::Ranks>,
     /// Host n-gram embedding table for models with a PLE port.
     ple: Option<PleStore>,
+    disk: Option<tessera_kv::DiskKv>,
     /// Whether slots carry state that a kept prefix cannot restore.
     stateful: bool,
     /// Rows a pending verify can promote, if any.
@@ -436,6 +439,7 @@ impl Engine {
             held: None,
             ranks: None,
             ple: None,
+            disk: None,
             stateful,
             verified: None,
         })

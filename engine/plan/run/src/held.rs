@@ -161,6 +161,107 @@ impl Held {
         Ok(self.all[at].backing_mut().upload(slot.start(), bytes)?)
     }
 
+    /// Reads raw bytes from `slot` starting `offset` bytes in.
+    pub fn download(&self, slot: Slot, offset: usize, dst: &mut [u8]) -> Result<(), Error> {
+        let start = slot.start() + offset;
+        let backing = self.get(slot).backing();
+        if let Some(all) = backing.mapped() {
+            dst.copy_from_slice(&all[start..start + dst.len()]);
+            return Ok(());
+        }
+        Ok(backing.download(start, dst)?)
+    }
+
+    /// Writes `bytes` into `slot` starting `offset` bytes in.
+    pub fn upload_at(&mut self, slot: Slot, offset: usize, bytes: &[u8]) -> Result<(), Error> {
+        let at = self.bound[slot.buffer as usize];
+        Ok(self.all[at]
+            .backing_mut()
+            .upload(slot.start() + offset, bytes)?)
+    }
+
+    /// Paged kept-slot metadata `(index, width, bytes, form)` for `plan`.
+    pub fn kept_page_meta(
+        plan: &Plan,
+        page: usize,
+    ) -> Option<Vec<(u32, u32, usize, &'static str)>> {
+        plan.table?;
+        Some(
+            plan.kept
+                .iter()
+                .zip(&plan.kept_info)
+                .filter(|(_, i)| i.context > 1 && i.page_rows as usize == page)
+                .map(|(&(id, s), i)| {
+                    (
+                        id,
+                        i.width,
+                        s.form.bytes(page * i.width as usize),
+                        s.form.name(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn page_spans(
+        &self,
+        plan: &Plan,
+        phys: u32,
+        page: usize,
+    ) -> Option<Vec<(Slot, usize, usize, usize)>> {
+        let (mut out, mut at) = (Vec::new(), 0usize);
+        for (&(_, slot), info) in plan.kept.iter().zip(&plan.kept_info) {
+            if info.context <= 1 || info.page_rows as usize != page {
+                continue;
+            }
+            let elems = page * info.width as usize;
+            let (off, len) = (
+                slot.form.offset(phys as usize * elems),
+                slot.form.bytes(elems),
+            );
+            if off + len > self.span(slot) {
+                return None;
+            }
+            out.push((slot, off, at, len));
+            at += len;
+        }
+        Some(out)
+    }
+
+    /// Downloads one physical KV page across all paged kept tensors.
+    pub fn download_page(
+        &self,
+        plan: &Plan,
+        phys: u32,
+        page: usize,
+        dst: &mut [u8],
+    ) -> Result<bool, Error> {
+        let Some(spans) = self.page_spans(plan, phys, page) else {
+            return Ok(false);
+        };
+        for (slot, off, at, len) in spans {
+            self.download(slot, off, &mut dst[at..at + len])?;
+        }
+        Ok(true)
+    }
+
+    /// Uploads one physical KV page across all paged kept tensors.
+    pub fn upload_page(
+        &mut self,
+        plan: &Plan,
+        phys: u32,
+        page: usize,
+        src: &[u8],
+    ) -> Result<bool, Error> {
+        let Some(spans) = self.page_spans(plan, phys, page) else {
+            return Ok(false);
+        };
+        for (slot, off, at, len) in spans {
+            self.upload_at(slot, off, &src[at..at + len])?;
+        }
+        Ok(true)
+    }
+
     /// The slot's bytes in place, when the host addresses them.
     pub fn mapped_slot(&mut self, slot: Slot) -> Option<&mut [u8]> {
         let at = self.bound[slot.buffer as usize];

@@ -6,6 +6,7 @@ use crate::lanes::Lanes;
 use crate::sample::{Sampler, Target, Weights, accept, take};
 use crate::{Allowed, Engine, Error, Event, Reason, Request, Row, ends};
 use std::collections::VecDeque;
+use tessera_kv::{DiskKv, DiskMsg};
 
 crate::metric_registry!(REQUESTS = "requests");
 crate::metric!(WAITING in REQUESTS = Gauge "tessera:requests_waiting", "Answers waiting for a slot.");
@@ -293,8 +294,8 @@ impl<'a> Batch<'a> {
         !self.waiting.is_empty() || !self.paused.is_empty() || !self.active.is_empty()
     }
 
-    /// A slot for the next answer, and its kept rows.
-    fn place(&mut self) -> Option<(u32, usize)> {
+    /// Slot, kept rows, and limit for next answer.
+    fn place(&mut self) -> Option<(u32, usize, usize)> {
         let request = &self.waiting.front()?.0;
         // A read feeds its first read row at least.
         let fed = request.reads.first().map(|r| r.row as usize);
@@ -303,14 +304,39 @@ impl<'a> Batch<'a> {
         } else {
             fed.unwrap_or(request.tokens.len() - 1)
         };
-        match &mut self.kept {
-            Some(kept) => kept.admit(&request.tokens, limit),
-            None => Some((self.free.pop()?, 0)),
+        let (slot, skip) = match &mut self.kept {
+            Some(kept) => kept.admit(&request.tokens, limit)?,
+            None => (self.free.pop()?, 0),
+        };
+        Some((slot, skip, limit))
+    }
+
+    /// Restores extra prefix pages from the disk store past `skip`.
+    fn restore_disk(&mut self, slot: u32, tokens: &[u32], skip: usize) -> Result<usize, Error> {
+        let Some(d) = self.engine.disk.as_ref() else {
+            return Ok(skip);
+        };
+        let (page, (vram, keys)) = (d.page, d.missing_keys(tokens, skip));
+        let hit = self.engine.disk_exec(DiskMsg::Prefix(keys.clone()), true)?;
+        let Some(kept) = self.kept.as_mut().filter(|_| hit > 0) else {
+            return Ok(skip);
+        };
+        if kept.grow(slot, (vram + hit) * page).is_err() {
+            return Ok(skip);
         }
+        let Some(pages) = kept.pages(slot).map(<[u32]>::to_vec) else {
+            return Ok(skip);
+        };
+        let pairs = DiskKv::load_pairs_slice(&pages, keys, vram, hit);
+        let loaded = self.engine.disk_exec(DiskMsg::Load(pairs), true)?;
+        if let Some(lanes) = &mut self.engine.lanes {
+            lanes.set(slot, &pages);
+        }
+        Ok((vram + loaded) * page)
     }
 
     /// Resumes paused answers, then admits waiting ones.
-    fn admit(&mut self) {
+    fn admit(&mut self) -> Result<(), Error> {
         while let Some(front) = self.paused.front() {
             let tokens: Vec<u32> = front.pending.iter().copied().collect();
             let limit = match self.engine.stateful() {
@@ -322,8 +348,9 @@ impl<'a> Batch<'a> {
                 None => self.free.pop().map(|slot| (slot, 0)),
             };
             let Some((slot, skip)) = placed else {
-                return;
+                return Ok(());
             };
+            let skip = self.restore_disk(slot, &tokens[..limit], skip)?;
             let mut seq = self.paused.pop_front().expect("a paused answer");
             seq.slot = slot;
             seq.history = tokens[..skip].to_vec();
@@ -332,10 +359,11 @@ impl<'a> Batch<'a> {
             self.active.push(seq);
         }
         if self.closed {
-            return;
+            return Ok(());
         }
-        while let Some((slot, skip)) = self.place() {
+        while let Some((slot, skip, limit)) = self.place() {
             let (request, sink) = self.waiting.pop_front().expect("a waiting answer");
+            let skip = self.restore_disk(slot, &request.tokens[..limit], skip)?;
             PROMPT.add(request.tokens.len() as u64);
             let sampler = Sampler::new(request.sampling);
             let mut seq = Seq {
@@ -365,6 +393,7 @@ impl<'a> Batch<'a> {
                 None => self.active.push(seq),
             }
         }
+        Ok(())
     }
 
     /// The most rows one step feeds.
@@ -458,6 +487,13 @@ impl<'a> Batch<'a> {
 
     /// Frees an answer's slot, or keeps its rows.
     fn retire(&mut self, seq: Seq) {
+        if let (Some(d), Some(kept)) = (&self.engine.disk, &self.kept)
+            && let Some(pages) = kept.pages(seq.slot)
+        {
+            let _ = self
+                .engine
+                .disk_exec(DiskMsg::Save(d.spill_pairs(pages, &seq.history)), true);
+        }
         match &mut self.kept {
             Some(kept) => kept.finish(seq.slot, seq.history),
             None => self.free.push(seq.slot),
@@ -510,7 +546,7 @@ impl<'a> Batch<'a> {
     }
 
     fn turn(&mut self) -> Result<bool, Error> {
-        self.admit();
+        self.admit()?;
         let read = self.read()?;
         self.fit();
         let rows = loop {
