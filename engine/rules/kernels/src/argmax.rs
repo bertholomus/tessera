@@ -11,8 +11,11 @@ const PARTS: usize = 512;
 /// Threads per row in the radix selector.
 const RADIX_THREADS: u32 = 256;
 
-/// Four-bit radix buckets per histogram pass.
-const BINS: u32 = 16;
+/// Eleven-bit radix buckets per histogram pass.
+const HIST_BINS: u32 = 2048;
+
+/// Histogram bins reduced per thread.
+const HIST_STEP: u32 = HIST_BINS / RADIX_THREADS;
 
 /// Warps per radix block.
 const WARPS: u32 = RADIX_THREADS / LANES as u32;
@@ -30,7 +33,7 @@ const SLOTS_SMALL: u32 = 4096;
 const SLOTS_LARGE: u32 = 8192;
 
 /// Scan scratch entries: per-thread plus bin totals.
-const SCAN_LEN: u32 = RADIX_THREADS + BINS;
+const SCAN_LEN: u32 = RADIX_THREADS + WARPS;
 
 /// The best index in each piece of each row.
 #[derive(Clone, Copy, Debug, Kernel)]
@@ -237,14 +240,14 @@ fn radix_launches(k: &RadixTopK, step: &Step) -> Vec<Launch> {
 
 fn radix_needs(k: &RadixTopK) -> Needs {
     Needs {
-        group_bytes: 4 * (radix_slots(k.k) + SCAN_LEN as usize),
+        group_bytes: 4 * (radix_slots(k.k) + HIST_BINS as usize + SCAN_LEN as usize),
         group_threads: RADIX_THREADS as usize,
         ..Needs::default()
     }
 }
 
 fn radix_work(k: &RadixTopK) -> usize {
-    let passes: usize = if k.width > k.k { 9 } else { 1 };
+    let passes: usize = if k.width > k.k { 4 } else { 1 };
     let cap = k.k.min(k.width).max(1).next_power_of_two();
     let stages = cap.trailing_zeros() as usize;
     let sort = cap * stages * (stages + 1) / 4;
@@ -538,6 +541,7 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
     let at = row as u64 * width as u64;
     let out_at = row as u64 * k as u64;
     let mut pool = shared::<u32>(SLOTS);
+    let mut hist = atomic_shared(HIST_BINS);
     let mut scan = shared::<u32>(SCAN_LEN);
 
     let mut strict_min = 1u32;
@@ -548,73 +552,126 @@ fn radix_top_k<const SLOTS: u32, const MAX_STAGES: u32, const CACHE_KEYS: bool>(
         let mut mask = 0u32;
         let mut need = k;
         let mut done = false;
-        let passes = 8u32;
+        let passes = 3u32;
         for pass in 0..passes {
+            let shift = if pass == 0u32 {
+                21u32
+            } else if pass == 1u32 {
+                10u32
+            } else {
+                0u32
+            };
+            let bmask = if pass < 2u32 { 2047u32 } else { 1023u32 };
             if !done {
-                let shift = 28u32 - pass * 4u32;
-                for b in 0..BINS {
-                    pool[b * RADIX_THREADS + l] = 0u32;
-                }
-                for i in (l..width).by(RADIX_THREADS) {
-                    let key = float_key(x[at + i as u64]);
-                    if key != 0u32 && (key & mask) == prefix {
-                        let d = (key >> shift) & 15u32;
-                        pool[d * RADIX_THREADS + l] += 1u32;
-                    }
+                for j in (l..HIST_BINS).by(RADIX_THREADS) {
+                    hist[j] = 0u32;
                 }
             }
             barrier();
             if !done {
-                let bin = l / 16u32;
-                let part = l % 16u32;
-                let base = bin * RADIX_THREADS + part * 16u32;
+                let mut run_b = HIST_BINS;
+                let mut run_c = 0u32;
+                for i in (l..width).by(RADIX_THREADS) {
+                    let key = float_key(x[at + i as u64]);
+                    if key != 0u32 && (key & mask) == prefix {
+                        let d = (key >> shift) & bmask;
+                        if d == run_b {
+                            run_c += 1u32;
+                        } else {
+                            if run_c > 0u32 {
+                                hist.add(run_b, run_c);
+                            }
+                            run_b = d;
+                            run_c = 1u32;
+                        }
+                    }
+                }
+                if run_c > 0u32 {
+                    hist.add(run_b, run_c);
+                }
+            }
+            barrier();
+            if !done {
+                let base = l * HIST_STEP;
                 let mut sum = 0u32;
-                for j in 0..16u32 {
-                    sum += pool[base + j];
+                for j in 0..HIST_STEP {
+                    sum += hist[base + j];
                 }
                 scan[l] = sum;
             }
             barrier();
-            if !done && l < BINS {
-                let mut tot = 0u32;
-                for p in 0..16u32 {
-                    tot += scan[l * 16u32 + p];
+            if !done && l < WARPS {
+                let w_base = l * LANES as u32;
+                let mut wt = 0u32;
+                for j in 0..LANES as u32 {
+                    wt += scan[w_base + j];
                 }
-                scan[RADIX_THREADS + l] = tot;
+                scan[RADIX_THREADS + l] = wt;
             }
             barrier();
             if !done {
                 if pass == 0u32 {
                     let mut finite = 0u32;
-                    for b in 0..BINS {
-                        finite += scan[RADIX_THREADS + b];
+                    for w in 0..WARPS {
+                        finite += scan[RADIX_THREADS + w];
                     }
                     if finite <= k {
                         done = true;
                     }
                 }
                 if !done {
-                    let shift = 28u32 - pass * 4u32;
-                    let mut found = false;
-                    for rev in 0..BINS {
-                        if !found {
-                            let b = 15u32 - rev;
-                            let c = scan[RADIX_THREADS + b];
+                    let mut win_w = 0u32;
+                    let mut found_w = false;
+                    for rev in 0..WARPS {
+                        if !found_w {
+                            let w = WARPS - 1u32 - rev;
+                            let c = scan[RADIX_THREADS + w];
+                            if need > c {
+                                need -= c;
+                            } else {
+                                win_w = w;
+                                found_w = true;
+                            }
+                        }
+                    }
+                    let mut win_m = 0u32;
+                    let mut found_m = false;
+                    let w_base = win_w * LANES as u32;
+                    for rev in 0..LANES as u32 {
+                        if !found_m {
+                            let m = LANES as u32 - 1u32 - rev;
+                            let c = scan[w_base + m];
+                            if need > c {
+                                need -= c;
+                            } else {
+                                win_m = w_base + m;
+                                found_m = true;
+                            }
+                        }
+                    }
+                    let mut found_b = false;
+                    let b_base = win_m * HIST_STEP;
+                    for rev in 0..HIST_STEP {
+                        if !found_b {
+                            let j = HIST_STEP - 1u32 - rev;
+                            let b = b_base + j;
+                            let c = hist[b];
                             if need > c {
                                 need -= c;
                             } else {
                                 prefix = prefix | (b << shift);
-                                mask = mask | (15u32 << shift);
+                                mask = mask | (bmask << shift);
                                 if c == need {
                                     strict_min = if prefix > 0u32 { prefix } else { 1u32 };
                                     done = true;
                                 }
-                                found = true;
+                                found_b = true;
                             }
                         }
                     }
                 }
             }
+            barrier();
         }
         if !done {
             strict_min = prefix + 1u32;

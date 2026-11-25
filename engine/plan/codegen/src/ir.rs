@@ -219,6 +219,17 @@ pub enum Stmt {
         ty: Ty,
         len: usize,
     },
+    /// Atomic `u32` group memory of `len` elements.
+    AtomicShared {
+        name: String,
+        len: usize,
+    },
+    /// Atomic addition of `value` into `name[at]`.
+    AtomicAdd {
+        name: String,
+        at: Expr,
+        value: Expr,
+    },
     /// `target = value`, or `target op= value` with `op`.
     Assign {
         target: Expr,

@@ -536,6 +536,17 @@ impl Group<'_, '_> {
                 };
                 self.shared.insert(name.clone(), vec![zero; *len]);
             }
+            Stmt::AtomicShared { name, len } => {
+                self.shared.insert(name.clone(), vec![Val::U(0); *len]);
+            }
+            Stmt::AtomicAdd { name, at, value } => {
+                let (at, value) = (self.eval(at, mask), self.eval(value, mask));
+                let shared = self.shared.get_mut(name).expect("atomic shared");
+                for t in (0..n).filter(|t| mask[*t]) {
+                    let idx = at[t].u() as usize;
+                    shared[idx] = Val::U(shared[idx].u().wrapping_add(value[t].u()));
+                }
+            }
             Stmt::Assign {
                 target,
                 op,

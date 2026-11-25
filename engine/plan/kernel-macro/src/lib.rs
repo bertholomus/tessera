@@ -509,6 +509,12 @@ fn declare(name: &Tokens, init: &Expr, ctx: &Ctx) -> Res {
         let (ty, len) = (scalar(t)?, &call.args[0]);
         return Ok(quote!(Stmt::Shared { name: #name.into(), ty: #ty, len: (#len) as usize }));
     }
+    if let Expr::Call(c) = init
+        && is_path(&c.func, "atomic_shared")
+    {
+        let len = &c.args[0];
+        return Ok(quote!(Stmt::AtomicShared { name: #name.into(), len: (#len) as usize }));
+    }
     if let Expr::Call(call) = init
         && is_path(&call.func, "tiles")
     {
@@ -643,6 +649,14 @@ fn statement(e: &Expr, ctx: &Ctx) -> Res {
             let acc = named(&m.receiver)?;
             Ok(quote!(Stmt::TileZero { acc: #acc.into() }))
         }
+        Expr::MethodCall(m) if m.method == "add" => {
+            let (name, at, val) = (
+                named(&m.receiver)?,
+                expr(&m.args[0], ctx)?,
+                expr(&m.args[1], ctx)?,
+            );
+            Ok(quote!(Stmt::AtomicAdd { name: #name.into(), at: #at, value: #val }))
+        }
         Expr::MethodCall(m) if m.method == "scale" => {
             let acc = named(&m.receiver)?;
             let Some(Expr::Closure(f)) = m.args.first() else {
@@ -775,7 +789,7 @@ fn bin_op(op: &BinOp) -> Option<Tokens> {
 }
 
 /// Prelude names this macro reads as statements.
-const STATEMENTS: &[&str] = &["barrier", "shared", "tiles"];
+const STATEMENTS: &[&str] = &["barrier", "shared", "atomic_shared", "tiles"];
 
 /// Each intrinsic's kind, source name and variant.
 macro_rules! sources {

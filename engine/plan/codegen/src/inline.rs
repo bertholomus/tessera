@@ -226,6 +226,7 @@ fn declares(stmts: &[Stmt], out: &mut Vec<String>) {
             Stmt::Let { name, .. }
             | Stmt::Array { name, .. }
             | Stmt::Shared { name, .. }
+            | Stmt::AtomicShared { name, .. }
             | Stmt::TileAcc { name, .. }
             | Stmt::TileHeld { name, .. } => out.push(name.clone()),
             Stmt::For { var, body, .. } => {
@@ -310,6 +311,15 @@ impl Rename<'_> {
                 name: self.name(name),
                 ty: *ty,
                 len: *len,
+            },
+            Stmt::AtomicShared { name, len } => Stmt::AtomicShared {
+                name: self.name(name),
+                len: *len,
+            },
+            Stmt::AtomicAdd { name, at, value } => Stmt::AtomicAdd {
+                name: self.name(name),
+                at: self.expr(at),
+                value: self.expr(value),
             },
             Stmt::Assign { target, op, value } => Stmt::Assign {
                 target: self.expr(target),
