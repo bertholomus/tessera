@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM nvidia/cuda:13.0.1-runtime-ubuntu24.04 AS runtime-cuda
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates cuda-nvrtc-13-0 \
+    && apt-get install -y --no-install-recommends ca-certificates cuda-nvrtc-13-0 libibverbs1 ibverbs-providers \
     && rm -rf /var/lib/apt/lists/*
 
 # tesserax loads the HIP runtime and hiprtc at runtime. The full ROCm
@@ -34,7 +34,7 @@ RUN apt-get update \
     && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.asc] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main" \
         > /etc/apt/sources.list.d/rocm.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends hip-runtime-amd \
+    && apt-get install -y --no-install-recommends hip-runtime-amd libibverbs1 ibverbs-providers \
     && rm -rf /var/lib/apt/lists/* \
     && echo /opt/rocm/lib > /etc/ld.so.conf.d/rocm.conf \
     && ldconfig
