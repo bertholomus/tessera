@@ -26,6 +26,7 @@ pub static ENTRY: Entry = Entry {
         },
         ADAPTIVE,
         SPEC_LEN,
+        Flag::switch("--reuse-prefix"),
     ],
     open,
 };
@@ -93,6 +94,9 @@ impl SpecBatch for BatchMtp<'_> {
 fn run_batch_loop(load: &Load, mut batch: BatchMtp<'_>, generate: Generate) -> Result<(), String> {
     if let Some(rows) = load.options.max_batch_rows {
         batch = batch.with_prefill_chunk(rows);
+    }
+    if load.on("--reuse-prefix") {
+        batch.reuse();
     }
     drive_batch(load, &mut batch, generate)
 }

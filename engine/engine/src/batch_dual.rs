@@ -106,6 +106,7 @@ impl<'a> BatchMtp<'a> {
             prefilling: VecDeque::new(),
             active: Vec::new(),
             free,
+            kept: None,
             hash: 2166136261,
         })
     }
@@ -117,6 +118,7 @@ impl<'a> BatchMtp<'a> {
         };
         let slot = self.active[0].slot;
         self.flush_mtp(slot, solo.m_start, &solo.m_tokens, &solo.m_taps)?;
+        self.active[0].mtp_valid = solo.m_start as usize + solo.m_tokens.len();
         self.active[0].drafts.truncate(self.depth);
         if let Some(peer) = &self.dual {
             push_tail(&mut self.active[0].d_tail, &solo.d_pending, peer.d_width);
@@ -134,13 +136,17 @@ impl<'a> BatchMtp<'a> {
         }
         p.solo_mode = false;
         let slot = p.slot;
+        let skip = p.skip;
         let m_toks = std::mem::take(&mut p.m_tok_buf);
         let m_taps = std::mem::take(&mut p.m_tap_buf);
         if let Some(peer) = &self.dual {
             let raw = std::mem::take(&mut p.d_buf);
             push_tail(&mut p.d_buf, &raw, peer.d_width);
         }
-        self.flush_mtp(slot, 0, &m_toks, &m_taps)?;
+        self.flush_mtp(slot, skip as u32, &m_toks, &m_taps)?;
+        if let Some(p) = self.prefilling.front_mut() {
+            p.mtp_valid = skip + m_toks.len();
+        }
         Ok(())
     }
 
@@ -259,10 +265,17 @@ impl<'a> BatchMtp<'a> {
         let ranked = self.target.control.is_some();
         let (accepted, committed, done) =
             self.active[0].apply_verify(k, &ids, self.max_ctx, &mut self.hash);
+        self.active[0].history.extend_from_slice(&committed);
         let commit = committed.len();
         if done.is_some() || (!ranked && self.active[0].cancelled) {
-            let seq = self.active.remove(0);
-            self.free.push(seq.slot);
+            let mut seq = self.active.remove(0);
+            if self.kept.is_some()
+                && let Some(solo) = seq.solo.take()
+            {
+                self.flush_mtp(seq.slot, solo.m_start, &solo.m_tokens, &solo.m_taps)?;
+                seq.mtp_valid = solo.m_start as usize + solo.m_tokens.len();
+            }
+            self.retire_slot(seq.slot, seq.history, seq.mtp_valid);
             return Ok(());
         }
         let seq = &mut self.active[0];
@@ -325,6 +338,7 @@ impl<'a> BatchMtp<'a> {
                     )
                 };
                 let d1 = self.flush_mtp(slot, m_start, &m_toks, &m_taps)?;
+                self.active[idx].mtp_valid = m_start as usize + m_toks.len();
                 self.active[idx].solo.as_mut().expect("solo").last_mtp_d1 = d1;
             }
             let (d_ctx_pos, d_pending) = {
@@ -404,6 +418,7 @@ impl<'a> BatchMtp<'a> {
             .selector
             .mtp
             .choose(None, drafts.len(), drafts.len());
+        self.active[idx].mtp_valid = start;
         self.active[idx].solo.as_mut().expect("solo").last_pred = pred;
         drafts.truncate(k);
         self.active[idx].drafts = drafts;
@@ -617,6 +632,8 @@ impl<'a> BatchDFlash<'a> {
             cancelled: false,
             solo: None,
             d_tail: Vec::new(),
+            history: Vec::new(),
+            mtp_valid: 0,
         };
         let done = act.commit(&[anchor], self.max_ctx);
         if done.is_some() || (self.target.control.is_none() && act.cancelled) {
@@ -780,6 +797,7 @@ impl RoundHost for BatchDFlash<'_> {
             let (request, sink) = self.waiting.pop_front().expect("waiting request");
             out.push(Admitted {
                 slot,
+                skip: 0,
                 request,
                 sink: Some(sink),
             });
@@ -793,8 +811,8 @@ impl RoundHost for BatchDFlash<'_> {
             slots,
             |s| s.seq.slot,
             |s| match kept {
-                Some(k) => k.finish(s, Vec::new()),
-                None => free.push(s),
+                Some(k) => k.finish(s.seq.slot, Vec::new()),
+                None => free.push(s.seq.slot),
             },
         );
     }
