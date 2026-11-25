@@ -298,6 +298,7 @@ pub struct Drafter {
     mask_token: u32,
     causal: bool,
     selector_k: Option<usize>,
+    sliding_window: Option<usize>,
 }
 
 draft_methods!(Drafter);
@@ -412,6 +413,15 @@ impl Drafter {
             .map(|d| d.size.max() as usize)
             .ok_or(Error::Taps)?;
         let selector_k = selector_top_k(&graph, block);
+        let sliding_window = graph.nodes.iter().find_map(|n| {
+            let tessera_graph::Op::Attend(a) = &n.op else {
+                return None;
+            };
+            let tessera_graph::Mask::Back(w) = a.mask else {
+                return None;
+            };
+            Some(w as usize + 1)
+        });
         let wants = match selector_k {
             Some(_) => Wants::roles(&graph, 0, &[Role::Candidates, Role::Taps]),
             None => Wants::role(&graph, 0, Role::Tokens),
@@ -434,6 +444,7 @@ impl Drafter {
             mask_token,
             causal: false,
             selector_k,
+            sliding_window,
         })
     }
 
@@ -452,6 +463,11 @@ impl Drafter {
 
     pub fn mask_token(&self) -> u32 {
         self.mask_token
+    }
+
+    /// Sliding attention window in tokens, if configured.
+    pub fn sliding_window(&self) -> Option<usize> {
+        self.sliding_window
     }
 
     pub(crate) fn draft_wants(&self) -> Wants {
@@ -620,34 +636,38 @@ fn run_dflash_req(
     spec: SpecLen,
     emit: &mut dyn FnMut(Event) -> bool,
 ) -> Result<SpecStats, Error> {
-    let block = drafter.block();
-    let tap_width = drafter.tap_width();
-    let max_ctx = target.context().min(drafter.context());
+    let (block, tap_width) = (drafter.block(), drafter.tap_width());
+    let (max_ctx, d_ctx) = (target.context(), drafter.context());
+    let win = drafter.sliding_window();
+    let drop_before = win.map_or(0, |w| req.request.tokens.len().saturating_sub(w));
     run_speculate(
         target,
         drafter,
         req,
         emit,
         |_, drafter, pos, prompt, len, taps| {
-            if prompt.len() + block <= max_ctx {
-                let wants = drafter.draft_wants();
-                let end = pos + len;
-                drafter.run_taps(0, prompt[end], end, pos, taps.as_in(), wants)?;
+            let end = pos + len;
+            if end > drop_before && (prompt.len() - drop_before) + block <= d_ctx {
+                let skip = drop_before.saturating_sub(pos);
+                let (d_end, d_pos) = (end - drop_before, pos + skip - drop_before);
+                let (in_t, w) = (taps.as_in_from(skip, tap_width), drafter.draft_wants());
+                drafter.run_taps(0, prompt[end], d_end, d_pos, in_t, w)?;
             }
             Ok(())
         },
-        |_, _, pos, _, _, taps| Ok((pos, taps, spec, None::<Vec<f32>>)),
-        |_, drafter, (ctx_pos, pending, spec, last_lp), start, anchor, remaining| {
-            if remaining == 1 || start + block > max_ctx {
+        |_, _, pos, _, _, taps| {
+            let skip = drop_before.saturating_sub(pos);
+            Ok((pos + skip - drop_before, skip, taps, spec, None::<Vec<f32>>))
+        },
+        |_, drafter, (ctx_pos, skip, pending, spec, last_lp), start, anchor, remaining| {
+            let d_start = start - drop_before;
+            if remaining == 1 || start + block > max_ctx || d_start + block > d_ctx {
                 return Ok(None);
             }
-            let wants = drafter.draft_wants();
-            let outputs = drafter.run_taps(0, anchor, start, *ctx_pos, pending.as_in(), wants)?;
-            let (mut drafts, lp) = drafter.read_draft(&outputs)?;
-            let avail = drafts
-                .len()
-                .min(remaining.saturating_sub(1))
-                .min(max_ctx.saturating_sub(start + 1));
+            let (in_t, w) = (pending.as_in_from(*skip, tap_width), drafter.draft_wants());
+            let out = drafter.run_taps(0, anchor, d_start, *ctx_pos, in_t, w)?;
+            let (mut drafts, lp) = drafter.read_draft(&out)?;
+            let avail = drafts.len().min(remaining - 1).min(max_ctx - start - 1);
             if avail == 0 {
                 return Ok(None);
             }
@@ -658,7 +678,7 @@ fn run_dflash_req(
         },
         |_,
          _,
-         (ctx_pos, pending, spec, last_lp),
+         (ctx_pos, skip, pending, spec, last_lp),
          start,
          drafted,
          accepted,
@@ -668,7 +688,8 @@ fn run_dflash_req(
             spec.observe(drafted, accepted, last_lp.as_deref());
             stats.dflash_steps += 1;
             let commit = 1 + accepted;
-            *ctx_pos = start;
+            *ctx_pos = start - drop_before;
+            *skip = 0;
             block_taps.keep_rows(commit, tap_width);
             *pending = block_taps;
             Ok(())
