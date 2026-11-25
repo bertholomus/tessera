@@ -68,6 +68,28 @@ TESSERA_FN uint2 pack_bf16x4(float4 v) {
     return make_uint2(lo, hi);
 }
 
+TESSERA_FN uint2 pack_fp16x4(float4 v) {
+    u32 lo, hi;
+    float x = fminf(fmaxf(v.x, -65504.0f), 65504.0f);
+    float y = fminf(fmaxf(v.y, -65504.0f), 65504.0f);
+    float z = fminf(fmaxf(v.z, -65504.0f), 65504.0f);
+    float w = fminf(fmaxf(v.w, -65504.0f), 65504.0f);
+    asm("cvt.rn.f16x2.f32 %0, %2, %1;" : "=r"(lo) : "f"(x), "f"(y));
+    asm("cvt.rn.f16x2.f32 %0, %2, %1;" : "=r"(hi) : "f"(z), "f"(w));
+    return make_uint2(lo, hi);
+}
+
+TESSERA_FN float4 unpack_fp16x4(uint2 p) {
+    float x, y, z, w;
+    asm("{.reg .b16 lo, hi; mov.b32 {lo, hi}, %2; cvt.f32.f16 %0, lo; cvt.f32.f16 %1, hi;}"
+        : "=f"(x), "=f"(y)
+        : "r"(p.x));
+    asm("{.reg .b16 lo, hi; mov.b32 {lo, hi}, %2; cvt.f32.f16 %0, lo; cvt.f32.f16 %1, hi;}"
+        : "=f"(z), "=f"(w)
+        : "r"(p.y));
+    return make_float4(x, y, z, w);
+}
+
 TESSERA_FN uint2 load_fresh_u2(const u32* p) {
     uint2 v;
     asm volatile("ld.global.cv.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p));
@@ -101,6 +123,51 @@ TESSERA_FN uint2 pack_bf16x4(float4 v) {
     return make_uint2(lo, hi);
 }
 
+TESSERA_FN u16 to_fp16(float v) {
+    float c = fminf(fmaxf(v, -65504.0f), 65504.0f);
+    u32 b = __float_as_uint(c);
+    u32 sign = (b >> 16) & 0x8000u;
+    int exp = int((b >> 23) & 0xFFu) - 112;
+    u32 mant = b & 0x7FFFFFu;
+    if (exp <= 0) {
+        if (exp < -10) return static_cast<u16>(sign);
+        mant |= 0x800000u;
+        u32 sh = u32(14 - exp);
+        u32 rnd = (1u << (sh - 1u)) - 1u + ((mant >> sh) & 1u);
+        return static_cast<u16>(sign | ((mant + rnd) >> sh));
+    }
+    u32 rnd = 0xFFFu + ((mant >> 13) & 1u);
+    mant += rnd;
+    if (mant & 0x800000u) {
+        mant = 0u;
+        exp += 1;
+    }
+    return static_cast<u16>(sign | (u32(exp) << 10) | (mant >> 13));
+}
+
+TESSERA_FN float from_fp16(u16 h) {
+    u32 sign = u32(h & 0x8000u) << 16;
+    u32 exp = (h >> 10) & 0x1Fu;
+    u32 mant = h & 0x3FFu;
+    if (exp == 0u) {
+        if (mant == 0u) return __uint_as_float(sign);
+        float f = float(mant) * __uint_as_float(0x33800000u);
+        return sign ? -f : f;
+    }
+    return __uint_as_float(sign | ((exp + 112u) << 23) | (mant << 13));
+}
+
+TESSERA_FN uint2 pack_fp16x4(float4 v) {
+    u32 lo = u32(to_fp16(v.x)) | (u32(to_fp16(v.y)) << 16);
+    u32 hi = u32(to_fp16(v.z)) | (u32(to_fp16(v.w)) << 16);
+    return make_uint2(lo, hi);
+}
+
+TESSERA_FN float4 unpack_fp16x4(uint2 p) {
+    return make_float4(from_fp16(static_cast<u16>(p.x)), from_fp16(static_cast<u16>(p.x >> 16)),
+                       from_fp16(static_cast<u16>(p.y)), from_fp16(static_cast<u16>(p.y >> 16)));
+}
+
 TESSERA_FN uint2 load_fresh_u2(const u32* p) {
     return make_uint2(prim::load_fresh(p + 0), prim::load_fresh(p + 1));
 }
@@ -116,36 +183,48 @@ TESSERA_FN float4 unpack_bf16x4(uint2 p) {
                        __uint_as_float(p.y << 16), __uint_as_float(p.y & 0xFFFF0000u));
 }
 
-template <bool BF16>
+template <int WIRE>
+TESSERA_FN uint2 pack_wire4(float4 v) {
+    if constexpr (WIRE == 2) return pack_fp16x4(v);
+    return pack_bf16x4(v);
+}
+
+template <int WIRE>
+TESSERA_FN float4 unpack_wire4(uint2 p) {
+    if constexpr (WIRE == 2) return unpack_fp16x4(p);
+    return unpack_bf16x4(p);
+}
+
+template <int WIRE>
 TESSERA_FN float4 round_wire4(float4 v) {
-    if constexpr (BF16) {
-        return unpack_bf16x4(pack_bf16x4(v));
+    if constexpr (WIRE != 0) {
+        return unpack_wire4<WIRE>(pack_wire4<WIRE>(v));
     } else {
         return v;
     }
 }
 
-template <bool BF16>
+template <int WIRE>
 TESSERA_FN float4 load_peer4(u64 slot_ptr, u32 j) {
-    if constexpr (BF16) {
-        return unpack_bf16x4(load_fresh_u2(reinterpret_cast<const u32*>(slot_ptr) + j * 2));
+    if constexpr (WIRE != 0) {
+        return unpack_wire4<WIRE>(load_fresh_u2(reinterpret_cast<const u32*>(slot_ptr) + j * 2));
     } else {
         return load_fresh4(reinterpret_cast<const float*>(slot_ptr) + j * 4);
     }
 }
 
-template <bool BF16>
+template <int WIRE>
 TESSERA_FN void store_peer4(u64 slot_ptr, u32 j, float4 v) {
-    if constexpr (BF16) {
-        store_u2(reinterpret_cast<u32*>(slot_ptr) + j * 2, pack_bf16x4(v));
+    if constexpr (WIRE != 0) {
+        store_u2(reinterpret_cast<u32*>(slot_ptr) + j * 2, pack_wire4<WIRE>(v));
     } else {
         store_vec4(reinterpret_cast<float*>(slot_ptr) + j * 4, v);
     }
 }
 
-template <bool BF16>
+template <int WIRE>
 TESSERA_FN float* tail_floats(u64 slot_ptr, u32 base) {
-    return reinterpret_cast<float*>(slot_ptr + u64(base) * (BF16 ? 2ull : 4ull));
+    return reinterpret_cast<float*>(slot_ptr + u64(base) * (WIRE != 0 ? 2ull : 4ull));
 }
 
 // Spins in thread 0 until `*p >= want`.
@@ -185,29 +264,29 @@ TESSERA_FN bool last_cta(u32* cnt) {
     return is_last != 0;
 }
 
-template <bool BF16>
+template <int WIRE>
 TESSERA_FN void write_slice(u64 area, u64 seq, u32 me, u32 nr, const float* src, u32 n, u32 lo4,
                             u32 hi4, bool aligned) {
     u64 dst = area + slot_off(seq, me, nr);
     for (u32 j = lo4 + threadIdx.x; j < hi4; j += blockDim.x) {
-        store_peer4<BF16>(dst, j, load_vec4(src, j, aligned));
+        store_peer4<WIRE>(dst, j, load_vec4(src, j, aligned));
     }
     if (prim::leader_block()) {
         u32 base = (n / 4) * 4;
         u32 rem = n - base;
-        if (threadIdx.x < rem) tail_floats<BF16>(dst, base)[threadIdx.x] = src[base + threadIdx.x];
+        if (threadIdx.x < rem) tail_floats<WIRE>(dst, base)[threadIdx.x] = src[base + threadIdx.x];
     }
 }
 
-template <bool BF16>
+template <int WIRE>
 TESSERA_FN void sum_slice(const u64* areas, u64 seq, u32 me, u32 nr, const float* src, float* dst,
                           u32 n, u32 lo4, u32 hi4, bool aligned_src, bool aligned_dst) {
     u64 mine = areas[me];
     for (u32 j = lo4 + threadIdx.x; j < hi4; j += blockDim.x) {
         float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         for (u32 r = 0; r < nr; r++) {
-            float4 v = (r == me) ? round_wire4<BF16>(load_vec4(src, j, aligned_src))
-                                 : load_peer4<BF16>(mine + slot_off(seq, r, nr), j);
+            float4 v = (r == me) ? round_wire4<WIRE>(load_vec4(src, j, aligned_src))
+                                 : load_peer4<WIRE>(mine + slot_off(seq, r, nr), j);
             acc.x += v.x;
             acc.y += v.y;
             acc.z += v.z;
@@ -222,7 +301,7 @@ TESSERA_FN void sum_slice(const u64* areas, u64 seq, u32 me, u32 nr, const float
             u32 idx = base + threadIdx.x;
             float acc = 0.0f;
             for (u32 r = 0; r < nr; r++) {
-                const float* peer = tail_floats<BF16>(mine + slot_off(seq, r, nr), base);
+                const float* peer = tail_floats<WIRE>(mine + slot_off(seq, r, nr), base);
                 acc += (r == me) ? src[idx] : prim::load_fresh(peer + threadIdx.x);
             }
             dst[idx] = acc;
@@ -230,21 +309,21 @@ TESSERA_FN void sum_slice(const u64* areas, u64 seq, u32 me, u32 nr, const float
     }
 }
 
-template <bool BF16, bool WRITE_REMOTE>
+template <int WIRE, bool WRITE_REMOTE>
 TESSERA_FN void add_pair(u64 dst_area, u64 mine, u64 seq, u32 me, u32 prev, u32 nr,
                          const float* in_ptr, float* dst_buf, u32 n, u32 lo4, u32 hi4,
                          bool aligned_in, bool aligned_dst) {
     u64 remote = WRITE_REMOTE ? (dst_area + slot_off(seq, me, nr)) : 0ull;
     u64 peer = mine + slot_off(seq, prev, nr);
     for (u32 j = lo4 + threadIdx.x; j < hi4; j += blockDim.x) {
-        float4 a = round_wire4<BF16>(load_vec4(in_ptr, j, aligned_in));
-        float4 b = load_peer4<BF16>(peer, j);
+        float4 a = round_wire4<WIRE>(load_vec4(in_ptr, j, aligned_in));
+        float4 b = load_peer4<WIRE>(peer, j);
         float4 s = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
         if constexpr (WRITE_REMOTE) {
-            if constexpr (BF16) {
-                uint2 p = pack_bf16x4(s);
+            if constexpr (WIRE != 0) {
+                uint2 p = pack_wire4<WIRE>(s);
                 store_u2(reinterpret_cast<u32*>(remote) + j * 2, p);
-                s = unpack_bf16x4(p);
+                s = unpack_wire4<WIRE>(p);
             } else {
                 store_vec4(reinterpret_cast<float*>(remote) + j * 4, s);
             }
@@ -256,14 +335,14 @@ TESSERA_FN void add_pair(u64 dst_area, u64 mine, u64 seq, u32 me, u32 prev, u32 
         u32 rem = n - base;
         if (threadIdx.x < rem) {
             u32 idx = base + threadIdx.x;
-            float s = in_ptr[idx] + prim::load_fresh(tail_floats<BF16>(peer, base) + threadIdx.x);
-            if (WRITE_REMOTE) tail_floats<BF16>(remote, base)[threadIdx.x] = s;
+            float s = in_ptr[idx] + prim::load_fresh(tail_floats<WIRE>(peer, base) + threadIdx.x);
+            if (WRITE_REMOTE) tail_floats<WIRE>(remote, base)[threadIdx.x] = s;
             dst_buf[idx] = s;
         }
     }
 }
 
-template <bool BF16>
+template <int WIRE>
 TESSERA_FN bool exchange_all(const u64* areas, u32* ci, u64 mine, u64 seq, u32 me, u32 nr,
                              u32 sched, bool pow2, const float* src, u32 n, u32 lo4, u32 hi4,
                              bool aligned_src, u64 meta, u64 deadline, u32* fault, int* stop) {
@@ -274,7 +353,7 @@ TESSERA_FN bool exchange_all(const u64* areas, u32* ci, u64 mine, u64 seq, u32 m
         }
         for (u32 k = 1; k < nr; k++) {
             u32 peer = (me + k) % nr;
-            write_slice<BF16>(areas[peer], seq, me, nr, src, n, lo4, hi4, aligned_src);
+            write_slice<WIRE>(areas[peer], seq, me, nr, src, n, lo4, hi4, aligned_src);
         }
         if (last_cta(ci + 0) && prim::leader_thread()) {
             for (u32 k = 1; k < nr; k++) {
@@ -293,7 +372,7 @@ TESSERA_FN bool exchange_all(const u64* areas, u32* ci, u64 mine, u64 seq, u32 m
         u32 dst = pow2 ? (me ^ k) : (me + k) % nr;
         u32 peer = pow2 ? (me ^ k) : (me + nr - k) % nr;
         if (!spin_ge(ack_of(mine, nr, dst), seq - 2, deadline, fault, stop)) return false;
-        write_slice<BF16>(areas[dst], seq, me, nr, src, n, lo4, hi4, aligned_src);
+        write_slice<WIRE>(areas[dst], seq, me, nr, src, n, lo4, hi4, aligned_src);
         if (last_cta(ci + 2 + k) && prim::leader_thread()) {
             if (meta != 0) prim::store_release_sys(size_of(areas[dst], seq, me, nr), meta);
             prim::store_release_sys(tail_of(areas[dst], seq, me, nr), seq);
@@ -314,7 +393,7 @@ TESSERA_FN void finish_chunk(const u64* areas, u32* ci, u64* seq_ptr, u64 seq, u
     }
 }
 
-template <bool BF16>
+template <int WIRE>
 TESSERA_FN void sum_body(const u64* areas, u32* counters, u32* fault, u64* seq_ptr, u64 from_ptr,
                          u64 to_ptr, u32 total, u32 nr, u32 me, u32 sched, u64 timeout_ticks) {
     __shared__ int stop;
@@ -351,7 +430,7 @@ TESSERA_FN void sum_body(const u64* areas, u32* counters, u32* fault, u64* seq_p
         if (butterfly) {
             u32 peer0 = me ^ 1u;
             if (!spin_ge(ack_of(mine, nr, peer0), seq - 2, deadline, fault, &stop)) return;
-            write_slice<BF16>(areas[peer0], seq, me, nr, src, n, lo4, hi4, aligned_src);
+            write_slice<WIRE>(areas[peer0], seq, me, nr, src, n, lo4, hi4, aligned_src);
             if (last_cta(ci + 2) && prim::leader_thread()) {
                 prim::store_release_sys(tail_of(areas[peer0], seq, me, nr), seq);
             }
@@ -363,7 +442,7 @@ TESSERA_FN void sum_body(const u64* areas, u32* counters, u32* fault, u64* seq_p
                 if (!spin_ge(ack_of(mine, nr, peer), seq - 2, deadline, fault, &stop)) return;
                 const float* in_ptr = (step == 2u) ? src : dst_buf;
                 bool in_aligned = (step == 2u) ? aligned_src : aligned_dst;
-                add_pair<BF16, true>(areas[peer], mine, seq, me, prev, nr, in_ptr, dst_buf, n, lo4,
+                add_pair<WIRE, true>(areas[peer], mine, seq, me, prev, nr, in_ptr, dst_buf, n, lo4,
                                      hi4, in_aligned, aligned_dst);
                 if (last_cta(ci + ci_idx) && prim::leader_thread()) {
                     prim::store_release_sys(tail_of(areas[peer], seq, me, nr), seq);
@@ -371,13 +450,13 @@ TESSERA_FN void sum_body(const u64* areas, u32* counters, u32* fault, u64* seq_p
                 if (!spin_ge(tail_of(mine, seq, peer, nr), seq, deadline, fault, &stop)) return;
                 prev = peer;
             }
-            add_pair<BF16, false>(0ull, mine, seq, me, prev, nr, dst_buf, dst_buf, n, lo4, hi4,
+            add_pair<WIRE, false>(0ull, mine, seq, me, prev, nr, dst_buf, dst_buf, n, lo4, hi4,
                                   aligned_dst, aligned_dst);
         } else {
-            if (!exchange_all<BF16>(areas, ci, mine, seq, me, nr, sched, pow2, src, n, lo4, hi4,
+            if (!exchange_all<WIRE>(areas, ci, mine, seq, me, nr, sched, pow2, src, n, lo4, hi4,
                                     aligned_src, 0ull, deadline, fault, &stop))
                 return;
-            sum_slice<BF16>(areas, seq, me, nr, src, dst_buf, n, lo4, hi4, aligned_src,
+            sum_slice<WIRE>(areas, seq, me, nr, src, dst_buf, n, lo4, hi4, aligned_src,
                             aligned_dst);
         }
         finish_chunk(areas, ci, seq_ptr, seq, me, nr, total - off <= MAX_FLOATS);
@@ -390,16 +469,24 @@ TESSERA_FN void sum_body(const u64* areas, u32* counters, u32* fault, u64* seq_p
 extern "C" __global__ void tessera_p2p_sum(const u64* areas, u32* counters, u32* fault,
                                            u64* seq_ptr, u64 from_ptr, u64 to_ptr, u32 total,
                                            u32 nr, u32 me, u32 sched, u64 timeout_ticks) {
-    p2p::sum_body<false>(areas, counters, fault, seq_ptr, from_ptr, to_ptr, total, nr, me, sched,
-                         timeout_ticks);
+    p2p::sum_body<0>(areas, counters, fault, seq_ptr, from_ptr, to_ptr, total, nr, me, sched,
+                     timeout_ticks);
 }
 
 // Direct P2P all-reduce using BF16 wire transport and FP32 sum.
 extern "C" __global__ void tessera_p2p_sum_bf16(const u64* areas, u32* counters, u32* fault,
                                                 u64* seq_ptr, u64 from_ptr, u64 to_ptr, u32 total,
                                                 u32 nr, u32 me, u32 sched, u64 timeout_ticks) {
-    p2p::sum_body<true>(areas, counters, fault, seq_ptr, from_ptr, to_ptr, total, nr, me, sched,
-                        timeout_ticks);
+    p2p::sum_body<1>(areas, counters, fault, seq_ptr, from_ptr, to_ptr, total, nr, me, sched,
+                     timeout_ticks);
+}
+
+// Direct P2P all-reduce using FP16 wire transport and FP32 sum.
+extern "C" __global__ void tessera_p2p_sum_fp16(const u64* areas, u32* counters, u32* fault,
+                                                u64* seq_ptr, u64 from_ptr, u64 to_ptr, u32 total,
+                                                u32 nr, u32 me, u32 sched, u64 timeout_ticks) {
+    p2p::sum_body<2>(areas, counters, fault, seq_ptr, from_ptr, to_ptr, total, nr, me, sched,
+                     timeout_ticks);
 }
 
 // Direct P2P all-gather: fan-out (0) or pairwise rounds (1+).
@@ -445,8 +532,8 @@ extern "C" __global__ void tessera_p2p_gather(const u64* areas, u32* counters, u
         if (hi4 > vec4s) hi4 = vec4s;
         u32* ci = counters + u32(seq & (p2p::RING - 1)) * p2p::CNT_STRIDE;
 
-        if (!p2p::exchange_all<false>(areas, ci, mine, seq, me, nr, sched, pow2, src_chunk, n, lo4,
-                                      hi4, aligned_src, u64(local_w), deadline, fault, &stop))
+        if (!p2p::exchange_all<0>(areas, ci, mine, seq, me, nr, sched, pow2, src_chunk, n, lo4, hi4,
+                                  aligned_src, u64(local_w), deadline, fault, &stop))
             return;
 
         u32 off = 0;

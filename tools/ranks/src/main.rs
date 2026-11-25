@@ -239,9 +239,10 @@ fn join(
         Some(path) => Box::new(shm(path, args.rank, args.ranks as u32, CAPACITY)?),
         None => Box::new(meet(args.rank, &args.addrs, args.listen)?),
     };
-    if matches!(args.sums, Sums::P2p | Sums::P2pBf16) {
+    if matches!(args.sums, Sums::P2p | Sums::P2pBf16 | Sums::P2pFp16) {
         let sum = match args.sums {
             Sums::P2pBf16 => tessera_frontend_comm::p2p_bf16(&mut *met, settings)?,
+            Sums::P2pFp16 => tessera_frontend_comm::p2p_fp16(&mut *met, settings)?,
             _ => p2p(&mut *met, settings)?,
         };
         return Ok((met, Some(sum)));

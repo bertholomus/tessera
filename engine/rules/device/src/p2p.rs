@@ -13,6 +13,7 @@ const KERNEL: &str = include_str!("p2p/p2p.kernel");
 const ENTRY: &str = "tessera_p2p_sum";
 const GATHER_ENTRY: &str = "tessera_p2p_gather";
 const BF16_ENTRY: &str = "tessera_p2p_sum_bf16";
+const FP16_ENTRY: &str = "tessera_p2p_sum_fp16";
 
 /// Maximum ranks in one P2P group.
 const MAX_RANKS: usize = 8;
@@ -31,6 +32,18 @@ const MAX_THREADS: u32 = 1024;
 const LARGE_GRID: u32 = 4;
 /// Ranks may still load when the first sum starts.
 const TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Wire precision for P2P all-reduce transfers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Wire {
+    /// Full FP32 wire transport.
+    #[default]
+    F32,
+    /// BF16 wire transport with FP32 accumulation.
+    Bf16,
+    /// FP16 wire transport with FP32 accumulation.
+    Fp16,
+}
 
 /// Schedule choice for P2P transfers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -112,6 +125,7 @@ pub struct P2p<D: Device> {
     kernel: D::Kernel,
     gather_kernel: D::Kernel,
     bf16_kernel: D::Kernel,
+    fp16_kernel: D::Kernel,
     _peers: Peers<D>,
     _area: DeviceBuffer<D>,
     areas: DeviceBuffer<D>,
@@ -123,7 +137,7 @@ pub struct P2p<D: Device> {
     threads: u32,
     timeout_ticks: u64,
     schedule: Schedule,
-    bf16: bool,
+    wire: Wire,
     broken: bool,
 }
 
@@ -189,6 +203,7 @@ where
         let kernel = ctx.compile(&text, ENTRY)?;
         let gather_kernel = ctx.compile(&text, GATHER_ENTRY)?;
         let bf16_kernel = ctx.compile(&text, BF16_ENTRY)?;
+        let fp16_kernel = ctx.compile(&text, FP16_ENTRY)?;
 
         let area = DeviceBuffer::alloc(ctx, area_bytes(ranks))?;
         area.zero()?;
@@ -240,6 +255,7 @@ where
             kernel,
             gather_kernel,
             bf16_kernel,
+            fp16_kernel,
             _peers: peers,
             _area: area,
             areas,
@@ -251,7 +267,7 @@ where
             threads,
             timeout_ticks,
             schedule: Schedule::Auto,
-            bf16: false,
+            wire: Wire::F32,
             broken: false,
         })
     }
@@ -262,9 +278,15 @@ where
         self
     }
 
+    /// Sets the wire transport precision.
+    pub fn with_wire(mut self, wire: Wire) -> Self {
+        self.wire = wire;
+        self
+    }
+
     /// Enables BF16 wire transport with FP32 accumulation.
     pub fn with_bf16(mut self, bf16: bool) -> Self {
-        self.bf16 = bf16;
+        self.wire = if bf16 { Wire::Bf16 } else { Wire::F32 };
         self
     }
 
@@ -294,10 +316,10 @@ where
         self.ctx.programmatic(false);
         let blocks = (grid, 1, 1);
         let threads = (self.threads, 1, 1);
-        let kernel = if self.bf16 {
-            &self.bf16_kernel
-        } else {
-            &self.kernel
+        let kernel = match self.wire {
+            Wire::F32 => &self.kernel,
+            Wire::Bf16 => &self.bf16_kernel,
+            Wire::Fp16 => &self.fp16_kernel,
         };
         Ok(self.ctx.launch(kernel, blocks, threads, 0, &mut args)?)
     }
@@ -415,24 +437,29 @@ where
     }
 }
 
-struct Start<'a>(&'a mut dyn Transport, bool);
+struct Start<'a>(&'a mut dyn Transport, Wire);
 
 impl OnGpu for Start<'_> {
     type Out = Result<Box<dyn Sum>, Error>;
 
     fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
         Ok(Box::new(
-            P2p::on(cached_context::<D>()?, self.0)?.with_bf16(self.1),
+            P2p::on(cached_context::<D>()?, self.0)?.with_wire(self.1),
         ))
     }
 }
 
 /// Direct P2P sums on the GPU `gpu` names.
 pub fn open(gpu: Option<Gpu>, boot: &mut dyn Transport) -> Result<Box<dyn Sum>, Error> {
-    persistent(gpu, Start(boot, false))
+    persistent(gpu, Start(boot, Wire::F32))
 }
 
 /// Direct P2P sums with BF16 wire transport on `gpu`.
 pub fn open_bf16(gpu: Option<Gpu>, boot: &mut dyn Transport) -> Result<Box<dyn Sum>, Error> {
-    persistent(gpu, Start(boot, true))
+    persistent(gpu, Start(boot, Wire::Bf16))
+}
+
+/// Direct P2P sums with FP16 wire transport on `gpu`.
+pub fn open_fp16(gpu: Option<Gpu>, boot: &mut dyn Transport) -> Result<Box<dyn Sum>, Error> {
+    persistent(gpu, Start(boot, Wire::Fp16))
 }

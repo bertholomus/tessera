@@ -28,7 +28,7 @@ type Outcome = Result<(), Box<dyn Error>>;
 /// Runs `rounds` sums on the GPU the settings pick.
 pub fn run(args: &Args, rounds: u32) -> Outcome {
     let settings = tessera_frontend_settings::read();
-    if matches!(args.sums, Sums::P2p | Sums::P2pBf16) {
+    if matches!(args.sums, Sums::P2p | Sums::P2pBf16 | Sums::P2pFp16) {
         tessera_run::select(settings.device.unwrap_or(args.rank as usize));
     }
     let stub = Stub(args, rounds);
@@ -44,7 +44,7 @@ impl OnGpu for Stub<'_> {
     fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Outcome {
         let ctx = cached_context::<D>()?;
         match self.0.sums {
-            Sums::P2p | Sums::P2pBf16 => p2p_stub(ctx, self.0, self.1),
+            Sums::P2p | Sums::P2pBf16 | Sums::P2pFp16 => p2p_stub(ctx, self.0, self.1),
             _ => on(ctx, self.0, self.1),
         }
     }
@@ -60,16 +60,18 @@ where
         Some(path) => Box::new(shm(path, rank, ranks, CAPACITY)?),
         None => Box::new(meet(rank, &args.addrs, args.listen)?),
     };
-    let bf16 = args.sums == Sums::P2pBf16;
+    let wire = match args.sums {
+        Sums::P2pBf16 => tessera_device::p2p::Wire::Bf16,
+        Sums::P2pFp16 => tessera_device::p2p::Wire::Fp16,
+        _ => tessera_device::p2p::Wire::F32,
+    };
     let mut p2p = P2p::on(ctx, &mut *boot)?
         .with_schedule(args.sched)
-        .with_bf16(bf16);
-    let close = |got: f32, want: f32| {
-        if bf16 {
-            (got - want).abs() <= want.abs() * 0.02 + 1e-2
-        } else {
-            got == want
-        }
+        .with_wire(wire);
+    let close = |got: f32, want: f32| match wire {
+        tessera_device::p2p::Wire::F32 => got == want,
+        tessera_device::p2p::Wire::Bf16 => (got - want).abs() <= want.abs() * 0.02 + 1e-2,
+        tessera_device::p2p::Wire::Fp16 => (got - want).abs() <= want.abs() * 0.005 + 1e-3,
     };
     let bytes = n * 4;
     let from = DeviceBuffer::alloc(ctx, bytes)?;

@@ -78,15 +78,17 @@ pub enum Sums {
     Grid,
     P2p,
     P2pBf16,
+    P2pFp16,
 }
 
-/// Parses `--sums host|grid|p2p|p2p-bf16`.
+/// Parses `--sums host|grid|p2p|p2p-bf16|p2p-fp16`.
 pub fn sums_flag(value: &str) -> Option<Sums> {
     match value {
         "host" => Some(Sums::Host),
         "grid" => Some(Sums::Grid),
         "p2p" => Some(Sums::P2p),
         "p2p-bf16" => Some(Sums::P2pBf16),
+        "p2p-fp16" => Some(Sums::P2pFp16),
         _ => None,
     }
 }
@@ -96,7 +98,7 @@ pub fn p2p(
     met: &mut dyn Transport,
     settings: &Settings,
 ) -> Result<Box<dyn Sum>, Box<dyn std::error::Error>> {
-    p2p_with(met, settings, false)
+    p2p_with(met, settings, p2p::Wire::F32)
 }
 
 /// Direct GPU-to-GPU sums over IPC with BF16 wire transport.
@@ -104,22 +106,30 @@ pub fn p2p_bf16(
     met: &mut dyn Transport,
     settings: &Settings,
 ) -> Result<Box<dyn Sum>, Box<dyn std::error::Error>> {
-    p2p_with(met, settings, true)
+    p2p_with(met, settings, p2p::Wire::Bf16)
+}
+
+/// Direct GPU-to-GPU sums over IPC with FP16 wire transport.
+pub fn p2p_fp16(
+    met: &mut dyn Transport,
+    settings: &Settings,
+) -> Result<Box<dyn Sum>, Box<dyn std::error::Error>> {
+    p2p_with(met, settings, p2p::Wire::Fp16)
 }
 
 fn p2p_with(
     met: &mut dyn Transport,
     settings: &Settings,
-    bf16: bool,
+    wire: p2p::Wire,
 ) -> Result<Box<dyn Sum>, Box<dyn std::error::Error>> {
     let rank = met.rank();
     let device = settings.device.unwrap_or(rank as usize);
     tessera_engine::select(device);
-    let sums = match bf16 {
-        true => p2p::open_bf16(settings.gpu(), met)?,
-        false => p2p::open(settings.gpu(), met)?,
+    let (sums, kind) = match wire {
+        p2p::Wire::F32 => (p2p::open(settings.gpu(), met)?, "f32"),
+        p2p::Wire::Bf16 => (p2p::open_bf16(settings.gpu(), met)?, "bf16"),
+        p2p::Wire::Fp16 => (p2p::open_fp16(settings.gpu(), met)?, "fp16"),
     };
-    let kind = if bf16 { "bf16" } else { "f32" };
     eprintln!("rank {rank}: sums over direct GPU P2P ({kind}, device {device})");
     Ok(sums)
 }
