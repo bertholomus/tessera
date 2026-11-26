@@ -7,9 +7,10 @@ pub(crate) mod mm;
 
 use gemv::{propose_gemv, why_gemv};
 use std::sync::OnceLock;
-use tessera_device::{Backend, flatten_for, parse_trellis};
+use tessera_device::{Backend, flatten_for};
 pub(crate) use tessera_device::{CUDA_LACKS, cuda_rule, f32_only};
-use tessera_graph::{Op, Order, Stage, View};
+use tessera_graph::{Op, Order, View};
+use tessera_linear::{Dense, launch_args};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
     Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Ops, Read, Shape, Source, Step, T, Term,
@@ -168,26 +169,8 @@ fn mma_launches(t: &TrellisMma, step: &Step) -> Vec<Launch> {
         down: t.m.div_ceil(dtr_tile(t.m)),
         threads: THREADS,
     };
-    let suh = if t.turned { step.read(2) } else { step.read(0) };
-    let svh = if t.turned && t.ks == 1 {
-        step.read(3)
-    } else {
-        step.read(0)
-    };
-    let args = vec![
-        step.read(0),
-        step.read(1),
-        suh,
-        svh,
-        step.out(),
-        Arg::count(t.m),
-        Arg::count(t.n),
-        Arg::count(t.k),
-        Arg::count(t.ks),
-        Arg::value(&t.bits),
-        Arg::value(&t.book),
-        Arg::count(usize::from(t.turned)),
-    ];
+    let sizes = [t.m, t.n, t.k, t.ks];
+    let args = launch_args(step, sizes, t.bits, t.book, t.turned);
     vec![Launch { args, shape }]
 }
 
@@ -250,11 +233,6 @@ fn reduce_launches(r: &TrellisReduce, step: &Step) -> Vec<Launch> {
         Arg::count(usize::from(r.turned)),
     ];
     vec![Launch { args, shape }]
-}
-
-fn step_args<'a>(tree: &'a Tree, t: T, term: Term) -> Option<&'a [T]> {
-    let node = tree.node(t);
-    (node.term == term && !tree.root(t)).then_some(&node.args[..])
 }
 
 fn dtr_pre_tile(m: usize, n: usize) -> usize {
@@ -397,158 +375,47 @@ fn pre_mma_launches(t: &TrellisPreMma, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-fn trellis_drafts(t: TrellisMma, x: T, w: T, suh: Option<T>, svh: Option<T>) -> Vec<Draft> {
-    let (m, n, k, ks, turned) = (t.m, t.n, t.k, t.ks, t.turned);
+fn trellis_drafts(d: &Dense) -> Vec<Draft> {
+    let (m, n, k, turned) = (d.m, d.n, d.k, d.turned());
+    let ks = dtr_ks(m, n, k);
     if ks == 1 && m >= 64 {
-        let mut p_reads = vec![Read::Node(x)];
-        if let Some(u) = suh {
-            p_reads.push(Read::Node(u));
-        }
-        let mut m_reads = vec![Read::Draft(0), Read::Node(w)];
-        if let Some(v) = svh {
-            m_reads.push(Read::Node(v));
-        }
+        let [suh, svh] = d.turn.map_or([None, None], |[u, v]| [Some(u), Some(v)]);
+        let p_reads = [d.x].into_iter().chain(suh).map(Read::Node);
+        let m_reads = [Read::Draft(0), Read::Node(d.w)]
+            .into_iter()
+            .chain(svh.map(Read::Node));
         let prep = TrellisPrep { m, k, turned };
         let pre_len = m.div_ceil(64) * (k / BLOCK) * 8 * 512;
         let mma = TrellisPreMma {
             m,
             n,
             k,
-            bits: t.bits,
-            book: t.book,
+            bits: d.bits,
+            book: d.book,
             turned,
-            form: t.form,
+            form: d.form,
         };
         return vec![
             Draft::new(prep, p_reads, pre_len),
             Draft::new(mma, m_reads, m * n),
         ];
     }
-    if ks == 1 {
-        let mut reads = vec![x, w];
-        if let (Some(u), Some(v)) = (suh, svh) {
-            reads.extend([u, v]);
-        }
-        return vec![Draft::new(t, reads, m * n)];
-    }
-    let mut s_reads = vec![Read::Node(x), Read::Node(w)];
-    if let Some(u) = suh {
-        s_reads.push(Read::Node(u));
-    }
-    let mut r_reads = vec![Read::Draft(0)];
-    if let Some(v) = svh {
-        r_reads.push(Read::Node(v));
-    }
-    let red = TrellisReduce { m, n, ks, turned };
-    vec![
-        Draft::new(t, s_reads, ks * m * n),
-        Draft::new(red, r_reads, m * n),
-    ]
-}
-
-fn check_trellis(tree: &Tree, x: T, w: T, turned: bool) -> Option<Result<TrellisMma, String>> {
-    let form = tree.node(w).form;
-    if !form.name().starts_with("trellis") {
-        return None;
-    }
-    let Some((bits, book)) = parse_trellis(form.name()) else {
-        return Some(Err(format!("unsupported trellis form {}", form.name())));
-    };
-    let [n, k] = tree.node(w).shape[..] else {
-        return Some(Err("trellis weight is not 2D".into()));
-    };
-    if !tree.leaf(w) {
-        return Some(Err("trellis weight is not a direct leaf".into()));
-    }
-    if !n.is_multiple_of(BLOCK) {
-        return Some(Err(format!(
-            "n={n} is not a multiple of {BLOCK} for trellis"
-        )));
-    }
-    if !k.is_multiple_of(BLOCK) {
-        return Some(Err(format!(
-            "k={k} is not a multiple of {BLOCK} for trellis"
-        )));
-    }
-    if tree.node(x).form.name() != "f32" {
-        return Some(Err(format!(
-            "input form {} (requires f32)",
-            tree.node(x).form.name()
-        )));
-    }
-    let m = tree.elements(x) / k;
-    if m == 0 {
-        return Some(Err("m=0".into()));
-    }
-    Some(Ok(TrellisMma {
+    let mma = TrellisMma {
         m,
         n,
         k,
-        ks: dtr_ks(m, n, k),
-        bits,
-        book,
+        ks,
+        bits: d.bits,
+        book: d.book,
         turned,
-        form,
-    }))
+        form: d.form,
+    };
+    d.drafts(mma, ks, TrellisReduce { m, n, ks, turned })
 }
 
 /// Rotated or plain dense trellis matmul.
 fn eval_trellis(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
-    let turn = Term::Stage(Stage::Hadamard {
-        block: BLOCK as u32,
-    });
-    let mul = Term::Stage(Stage::Mul);
-    let node = tree.node(at);
-    if node.term == mul {
-        let (back, svh) = (node.args[0], *node.args.get(1)?);
-        let &[product] = step_args(tree, back, turn.clone())? else {
-            return None;
-        };
-        let &[turned, w] = step_args(tree, product, Term::Op(Op::Matmul))? else {
-            return None;
-        };
-        let &[scaled] = step_args(tree, turned, turn)? else {
-            return None;
-        };
-        let &[x, suh] = step_args(tree, scaled, mul)? else {
-            return None;
-        };
-        if node.form.name() != "f32" {
-            return Some(Err(format!(
-                "output form {} (requires f32)",
-                node.form.name()
-            )));
-        }
-        let kernel = match check_trellis(tree, x, w, true)? {
-            Ok(k) => k,
-            Err(e) => return Some(Err(e)),
-        };
-        if tree.elements(suh) != kernel.k || tree.elements(svh) != kernel.n {
-            return Some(Err("rotation scale length mismatch".into()));
-        }
-        if tree.node(suh).form.name() != "f32" || tree.node(svh).form.name() != "f32" {
-            return Some(Err("rotation scales must be f32".into()));
-        }
-        return Some(Ok(trellis_drafts(kernel, x, w, Some(suh), Some(svh))));
-    }
-    if node.term == Term::Op(Op::Matmul) {
-        let (x, w) = (node.args[0], node.args[1]);
-        if !tree.node(w).form.name().starts_with("trellis") {
-            return None;
-        }
-        if node.form.name() != "f32" {
-            return Some(Err(format!(
-                "output form {} (requires f32)",
-                node.form.name()
-            )));
-        }
-        let kernel = match check_trellis(tree, x, w, false)? {
-            Ok(k) => k,
-            Err(e) => return Some(Err(e)),
-        };
-        return Some(Ok(trellis_drafts(kernel, x, w, None, None)));
-    }
-    None
+    Some(Dense::find(tree, at, BLOCK)?.map(|d| trellis_drafts(&d)))
 }
 
 /// One thread's trip. Bf16 widens with one integer op.

@@ -633,6 +633,20 @@ pub fn rotated(t: &[f32], inp: usize, out: usize, suh: &[f32], svh: &[f32]) -> V
     back
 }
 
+/// Parses `trellis_k{2,3,4}[_{mul1,pmcgx}]` into `(bits, book)`.
+pub fn parse_form(name: &str) -> Option<(u32, u32)> {
+    let rest = name.strip_prefix("trellis_k")?;
+    let (k, book) = if let Some(k) = rest.strip_suffix("_pmcgx") {
+        (k, 2u32)
+    } else if let Some(k) = rest.strip_suffix("_mul1") {
+        (k, 1u32)
+    } else {
+        (rest, 0u32)
+    };
+    let bits: u32 = k.parse().ok()?;
+    (2..=4).contains(&bits).then_some((bits, book))
+}
+
 macro_rules! define_trellis {
     ($(($book:ident, $suffix:literal, $k:literal, $plain:ident, $turned:ident, $kind:literal),)*) => {$(
         #[doc = concat!("exlr8 at ", $k, " bits a weight, ", stringify!($book), ".")]

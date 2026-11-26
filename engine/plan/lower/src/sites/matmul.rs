@@ -3,7 +3,7 @@ use crate::form::Load;
 use crate::kernels::MapStage;
 use crate::rule::Read;
 use crate::tree::{T, Term, Tree};
-use tessera_graph::{Op, Select, View};
+use tessera_graph::{Op, Select, Stage, View};
 
 /// Each output row reads one matrix of a stored set.
 #[derive(Clone, Copy, Debug)]
@@ -172,6 +172,51 @@ impl Pattern for Finished {
             product: lone(&reads[sum])?,
             after: After { stages, sum },
             others: others.map(|r| Read::Node(*r)).collect(),
+        })
+    }
+}
+
+/// `Mul(Hadamard(Matmul(Hadamard(Mul(x, suh)), w)), svh)`, inner nodes unshared.
+#[derive(Clone, Copy, Debug)]
+pub struct Rotated {
+    pub x: T,
+    pub w: T,
+    pub suh: T,
+    pub svh: T,
+    /// The Hadamard block of both rotations.
+    pub block: u32,
+}
+
+impl Pattern for Rotated {
+    fn find(tree: &Tree, at: T) -> Option<Self> {
+        let mul = Term::Stage(Stage::Mul);
+        let node = tree.node(at);
+        if node.term != mul {
+            return None;
+        }
+        let (back, svh) = (node.args[0], *node.args.get(1)?);
+        let turn = tree.node(back).term.clone();
+        let Term::Stage(Stage::Hadamard { block }) = turn else {
+            return None;
+        };
+        let &[product] = tree.inner(back, &turn)? else {
+            return None;
+        };
+        let &[turned, w] = tree.inner(product, &Term::Op(Op::Matmul))? else {
+            return None;
+        };
+        let &[scaled] = tree.inner(turned, &turn)? else {
+            return None;
+        };
+        let &[x, suh] = tree.inner(scaled, &mul)? else {
+            return None;
+        };
+        Some(Self {
+            x,
+            w,
+            suh,
+            svh,
+            block,
         })
     }
 }

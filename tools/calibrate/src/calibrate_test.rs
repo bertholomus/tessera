@@ -35,6 +35,7 @@ fn grid_reaches_rules() {
     // CPU and compiled device rules need matching hardware.
     let device_rules = [
         "trellis_mma",
+        "trellis_metal",
         "fast_gemv",
         "fast_mm",
         "fast_stacked",

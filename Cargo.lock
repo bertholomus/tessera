@@ -2119,6 +2119,7 @@ dependencies = [
  "tessera-interp",
  "tessera-kernels",
  "tessera-lower",
+ "tessera-mem",
  "tessera-run",
  "tessera-testkit",
  "tessera-trace",

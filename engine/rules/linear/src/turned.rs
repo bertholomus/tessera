@@ -1,10 +1,11 @@
 //! A rotated matmul for few rows, in one launch.
 
 use tessera_codegen::prelude::*;
-use tessera_graph::{Op, Order, Stage};
+use tessera_graph::Order;
 use tessera_kernels::{BLOCK, spin, spin_inline};
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{Draft, Kernel, Load, Needs, Shape, Source, T, Term, Tree};
+use tessera_lower::sites::Rotated;
+use tessera_lower::{Draft, Kernel, Load, Needs, Shape, Source, T, Tree};
 
 /// Its row limit: each thread keeps one sum per row.
 const ROWS: usize = 8;
@@ -142,33 +143,10 @@ fn turned_load(t: &Turned, _: usize) -> Option<Load> {
     })
 }
 
-/// The arguments of `t` if it is `term`.
-fn step<'a>(tree: &'a Tree, t: T, term: Term) -> Option<&'a [T]> {
-    let node = tree.node(t);
-    (node.term == term && !tree.root(t)).then_some(&node.args[..])
-}
-
-/// `Mul(Hadamard(Matmul(Hadamard(Mul(x, suh)), w)), svh)` at `at`.
+/// A rotated matmul at `at`.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let turn = || Term::Stage(Stage::Hadamard { block: BLOCK });
-    let mul = || Term::Stage(Stage::Mul);
-    let node = tree.node(at);
-    if node.term != mul() {
-        return None;
-    }
-    let (back, svh) = (node.args[0], *node.args.get(1)?);
-    let &[product] = step(tree, back, turn())? else {
-        return None;
-    };
-    let &[turned, w] = step(tree, product, Term::Op(Op::Matmul))? else {
-        return None;
-    };
-    let &[scaled] = step(tree, turned, turn())? else {
-        return None;
-    };
-    let &[x, suh] = step(tree, scaled, mul())? else {
-        return None;
-    };
+    let r = tree.site::<Rotated>(at).filter(|r| r.block == BLOCK)?;
+    let (x, w, suh, svh) = (r.x, r.w, r.suh, r.svh);
     let [n, k] = tree.node(w).shape[..] else {
         return None;
     };

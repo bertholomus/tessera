@@ -716,6 +716,12 @@ impl<'a> Tree<'a> {
         kept || end || self.readers[t.0 as usize] > 1 || self.output(t)
     }
 
+    /// `t`'s arguments if it is an unshared `term`.
+    pub fn inner(&self, t: T, term: &Term) -> Option<&[T]> {
+        let node = self.node(t);
+        (node.term == *term && !self.root(t)).then_some(&node.args[..])
+    }
+
     /// Whether a region rule claims `t` as an output.
     pub(crate) fn end(&self, t: T) -> bool {
         self.ends[t.0 as usize]

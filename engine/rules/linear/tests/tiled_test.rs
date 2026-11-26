@@ -199,6 +199,62 @@ fn codes_match_decode() {
     }
 }
 
+#[test]
+fn metal_trellis_matches_cpu() {
+    let Some(settings) = runs().into_iter().find(|s| s.gpu().is_some()) else {
+        return;
+    };
+    let (inp, out) = (512usize, 256usize);
+    let g = linear(inp as u64, out as u64);
+    let mut draws = Noise(41);
+    let forms = [
+        (2, ""),
+        (3, ""),
+        (4, ""),
+        (2, "_mul1"),
+        (3, "_mul1"),
+        (4, "_mul1"),
+        (2, "_pmcgx"),
+        (3, "_pmcgx"),
+        (4, "_pmcgx"),
+    ];
+    for (k, book) in forms {
+        let codes = named(&format!("trellis_k{k}{book}")).unwrap();
+        let rot = named(&format!("{}_rot", codes.name())).unwrap();
+        let entries: Vec<u8> = (0..out * inp * k as usize / 8)
+            .map(|_| (draws.draw() * 256.0) as u8)
+            .collect();
+        let scale: Vec<u8> = (0..inp + out)
+            .flat_map(|i| F16::from(0.5 + (i % 7) as f32 / 8.0).0.to_le_bytes())
+            .collect();
+        for side in [1u32, trellis::INPUT_SIDE] {
+            let plain = trellis::packed(inp, out, side, &entries);
+            let mut turned = plain.clone();
+            turned.extend(&scale);
+            for (form, bytes) in [(codes, &plain), (rot, &turned)] {
+                let weights = [Tensor::f32(vec![out, inp], form.unpack_all(bytes))];
+                for rows in [1usize, 3, 13, 40] {
+                    let x = noise(vec![rows, inp], &mut draws);
+                    let want = run(&g, &weights, 0, std::slice::from_ref(&x)).unwrap();
+                    let device = Device::guess(&settings).pinned(Pins::all(form));
+                    let plan = lower(&g, 0, &[(Rows, rows as u64)], &device).unwrap();
+                    let mut runner = open(plan, &settings).unwrap();
+                    runner
+                        .load_weight(0, &Weight::Packed(form, bytes.clone()))
+                        .unwrap();
+                    let got = runner.run(&[x.view()]).unwrap().remove(0);
+                    let cos = cosine_f32(got.floats().unwrap(), want[0].floats().unwrap());
+                    assert!(
+                        cos > 0.99999,
+                        "{} side={side} rows={rows}: cos {cos}",
+                        form.name()
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Unsampled, a known chip's table picks its fastest schedule.
 #[test]
 fn tables_pick_schedules() {

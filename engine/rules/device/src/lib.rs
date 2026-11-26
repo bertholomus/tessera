@@ -98,20 +98,6 @@ pub fn f32_only<K>(_: &K, form: &dyn tessera_lower::form::Load) -> bool {
     form.name() == "f32"
 }
 
-/// Parses `trellis_k{2,3,4}[_{mul1,pmcgx}]` into `(bits, book)`.
-pub fn parse_trellis(name: &str) -> Option<(u32, u32)> {
-    let rest = name.strip_prefix("trellis_k")?;
-    let (k, book) = if let Some(k) = rest.strip_suffix("_pmcgx") {
-        (k, 2u32)
-    } else if let Some(k) = rest.strip_suffix("_mul1") {
-        (k, 1u32)
-    } else {
-        (rest, 0u32)
-    };
-    let bits: u32 = k.parse().ok()?;
-    (2..=4).contains(&bits).then_some((bits, book))
-}
-
 /// Flattens one built-in kernel source into a static string.
 pub fn flatten_for(backend: Backend, name: &str, kernel: &str) -> &'static str {
     let flat = flatten(name, kernel, &|_| None, &Options::plain(backend));
