@@ -1,0 +1,21 @@
+# GLM-5.3 exlr8 (bit280) across four GB10 ranks with fused routed MoE.
+name = "glm53-gb10x4"
+about = "GLM-5.3 exlr8 (bit280) for four GB10 ranks with fused routed MoE"
+module = "../glm53-moe/model"
+
+[weights]
+hf = "kindlingai/glm-5.3-exlr8-k2-k3-k4@9e25c28a2e8808d8b2599d780521fd6af24e7558"
+
+[lower]
+favor = "glm53_moe"
+
+[serve]
+task = "generate"
+manifest = "bit280"
+max_model_len = 1048576
+slots = 8
+kv_dtype = "fp8"
+kv_cache_tokens = 1048576
+reuse_prefix = true
+moe = "tp"
+sums = "arx"
