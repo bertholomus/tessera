@@ -496,12 +496,29 @@ pub(crate) fn held(
     Ok((graph, Weights::Held(weights), pins))
 }
 
+/// Builds the weight request used by `load_module`.
+pub(crate) fn module_ask<'a>(
+    dir: &'a Path,
+    sizes: [u64; 2],
+    user: &'a [Rule],
+    overrides: &'a Overrides,
+    json: &'a str,
+    manifest: Option<&'a str>,
+) -> arch::Ask<'a> {
+    arch::Ask {
+        user,
+        manifest,
+        ..arch::Ask::plain(dir, sizes, overrides, json)
+    }
+}
+
 /// A module's step graph over `dir`'s weights, if built.
 pub fn load_module(
     dir: &Path,
     sizes: [u64; 2],
     user: &[Rule],
     overrides: &Overrides,
+    manifest: Option<&str>,
     module: &Module,
 ) -> Result<Option<Bundle>, Box<dyn Error + Send + Sync>> {
     if !module.builds() || dir.is_file() {
@@ -513,10 +530,7 @@ pub fn load_module(
     };
     let layers = graph.dims.iter().find(|d| d.name == DimName::Layers);
     let layers = layers.map_or(0, |d| d.size.max());
-    let ask = arch::Ask {
-        user,
-        ..arch::Ask::plain(dir, sizes, overrides, &json)
-    };
+    let ask = module_ask(dir, sizes, user, overrides, &json, manifest);
     let built = held(&ask, graph, layers, &[])?;
     dressed(dir, built, Some(json), None, overrides).map(Some)
 }
