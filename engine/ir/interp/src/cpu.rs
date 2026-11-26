@@ -157,11 +157,12 @@ struct Keys<'a> {
 }
 
 impl Keys<'_> {
-    /// Adds query `q` over the key rows `at` into `o`.
+    /// Adds query `q` over `at`, with optional sink.
     fn row(
         &self,
         q: &[f32],
         at: impl Iterator<Item = usize> + Clone,
+        sink: Option<f32>,
         p: &mut Vec<f32>,
         o: &mut [f32],
     ) {
@@ -169,6 +170,9 @@ impl Keys<'_> {
         p.clear();
         for j in at.clone() {
             p.push(self.acc.dot(q, &self.k[j * d..(j + 1) * d]) * self.scale);
+        }
+        if let Some(s) = sink {
+            p.push(s);
         }
         softmax(self.acc, p);
         for (j, &pj) in at.zip(p.iter()) {
@@ -185,6 +189,7 @@ pub(crate) fn attend(
     a: &Attend,
     qkv: [&Tensor; 3],
     picked: Option<&Tensor>,
+    sinks: Option<&Tensor>,
 ) -> Result<Tensor, Error> {
     let acc = Acc::new(n.accumulate)?;
     let [q, k, v] = qkv;
@@ -196,6 +201,7 @@ pub(crate) fn attend(
     let past = past_keys(a, ctx, keys)?;
     let qs = q.floats()?;
     let (k, v) = (k.floats()?, v.floats()?);
+    let sink_vals = sinks.map(Tensor::floats).transpose()?;
     let kv = Keys {
         acc,
         scale: a.scale,
@@ -204,7 +210,7 @@ pub(crate) fn attend(
     };
     let mut out = vec![0.0; seqs * ctx * heads * dv];
     let lists = picked.map(Tensor::indices).transpose()?;
-    let mut p = Vec::with_capacity(keys);
+    let mut p = Vec::with_capacity(keys + 1);
     for s in 0..seqs {
         for t in 0..ctx {
             let (from, to) = seen(a.mask, past + t, keys);
@@ -226,6 +232,7 @@ pub(crate) fn attend(
                 kv.row(
                     &qs[row * d..(row + 1) * d],
                     all.iter().map(kv_at),
+                    sink_vals.map(|sv| sv[h]),
                     &mut p,
                     o,
                 );
@@ -426,6 +433,7 @@ pub(crate) fn attend_rows(
     [q, k, v]: [&Tensor; 3],
     [slots, positions]: [&Tensor; 2],
     picked: Option<&Tensor>,
+    sinks: Option<&Tensor>,
 ) -> Result<Tensor, Error> {
     let acc = Acc::new(n.accumulate)?;
     let [rows, heads, d] = q.shape[..] else {
@@ -437,6 +445,7 @@ pub(crate) fn attend_rows(
     let group = heads / kv_heads;
     let qs = q.floats()?;
     let (k, v) = (k.floats()?, v.floats()?);
+    let sink_vals = sinks.map(Tensor::floats).transpose()?;
     let kv = Keys {
         acc,
         scale: a.scale,
@@ -446,7 +455,7 @@ pub(crate) fn attend_rows(
     let (slots, positions) = (slots.indices()?, positions.indices()?);
     let lists = picked.map(Tensor::indices).transpose()?;
     let mut out = vec![0.0; rows * heads * dv];
-    let mut p = Vec::with_capacity(keys);
+    let mut p = Vec::with_capacity(keys + 1);
     for r in 0..rows {
         let (s, at) = (slots[r], positions[r]);
         if at >= keys {
@@ -472,6 +481,7 @@ pub(crate) fn attend_rows(
             kv.row(
                 &qs[row * d..(row + 1) * d],
                 all.iter().map(kv_at),
+                sink_vals.map(|sv| sv[h]),
                 &mut p,
                 o,
             );

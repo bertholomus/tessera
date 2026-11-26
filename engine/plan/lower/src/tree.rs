@@ -484,7 +484,11 @@ impl<'a> Tree<'a> {
                 Op::Attend(a) if bypass => {
                     let mut plain = a.clone();
                     plain.picked = false;
-                    push(Term::Op(Op::Attend(plain)), args[..5].to_vec(), form)
+                    let mut kept = args[..5].to_vec();
+                    if let Some(si) = a.sinks_arg() {
+                        kept.push(args[si]);
+                    }
+                    push(Term::Op(Op::Attend(plain)), kept, form)
                 }
                 op => push(Term::Op(op.clone()), args, form),
             });

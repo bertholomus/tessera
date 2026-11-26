@@ -73,7 +73,7 @@ ops! {
     /// `x[.., K]` times `w[.., N, K]` transposed.
     Matmul => { args: 2, reduces: true, pin: Pin::Matmul }
     Attend(a: Attend) => {
-        args: 3 + usize::from(a.picked) + 2 * usize::from(a.ragged),
+        args: a.arity(),
         reduces: true,
         pin: Pin::Attention,
     }

@@ -109,6 +109,27 @@ pub struct Attend {
     /// Query rows carry a slot and position: arguments four, five.
     #[serde(default)]
     pub ragged: bool,
+    /// Final argument holds per-head sink logits `[Heads]`.
+    #[serde(default)]
+    pub sinks: bool,
+}
+
+impl Attend {
+    /// Expected argument count.
+    pub fn arity(&self) -> usize {
+        3 + usize::from(self.picked) + 2 * usize::from(self.ragged) + usize::from(self.sinks)
+    }
+
+    /// Argument index of the listed key ids, if `picked`.
+    pub fn ids_arg(&self) -> Option<usize> {
+        self.picked.then_some(if self.ragged { 5 } else { 3 })
+    }
+
+    /// Argument index of the per-head sink logits, if `sinks`.
+    pub fn sinks_arg(&self) -> Option<usize> {
+        self.sinks
+            .then_some(3 + 2 * usize::from(self.ragged) + usize::from(self.picked))
+    }
 }
 
 fn one() -> u32 {

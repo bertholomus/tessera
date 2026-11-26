@@ -115,6 +115,7 @@ struct SplitAttend {
     kept: &'static dyn Layout,
     picks: usize,
     from_list: bool,
+    has_sinks: bool,
     scale: f32,
     window: (usize, usize),
     splits: usize,
@@ -133,7 +134,7 @@ impl SplitAttend {
 
 fn attend_accepts(k: &SplitAttend, input: usize, form: &dyn Stored) -> bool {
     match (k.kind, input) {
-        (_, 0) => form.name() == "f32",
+        (_, 0) | (_, 5) => form.name() == "f32",
         (AttendKind::Mla, 1) | (AttendKind::Gqa, 1 | 2) => form.name() == k.kv_form.name(),
         _ => form.name() == "u32",
     }
@@ -190,6 +191,7 @@ fn attend_launches(k: &SplitAttend, step: &Step) -> Vec<Launch> {
         step.read(2),
         step.read(3),
         step.read(4),
+        step.read(5),
         step.out(),
         Arg::value(&k.scale),
         Arg::count(k.rows),
@@ -212,6 +214,7 @@ fn attend_launches(k: &SplitAttend, step: &Step) -> Vec<Launch> {
         Arg::count(k.splits),
         table,
         Arg::count(page_shift),
+        Arg::count(usize::from(k.has_sinks)),
     ]);
     vec![Launch { args, shape }]
 }
@@ -366,23 +369,34 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
         "heads={heads} not a multiple of kv_heads={kv_heads}"
     );
     let [slots, positions] = [node.args[3], node.args[4]];
+    let sinks = match a.sinks_arg() {
+        Some(si) => {
+            let s = node.args[si];
+            require!(f32 tree, "sinks" s);
+            s
+        }
+        None => q,
+    };
     let (reads, picks, hgroups) = match kind {
         AttendKind::Mla => {
             require!(kv_heads == 1, "kv_heads={kv_heads} (requires 1)");
             let fits = heads >= 16 && heads.is_multiple_of(16);
             require!(fits, "heads={heads} (requires a multiple of 16)");
-            let (ids, picks) = match node.args.get(5) {
-                Some(&ids) => (ids, *tree.node(ids).shape.last()?),
+            let (ids, picks) = match a.ids_arg() {
+                Some(i) => {
+                    let ids = node.args[i];
+                    (ids, *tree.node(ids).shape.last()?)
+                }
                 None => (positions, most),
             };
-            ([q, k, ids, slots, positions], picks, heads / 16)
+            ([q, k, ids, slots, positions, sinks], picks, heads / 16)
         }
         AttendKind::Gqa => {
             let gqa = heads / kv_heads;
             let fits = gqa >= 4 && (gqa <= 16 || gqa.is_multiple_of(16));
             require!(fits, "{gqa} heads per kv head (requires 4..=16 or n*16)");
             let hgroups = kv_heads * gqa.div_ceil(16);
-            ([q, k, v, slots, positions], most, hgroups)
+            ([q, k, v, slots, positions, sinks], most, hgroups)
         }
     };
     let cache = kept_context(tree, k, v, most);
@@ -403,6 +417,7 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
         kept,
         picks,
         from_list: a.picked,
+        has_sinks: a.sinks,
         scale: a.scale,
         window: a.mask.window(most),
         splits,

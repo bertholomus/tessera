@@ -118,6 +118,7 @@ fn decode_and_constants() {
             scale,
             picked: false,
             ragged: false,
+            sinks: false,
         })
     };
     let tys = vec![q.clone(), kv.clone(), kv.clone()];
@@ -183,6 +184,7 @@ fn picks_by_index() {
         scale: 0.5,
         picked: true,
         ragged: false,
+        sinks: false,
     });
     let tys = vec![q, kv.clone(), kv];
     assert_eq!(placed(tys.clone(), attend.clone()), Err(ErrorKind::Arity));
@@ -202,6 +204,7 @@ fn ragged_causal() {
             scale: 0.5,
             picked: false,
             ragged: true,
+            sinks: false,
         })
     };
     assert!(result(tys.clone(), attend(Mask::Causal)).is_ok());
@@ -284,4 +287,43 @@ fn kept_rows_append() {
     // Kept rows must grow along a bounded axis.
     g.kept[0] = f32s([Seqs, Heads, Heads, HeadDim], Replicated);
     assert_eq!(verify(&g).unwrap_err().error.kind, ErrorKind::Shape);
+}
+
+#[test]
+fn attend_sinks_infer() {
+    let q = f32s([Rows, Heads, HeadDim], Replicated);
+    let kv = f32s([Seqs, Context, Heads, HeadDim], Replicated);
+    let by = TensorType::new([Rows], DType::U32);
+    let sinks = f32s([Heads], Replicated);
+    let op = Op::Attend(Attend {
+        mask: Mask::Causal,
+        scale: 0.5,
+        picked: false,
+        ragged: true,
+        sinks: true,
+    });
+    let tys = vec![
+        q.clone(),
+        kv.clone(),
+        kv.clone(),
+        by.clone(),
+        by.clone(),
+        sinks,
+    ];
+    assert_eq!(placed(tys.clone(), op.clone()), Ok(Replicated));
+    // Missing sinks fails arity.
+    assert_eq!(placed(tys[..5].to_vec(), op.clone()), Err(ErrorKind::Arity));
+    // Wrong shape fails shape check.
+    let bad_shape = f32s([HeadDim], Replicated);
+    let mut wrong = tys.clone();
+    wrong[5] = bad_shape;
+    assert_eq!(placed(wrong, op.clone()), Err(ErrorKind::Shape));
+    // Head-split queries require head-split sinks.
+    let mut split = tys;
+    split[0].placement = Split { axis: 1 };
+    split[1].placement = Split { axis: 2 };
+    split[2].placement = Split { axis: 2 };
+    assert_eq!(placed(split.clone(), op.clone()), Err(ErrorKind::Placement));
+    split[5].placement = Split { axis: 0 };
+    assert_eq!(placed(split, op), Ok(Split { axis: 1 }));
 }

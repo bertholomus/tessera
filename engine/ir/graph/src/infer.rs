@@ -1,7 +1,7 @@
 //! Per-op typing rules: shapes, dtypes and placements.
 
 use crate::dims::{Dim, DimExpr, DimName, Poly, Shape};
-use crate::node::{Graph, Op, View};
+use crate::node::{Attend, Graph, Op, View};
 use crate::select;
 use crate::stages::{Check, Place, Stage, Takes};
 use crate::types::{DType, Placement, TensorType};
@@ -130,16 +130,12 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
                 None => conv(&g.dims, args[0], args[1]),
             }
         }
-        Op::Attend(a) if a.ragged => {
-            finite(a.scale, "attention scale")?;
-            need(a.mask.causal(), ErrorKind::Value, || {
-                format!("ragged attention is causal only, got {:?}", a.mask)
-            })?;
-            attend_rows(&g.dims, args)
-        }
         Op::Attend(a) => {
             finite(a.scale, "attention scale")?;
-            attend(&g.dims, args)
+            need(!a.ragged || a.mask.causal(), ErrorKind::Value, || {
+                format!("ragged attention is causal only, got {:?}", a.mask)
+            })?;
+            attend(&g.dims, a, args)
         }
         Op::Delta(d) => {
             finite(d.scale, "delta rule scale")?;
@@ -277,29 +273,65 @@ fn heads_fit(dims: &[Dim], [q, k, v]: [&TensorType; 3], q_heads: usize) -> Resul
     )
 }
 
-fn attend(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
+fn attend(dims: &[Dim], op: &Attend, a: &[&TensorType]) -> Result<TensorType, TypeError> {
     let (q, k, v) = (a[0], a[1], a[2]);
-    need(
-        a[..3].iter().all(|t| t.rank() == 4),
-        ErrorKind::Shape,
-        || "attention takes [Seqs, Context, Heads, HeadDim] tensors".into(),
-    )?;
-    // Query and key lengths may differ, as in decode.
-    for axis in [0, 3] {
+    let q_heads = if op.ragged {
         need(
-            same(dims, &q.shape.0[axis], &k.shape.0[axis])?,
+            q.rank() == 3 && k.rank() == 4 && v.rank() == 4,
+            ErrorKind::Shape,
+            || "ragged attention takes [Rows, Heads, HeadDim] queries over kept rows".into(),
+        )?;
+        need(
+            same(dims, &q.shape.0[2], &k.shape.0[3])?,
             ErrorKind::Shape,
             || {
                 format!(
-                    "queries {} and keys {} differ on axis {axis}",
+                    "queries {} and keys {} differ in head width",
                     q.shape, k.shape
                 )
             },
         )?;
+        row_ids(dims, &q.shape, a[3], a[4])?;
+        1
+    } else {
+        need(
+            a[..3].iter().all(|t| t.rank() == 4),
+            ErrorKind::Shape,
+            || "attention takes [Seqs, Context, Heads, HeadDim] tensors".into(),
+        )?;
+        for axis in [0, 3] {
+            need(
+                same(dims, &q.shape.0[axis], &k.shape.0[axis])?,
+                ErrorKind::Shape,
+                || {
+                    format!(
+                        "queries {} and keys {} differ on axis {axis}",
+                        q.shape, k.shape
+                    )
+                },
+            )?;
+        }
+        2
+    };
+    heads_fit(dims, [q, k, v], q_heads)?;
+    if let Some(i) = op.ids_arg() {
+        key_lists(dims, a[i], q, q_heads)?;
     }
-    heads_fit(dims, [q, k, v], 2)?;
-    if let Some(ids) = a.get(3) {
-        key_lists(dims, ids, q, 2)?;
+    if let Some(i) = op.sinks_arg() {
+        let s = a[i];
+        let ok = s.rank() == 1 && same(dims, &s.shape.0[0], &q.shape.0[q_heads])?;
+        need(ok, ErrorKind::Shape, || {
+            format!("sinks {} vs {}", s.shape, q.shape)
+        })?;
+        let d_ok = s.dtype.is_float() && s.dtype == q.dtype;
+        need(d_ok, ErrorKind::DType, || "sink dtype mismatch".into())?;
+        let want = match q.placement {
+            Placement::Split { axis } if axis == q_heads as u32 => Placement::Split { axis: 0 },
+            _ => Placement::Replicated,
+        };
+        need(s.placement == want, ErrorKind::Placement, || {
+            format!("sinks {:?} want {want:?}", s.placement)
+        })?;
     }
     Ok(valued(q, v))
 }
@@ -925,32 +957,6 @@ fn row_ids(
         })?;
     }
     Ok(())
-}
-
-/// Queries `[Rows, Heads, HeadDim]` over kept `[Seqs, Context, KvHeads, HeadDim]`.
-fn attend_rows(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
-    let (q, k, v) = (a[0], a[1], a[2]);
-    need(
-        q.rank() == 3 && k.rank() == 4 && v.rank() == 4,
-        ErrorKind::Shape,
-        || "ragged attention takes [Rows, Heads, HeadDim] queries over kept rows".into(),
-    )?;
-    need(
-        same(dims, &q.shape.0[2], &k.shape.0[3])?,
-        ErrorKind::Shape,
-        || {
-            format!(
-                "queries {} and keys {} differ in head width",
-                q.shape, k.shape
-            )
-        },
-    )?;
-    heads_fit(dims, [q, k, v], 1)?;
-    row_ids(dims, &q.shape, a[3], a[4])?;
-    if let Some(ids) = a.get(5) {
-        key_lists(dims, ids, q, 1)?;
-    }
-    Ok(valued(q, v))
 }
 
 /// Rows go to kept `[Seqs, Context, ..]` by slot and position.
