@@ -21,9 +21,12 @@ fn package(manifest: &Path) -> Result<String, Error> {
 pub(crate) fn module(dir: &Path, cache: &Path) -> Result<PathBuf, Error> {
     let manifest = dir.join("Cargo.toml");
     let target = cache.join("modules");
+    let target = std::path::absolute(&target).map_err(io(&target))?;
     let mut cargo = Command::new("cargo");
+    // rustup reads the crate's pinned toolchain from the working directory.
+    cargo.current_dir(dir);
     cargo.args(["build", "--release", "--quiet", "--target", TARGET]);
-    cargo.arg("--manifest-path").arg(&manifest);
+    cargo.args(["--manifest-path", "Cargo.toml"]);
     let out = cargo.arg("--target-dir").arg(&target).output();
     let out = out.map_err(io(dir))?;
     if !out.status.success() {
