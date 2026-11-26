@@ -11,7 +11,7 @@ use crate::start::Options;
 use tessera_bundle::mtp::Mtp;
 use tessera_engine::{
     BatchMtp, CostModel, Drafter, DualSelector, DualSpeculate, Engine, MtpDrafter, MtpSpeculate,
-    Place, Recipe, Settings,
+    Place, Settings,
 };
 use tessera_tasks::Generate;
 
@@ -40,7 +40,9 @@ pub(super) fn open_mtp(
 ) -> Result<MtpDrafter, String> {
     let mut recipe = o.lower.clone().unwrap_or_default();
     recipe.pins = super::generate::kv_pin(o, pair.pins.clone());
-    recipe.kept = Recipe::default().kept;
+    if let Some(tokens) = o.kv_cache_tokens {
+        recipe.share_kept(tokens);
+    }
     let mut recipe = super::generate::dtyped(o, recipe);
     if o.require_favored {
         recipe.require_favored = true;

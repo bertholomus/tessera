@@ -117,6 +117,7 @@ pub(crate) struct DraftCore {
     pub plans: Cache,
     pub context: usize,
     pub slots: usize,
+    pub lanes: Option<crate::lanes::Lanes>,
     pub profile: Option<u64>,
     pub launches: u64,
     pub label: &'static str,
@@ -152,6 +153,12 @@ impl DraftCore {
             (Segments, 1),
         ];
         let (plan, _) = plans.wanting(&graph, 0, wants, &first, &[Context, Segments], &device)?;
+        let lanes = plan.table.zip(recipe.kept.page());
+        let pool = plan.pool_pages;
+        let lanes = lanes.map(|(table, page)| {
+            let pages = if pool > 0 { pool } else { table.len };
+            crate::lanes::Lanes::new(page, table.len, slots, pages)
+        });
         let mut runner = run(plan.clone())?;
         let device = crate::ranks::stored_device(runner.as_mut(), recipe, settings, place, true)?;
         Ok(Self {
@@ -161,6 +168,7 @@ impl DraftCore {
             plans,
             context,
             slots,
+            lanes,
             profile: settings.profile,
             launches: 0,
             label,
@@ -185,7 +193,13 @@ impl DraftCore {
         )?;
         let outputs = plan.outputs.iter().map(|o| o.slot).collect();
         let inputs = plan.inputs.clone();
+        let table = plan.table;
         self.runner.replan(plan)?;
+        if let (Some(table), Some(lanes)) = (table, self.lanes.as_mut()) {
+            for (offset, bytes) in lanes.take_dirty() {
+                self.runner.held_mut().upload_at(table, offset, &bytes)?;
+            }
+        }
         self.runner.bind_all(&bound);
         if feeds.len() != inputs.len() {
             return Err(RunError::InputCount.into());
