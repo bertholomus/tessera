@@ -6,6 +6,7 @@ mod gemma4;
 mod glm53;
 mod granite;
 mod nanogpt;
+mod qwen2;
 mod qwen3;
 mod qwen35;
 mod smollm2;

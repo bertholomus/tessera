@@ -71,7 +71,7 @@ pub use tessera_mem::{block, trellis};
 pub use tessera_models::mtp as mtp_model;
 pub use tessera_models::*;
 pub use tessera_run::{Grid, gpu, pinning, select, sizer};
-pub use tessera_trace::{Linear, Norm};
+pub use tessera_trace::{Linear, Norm, Vector};
 pub use tessera_turns as turns;
 pub use tessera_wasm as wasm;
 
