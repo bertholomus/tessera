@@ -13,6 +13,7 @@ fn sizes(max_seqs: u64, max_context: u64) -> Config {
     Config {
         stack: Stack::sized([262_144, 2560, 42, 8, 256, 10_240], max_seqs, max_context),
         kv_heads: 2,
+        full_kv_heads: 2,
         full_every: 6,
         full_head_dim: 512,
         full_turned: 64,
@@ -21,6 +22,8 @@ fn sizes(max_seqs: u64, max_context: u64) -> Config {
         theta: 1e4,
         full_theta: 1e6,
         first_shared: 24,
+        k_eq_v: false,
+        double_wide_mlp: false,
         eps: 1e-6,
         cap: Some(30.0),
     }

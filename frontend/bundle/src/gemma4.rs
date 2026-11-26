@@ -20,7 +20,7 @@ fn step(arch: &Arch, ask: &Ask) -> Result<Built> {
 
 arch!(
     "gemma4",
-    [Spot::Type("gemma4")],
+    [Spot::Type("gemma4"), Spot::Type("gemma4_unified")],
     rules: include_str!("../names/gemma4.json"),
     step: step,
 );
