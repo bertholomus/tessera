@@ -55,3 +55,22 @@ fn metrics_text() {
     assert!(has("# TYPE tessera:http_connections_open gauge"));
     assert!(has("# TYPE tessera:completion_requests_total counter"));
 }
+
+#[test]
+fn retrieve_model() {
+    let empty: Slot = Arc::new(OnceLock::new());
+    assert_eq!(json(&empty, "/v1/models/m", None).0, 503);
+    let slot = loaded(&Arc::new(MockGenerator::default()), false);
+    let (status, found) = json(&slot, "/v1/models/m", None);
+    assert_eq!(status, 200);
+    assert_eq!(found["id"], "m");
+    assert_eq!(found["object"], "model");
+    assert_eq!(found["max_model_len"], 16);
+    let (status, decoded) = json(&slot, "/v1/models/%6D", None);
+    assert_eq!(status, 200);
+    assert_eq!(decoded["id"], "m");
+    let (status, missing) = json(&slot, "/v1/models/other", None);
+    assert_eq!(status, 404);
+    assert_eq!(missing["error"]["type"], "NotFoundError");
+    assert_eq!(missing["error"]["param"], "model");
+}

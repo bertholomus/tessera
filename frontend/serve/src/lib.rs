@@ -74,6 +74,9 @@ impl Models {
                 health(slots.all(|s| s.get().is_some()), open)
             }
             ("GET", "/v1/models") => cards(slots, Some(&self.turns)),
+            ("GET", path) if path.starts_with("/v1/models/") => {
+                model_card(slots, &path["/v1/models/".len()..], Some(&self.turns))
+            }
             _ => route(self.pick(&request.body), request),
         }
     }
@@ -162,29 +165,80 @@ pub fn step(event: &Event) -> Value {
     })
 }
 
+/// One loaded model's OpenAI card, with its seat's numbers.
+fn card(m: &Model, turns: Option<&Turns>) -> Value {
+    let mut out = json!({
+        "id": m.info.name,
+        "object": "model",
+        "created": wire::now(),
+        "owned_by": "tessera",
+        "root": m.info.name,
+        "max_model_len": m.info.context,
+    });
+    if let Some(seat) = turns.and_then(|t| t.status(&m.info.name)) {
+        out["resident"] = seat.resident.into();
+        out["bytes"] = seat.bytes.into();
+        out["load_seconds"] = seat.seconds.into();
+        out["loads"] = seat.loads.into();
+    }
+    out
+}
+
+/// Decodes `%XX` escapes in a URL path segment.
+fn decode_id(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+            && let Ok(b) = u8::from_str_radix(hex, 16)
+        {
+            out.push(b);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| raw.to_string())
+}
+
 /// A card for each loaded model, with its seat's numbers.
 fn cards<'a>(slots: impl Iterator<Item = &'a Slot>, turns: Option<&Turns>) -> Response {
-    let mut data = Vec::new();
-    for m in slots.filter_map(|slot| slot.get()) {
-        let mut card = json!({
-            "id": m.info.name,
-            "object": "model",
-            "created": wire::now(),
-            "owned_by": "tessera",
-            "root": m.info.name,
-            "max_model_len": m.info.context,
-        });
-        if let Some(seat) = turns.and_then(|t| t.status(&m.info.name)) {
-            card["resident"] = seat.resident.into();
-            card["bytes"] = seat.bytes.into();
-            card["load_seconds"] = seat.seconds.into();
-            card["loads"] = seat.loads.into();
-        }
-        data.push(card);
-    }
+    let data: Vec<Value> = slots
+        .filter_map(|slot| slot.get())
+        .map(|m| card(m, turns))
+        .collect();
     match data.is_empty() {
         true => refuse(503, "the model is loading", None).into(),
         false => Response::json(200, &json!({"object": "list", "data": data})),
+    }
+}
+
+/// One model card by id, or 404 when absent.
+fn model_card<'a>(
+    slots: impl Iterator<Item = &'a Slot>,
+    raw_id: &str,
+    turns: Option<&Turns>,
+) -> Response {
+    let loaded: Vec<&Model> = slots.filter_map(|slot| slot.get()).collect();
+    if loaded.is_empty() {
+        return refuse(503, "the model is loading", None).into();
+    }
+    let id = decode_id(raw_id);
+    if id.is_empty() {
+        return refuse(404, "no such route", None).into();
+    }
+    match loaded.into_iter().find(|m| m.info.name == id) {
+        Some(m) => Response::json(200, &card(m, turns)),
+        None => refuse(
+            404,
+            format!("The model `{id}` does not exist."),
+            Some("model"),
+        )
+        .into(),
     }
 }
 
@@ -243,6 +297,9 @@ pub fn route(slot: &Slot, request: &Request) -> Response {
         ("GET", path) if HEALTH.contains(&path) => health(slot.get().is_some(), None),
         ("GET", "/version") => Response::json(200, &json!({"version": env!("CARGO_PKG_VERSION")})),
         ("GET", "/v1/models") => cards(std::iter::once(slot), None),
+        ("GET", path) if path.starts_with("/v1/models/") => {
+            model_card(std::iter::once(slot), &path["/v1/models/".len()..], None)
+        }
         ("GET", "/metrics") => metrics::metrics(),
         ("POST", "/tokenize") => tokenize(slot, body),
         ("POST", "/detokenize") => detokenize(slot, body),
