@@ -131,6 +131,31 @@ impl Kept {
         }
     }
 
+    /// Paged: grows each slot in `rows` once.
+    pub fn grow_rows(
+        &mut self,
+        rows: &[crate::Row],
+        lanes: &mut crate::lanes::Lanes,
+    ) -> Result<(), Error> {
+        let mut peaks: Vec<(u32, usize)> = Vec::new();
+        for r in rows {
+            let need = r.position as usize + 1;
+            if let Some((_, best)) = peaks.last_mut().filter(|(s, _)| *s == r.slot) {
+                *best = (*best).max(need);
+            } else if let Some((_, best)) = peaks.iter_mut().find(|(s, _)| *s == r.slot) {
+                *best = (*best).max(need);
+            } else {
+                peaks.push((r.slot, need));
+            }
+        }
+        for (slot, need) in peaks {
+            if let Some(pages) = self.grow(slot, need)? {
+                lanes.set(slot, pages);
+            }
+        }
+        Ok(())
+    }
+
     /// Paged: the slot's pages, if its lane lacks some.
     pub fn grow(&mut self, slot: u32, rows: usize) -> Result<Option<&[u32]>, Error> {
         let Some(lanes) = &mut self.laned else {

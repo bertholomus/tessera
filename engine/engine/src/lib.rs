@@ -20,6 +20,8 @@ mod batch_spec;
 mod dual;
 mod guide;
 mod kept;
+#[cfg(test)]
+mod kept_test;
 mod lanes;
 pub mod metrics;
 #[cfg(test)]
