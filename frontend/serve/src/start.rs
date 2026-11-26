@@ -18,7 +18,7 @@ use tessera_tasks::api::Info;
 pub fn flags() -> String {
     let head = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
 [--max-batch-rows <n>] [--layers <n>] [--kv-dtype <f32|bf16|fp8>] [--dtype <spot>=<dtype>]... [--shape <kernel>:<knob>=<n>]... [--kv-cache-tokens <tokens>] [--served-model-name <name>]";
-    let tail = "[--max-connections <n>] [--reject-unknown-fields] [--require-favored] [--explain-lowering] \
+    let tail = "[--max-connections <n>] [--api-key <key>] [--reject-unknown-fields] [--require-favored] [--explain-lowering] \
 [--priority <n>] [--swap-quantum <x>] [--also <model and its flags>]...";
     format!("{head} {} {tail}", task::usage())
 }
@@ -53,6 +53,8 @@ pub struct Options {
     /// Print top slow or unfused lowering sites on boot.
     pub explain_lowering: bool,
     pub max_connections: usize,
+    /// Optional API key required on non-health routes.
+    pub api_key: Option<String>,
     /// A recipe module that may build the model's graph.
     pub module: Option<Arc<Module>>,
     /// Lowering choices. Empty pins take the model's own.
@@ -93,6 +95,7 @@ impl Default for Options {
             require_favored: false,
             explain_lowering: false,
             max_connections: 64,
+            api_key: None,
             module: None,
             lower: None,
             names: None,
@@ -160,6 +163,12 @@ impl Options {
                 self.kv_cache_tokens = Some(n);
             }
             "--max-connections" => self.max_connections = value.parse().ok()?,
+            "--api-key" => {
+                if value.is_empty() {
+                    return None;
+                }
+                self.api_key = Some(value);
+            }
             // Keeps the first n layers, for quick kernel timing.
             "--layers" => {
                 let n: u64 = value.parse().ok().filter(|n| *n > 0)?;
@@ -242,13 +251,66 @@ pub fn run(mut options: Options) -> Result<(), String> {
     for more in &mut options.also {
         more.progress = more.progress.also(open.clone());
     }
+    let key = options.api_key.take();
     let models = spawn_all(options);
     let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
     eprintln!("listening on {host}:{port}");
     crate::http::run(listener, limits, move |request| {
+        if let Some(expected) = key.as_deref()
+            && let Some(denied) = check_auth(expected, request)
+        {
+            return denied;
+        }
         models.route(Some(&open), request)
     });
     Ok(())
+}
+
+/// Constant-time equality over two byte slices.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Checks `Authorization: Bearer` or `x-api-key` on non-health routes.
+pub(crate) fn check_auth(
+    expected: &str,
+    request: &crate::http::Request,
+) -> Option<crate::http::Response> {
+    if request.method == "GET"
+        && matches!(
+            request.path.as_str(),
+            "/health" | "/v1/health" | "/v1/health/ready" | "/ping"
+        )
+    {
+        return None;
+    }
+    let bearer = request.header("authorization").and_then(|v| {
+        v.strip_prefix("Bearer ")
+            .or_else(|| v.strip_prefix("bearer "))
+    });
+    let provided = bearer.or_else(|| request.header("x-api-key"));
+    if provided.is_some_and(|got| ct_eq(got.as_bytes(), expected.as_bytes())) {
+        return None;
+    }
+    let body = if request.path == "/v1/messages" {
+        serde_json::json!({
+            "type": "error",
+            "error": {"type": "authentication_error", "message": "invalid api key"},
+        })
+    } else {
+        serde_json::json!({
+            "error": {
+                "message": "invalid api key",
+                "type": "AuthenticationError",
+                "param": null,
+                "code": 401,
+            }
+        })
+    };
+    Some(crate::http::Response::json(401, &body))
 }
 
 /// Loads the model into `slot`. A failure ends the process.

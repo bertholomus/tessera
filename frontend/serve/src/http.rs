@@ -109,6 +109,7 @@ fn reason(status: u16) -> &'static str {
         100 => "Continue",
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
