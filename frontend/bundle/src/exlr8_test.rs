@@ -25,6 +25,12 @@ const CONFIG: &str = r#"{
 #[test]
 fn rotated_names_resolve() {
     let c = config(CONFIG, 1, 8).unwrap();
+    assert!(c.index.unwrap().rope_interleave);
+    let split = CONFIG.replace(
+        r#""index_topk_freq": 1"#,
+        r#""index_topk_freq": 1, "indexer_rope_interleave": false"#,
+    );
+    assert!(!config(&split, 1, 8).unwrap().index.unwrap().rope_interleave);
     let g = program::<RotatedMoe>(&c);
     let rules = rules(&c, true);
     let mut slices = Vec::new();

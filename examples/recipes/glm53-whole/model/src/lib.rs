@@ -265,7 +265,7 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
     if !(whole_rest && sums_fit && kept_fit && layers <= 96) {
         return None;
     }
-    if hidden != s.hidden || hidden % 128 != 0 {
+    if hidden != s.hidden || hidden % 128 != 0 || s.rope > index_dim {
         return None;
     }
     let tops: Vec<f32> = (step.scalars.iter())

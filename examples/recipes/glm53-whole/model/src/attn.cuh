@@ -36,7 +36,30 @@ static __device__ __forceinline__ void block_prefix(const ctx& c, bool flag, u32
     *tot_out = total;
 }
 
-// Centered RMS norm plus bias, stored into kept index table.
+// Rotates one adjacent pair in place.
+static __device__ __forceinline__ void rotate_pair(float* v, u32 pos, u32 j, u32 rope,
+                                                   float theta) {
+    float angle = float(pos) * powf(theta, -float(j << 1) / float(rope));
+    float sn, cs;
+    sincosf(angle, &sn, &cs);
+    float a = v[0], b = v[1];
+    v[0] = a * cs - b * sn;
+    v[1] = a * sn + b * cs;
+}
+
+// Parallel RoPE over leading pairs of each head.
+static __device__ void rotate_heads(const ctx& c, float* buf, u32 heads, u32 stride, u32 offset) {
+    const sizes& s = c.s;
+    line l = threads();
+    const u32* pos = at<const u32>(c.t, 1);
+    u32 pairs = s.rope >> 1;
+    for (u32 u = l.at; u < s.rows * heads * pairs; u += l.step) {
+        u32 j = u % pairs, rh = u / pairs, r = rh / heads;
+        rotate_pair(buf + u64(rh) * stride + offset + (j << 1), pos[r], j, s.rope, s.theta);
+    }
+}
+
+// Centered RMS norm, bias, and RoPE into kept index table.
 static __device__ void index_keys(const ctx& c, const place& pl) {
     const sizes& s = c.s;
     const u32* pos = at<const u32>(c.t, 1);
@@ -44,8 +67,9 @@ static __device__ void index_keys(const ctx& c, const place& pl) {
     const kept* kt = kept_table(c.t, pl.kept + 1u);
     mat knorm = field_mat(c, pl, K_NORM);
     mat kbias = field_mat(c, pl, K_BIAS);
+    u32 pairs = s.rope <= s.idim ? (s.rope >> 1) : 0u;
     for (u32 r = blockIdx.x; r < s.rows; r += gridDim.x) {
-        const float* row = c.p.b + u64(r) * s.idim;
+        float* row = c.p.b + u64(r) * s.idim;
         float sum = 0.0f;
         for (u32 d = threadIdx.x; d < s.idim; d += blockDim.x) sum += row[d];
         float mean = block_sum(c, sum) / float(s.idim);
@@ -55,10 +79,17 @@ static __device__ void index_keys(const ctx& c, const place& pl) {
             sq = fmaf(v, v, sq);
         }
         float inv = 1.0f / sqrtf(block_sum(c, sq) / float(s.idim) + s.eps);
+        for (u32 d = threadIdx.x; d < s.idim; d += blockDim.x) {
+            row[d] = (row[d] - mean) * (inv * vec_elem(knorm, 0u, d)) + vec_elem(kbias, 0u, d);
+        }
+        __syncthreads();
+        for (u32 j = threadIdx.x; j < pairs; j += blockDim.x) {
+            rotate_pair(row + (j << 1), pos[r], j, s.rope, s.theta);
+        }
+        __syncthreads();
         u8* dst = kept_row(c.t, kt, slot[r], pos[r]);
         for (u32 d = threadIdx.x; d < s.idim; d += blockDim.x) {
-            float out = (row[d] - mean) * (inv * vec_elem(knorm, 0u, d)) + vec_elem(kbias, 0u, d);
-            kv_store(dst, kt->elem, d, out);
+            kv_store(dst, kt->elem, d, row[d]);
         }
     }
 }
@@ -223,6 +254,9 @@ static __device__ bool pick_keys(const ctx& c, const place& pl) {
         PHASE(fill_direct(c));
         return true;
     }
+    if (s.rope > 0u && s.rope <= s.idim) {
+        PHASE(rotate_heads(c, c.p.a, s.ih, s.idim, 0u));
+    }
     PHASE(index_scores(c, pl));
     PHASE(select_top(c));
     return true;
@@ -236,16 +270,7 @@ static __device__ void turn_keys(const ctx& c, const place& pl) {
     const u32* slot = at<const u32>(c.t, 2);
     const kept* kt = kept_table(c.t, pl.kept);
     u32 pairs = s.rope >> 1, q_stride = s.nope + s.rope, kv_stride = s.latent + s.rope;
-    for (u32 u = l.at; u < s.rows * s.heads * pairs; u += l.step) {
-        u32 j = u % pairs, rh = u / pairs, r = rh / s.heads;
-        float angle = float(pos[r]) * powf(s.theta, -float(j << 1) / float(s.rope));
-        float sn, cs;
-        sincosf(angle, &sn, &cs);
-        float* v = c.p.a + u64(rh) * q_stride + s.nope + (j << 1);
-        float a = v[0], b = v[1];
-        v[0] = a * cs - b * sn;
-        v[1] = a * sn + b * cs;
-    }
+    rotate_heads(c, c.p.a, s.heads, q_stride, s.nope);
     for (u32 u = l.at; u < s.rows * pairs; u += l.step) {
         u32 r = u / pairs, j = u % pairs;
         float angle = float(pos[r]) * powf(s.theta, -float(j << 1) / float(s.rope));
