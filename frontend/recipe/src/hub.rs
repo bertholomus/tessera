@@ -120,6 +120,13 @@ pub fn search_hf(words: &str, token: Option<&str>) -> Result<Option<String>, Err
     Ok(best.map(String::from))
 }
 
+/// Whether `names` holds a safetensors or PyTorch weight file.
+pub(crate) fn has_weights(names: &[&str]) -> bool {
+    names
+        .iter()
+        .any(|n| n.ends_with(".safetensors") || PICKLED.iter().any(|ext| n.ends_with(ext)))
+}
+
 /// The repository's files at `revision`.
 fn lookup(repo: &str, revision: &str, token: Option<&str>) -> Result<Info, Error> {
     let api = format!("https://{HUB}/api/models/{repo}/revision/{revision}?blobs=true");
@@ -134,12 +141,9 @@ fn lookup(repo: &str, revision: &str, token: Option<&str>) -> Result<Info, Error
     let info: Info = response
         .into_json()
         .map_err(|e| Error::Http(repo.into(), e.to_string()))?;
-    if !info
-        .siblings
-        .iter()
-        .any(|s| s.rfilename.ends_with(".safetensors"))
-    {
-        return Err(Error::Source(repo.into(), "no safetensors files"));
+    let names: Vec<&str> = info.siblings.iter().map(|s| s.rfilename.as_str()).collect();
+    if !has_weights(&names) {
+        return Err(Error::Source(repo.into(), "no weight files"));
     }
     Ok(info)
 }
