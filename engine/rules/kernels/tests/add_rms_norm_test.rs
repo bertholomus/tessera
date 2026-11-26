@@ -252,3 +252,54 @@ fn early_reader_parity() {
         );
     });
 }
+
+/// Standalone RMS norm graph for cached lane and block paths.
+fn solo_norm_graph(max_rows: u64, width: u64, weighted: bool) -> Graph {
+    let m = Model::new(vec![
+        Dim::bounded(Rows, max_rows),
+        Dim::fixed(Hidden, width),
+    ]);
+    let nw: NormWeight = declare(&m);
+    let port = Port {
+        role: Role::Logits,
+        ty: TensorType::new([Rows, Hidden], DType::F32),
+    };
+    let [x] = m.entry(EntryKind::Forward, [port]);
+    let normed = if weighted {
+        x.rms_norm(&nw.w, 1e-5)
+    } else {
+        x.rms(1e-5)
+    };
+    m.finish([(Role::Logits, &normed)])
+}
+
+#[test]
+fn cached_lane_norm_parity() {
+    let device = gpu_device();
+    for (width, rows, weighted, want) in [
+        (128, 32, true, "lane_norm"),
+        (512, 32, false, "lane_rms"),
+        (1536, 32, true, "block_norm"),
+        (6144, 2, true, "block_norm"),
+        (12288, 2, true, "block_norm"),
+    ] {
+        let g = solo_norm_graph(64, width, weighted);
+        assert_parity(&g, rows, &device, 1e-4, |plan| {
+            assert_eq!(plan.steps.len(), 1);
+            assert_eq!(plan.steps[0].kernel.name(), want);
+        });
+    }
+    // Fused add_rms_norm still beats map + cached block_norm at 2048 rows.
+    let m = Model::new(vec![Dim::bounded(Rows, 2048), Dim::fixed(Hidden, 6144)]);
+    let nw: NormWeight = declare(&m);
+    let port = || Port {
+        role: Role::Logits,
+        ty: TensorType::new([Rows, Hidden], DType::F32),
+    };
+    let [x, a] = m.entry(EntryKind::Forward, [port(), port()]);
+    let h = x.add(&a);
+    let g = m.finish([(Role::Logits, &h.rms_norm(&nw.w, 1e-5)), (Role::Logits, &h)]);
+    let plan = lower(&g, 0, &[(Rows, 2048)], &device).unwrap();
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].kernel.name(), "block_add_norm_save");
+}
