@@ -18,7 +18,7 @@ use tessera_tasks::api::Info;
 pub fn flags() -> String {
     let head = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
 [--max-batch-rows <n>] [--layers <n>] [--kv-dtype <f32|bf16|fp8>] [--dtype <spot>=<dtype>]... [--shape <kernel>:<knob>=<n>]... [--kv-cache-tokens <tokens>] [--served-model-name <name>]";
-    let tail = "[--max-connections <n>] [--api-key <key>] [--cors-origin <origin>] [--reject-unknown-fields] [--require-favored] [--explain-lowering] \
+    let tail = "[--max-connections <n>] [--api-key <key>] [--cors-origin <origin>] [--reject-unknown-fields] [--require-favored] [--explain-lowering] [--attic] \
 [--priority <n>] [--swap-quantum <x>] [--also <model and its flags>]...";
     format!("{head} {} {tail}", task::usage())
 }
@@ -52,6 +52,8 @@ pub struct Options {
     pub require_favored: bool,
     /// Print top slow or unfused lowering sites on boot.
     pub explain_lowering: bool,
+    /// Borrow GB10 display carveout from `spark-attic` `atticd`.
+    pub attic: bool,
     pub max_connections: usize,
     /// Optional API key required on non-health routes.
     pub api_key: Option<String>,
@@ -96,6 +98,7 @@ impl Default for Options {
             strict: false,
             require_favored: false,
             explain_lowering: false,
+            attic: false,
             max_connections: 64,
             api_key: None,
             cors_origin: None,
@@ -125,6 +128,7 @@ impl Options {
             "--reject-unknown-fields" => self.strict = true,
             "--require-favored" => self.require_favored = true,
             "--explain-lowering" => self.explain_lowering = true,
+            "--attic" => self.attic = true,
             _ => match task::owned(flag) {
                 Some(owned) if owned.value.is_empty() => {
                     self.given.insert(owned.name, String::new());
@@ -327,6 +331,9 @@ pub(crate) fn check_auth(
 fn load(mut options: Options, slot: Slot, turns: &Arc<Turns>) {
     let mut settings = tessera_frontend_settings::read();
     settings.names = options.names.clone().or(settings.names);
+    if options.attic && settings.attic.is_none() {
+        settings.attic = Some(tessera_frontend_settings::attic_default());
+    }
     let info = Info {
         name: options.served(),
         context: options.max_model_len,

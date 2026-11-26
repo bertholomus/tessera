@@ -48,6 +48,13 @@ impl Base {
         }
     }
 
+    /// Extends a device-derived budget with external carveout bytes.
+    pub(crate) fn extend_budget(&mut self, extra: u64) {
+        if let Some(budget) = &mut self.budget {
+            *budget = budget.saturating_add(extra);
+        }
+    }
+
     /// Takes `plan` as the one to run.
     pub(crate) fn adopt(&mut self, plan: &Plan) {
         self.plan = plan.clone();

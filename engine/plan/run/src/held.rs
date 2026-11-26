@@ -44,6 +44,7 @@ fn copy_span(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Holds {
     Weights,
+    Kept,
     Other,
 }
 
@@ -460,7 +461,7 @@ impl Held {
             }
         }
         let at = self.all.len();
-        self.all.push(alloc(zone, need, Holds::Other)?);
+        self.all.push(alloc(zone, need, Holds::Kept)?);
         for &(index, offset, bytes) in entries {
             let place = Place {
                 buffer: at,

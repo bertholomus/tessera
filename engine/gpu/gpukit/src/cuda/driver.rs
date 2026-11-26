@@ -190,3 +190,196 @@ pub(crate) static NVRTC: Rtc = Rtc {
     error: Error::Cuda,
     lib: OnceLock::new(),
 };
+
+pub(crate) const CU_MEM_ALLOCATION_TYPE_PINNED: c_int = 1;
+pub(crate) const CU_MEM_LOCATION_TYPE_DEVICE: c_int = 1;
+pub(crate) const CU_MEM_HANDLE_TYPE_NONE: c_int = 0;
+pub(crate) const CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR: c_int = 1;
+pub(crate) const CU_MEM_ACCESS_FLAGS_PROT_READWRITE: c_int = 3;
+pub(crate) const CU_MEM_ALLOC_GRANULARITY_MINIMUM: c_int = 0;
+
+/// `CUmemLocation`, in the driver layout.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct MemLocation {
+    pub kind: c_int,
+    pub id: c_int,
+}
+
+/// `CUmemAllocationProp`, 32 bytes in the driver layout.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct MemAllocationProp {
+    pub kind: c_int,
+    pub handle_types: c_int,
+    pub location: MemLocation,
+    pub win32_metadata: *mut c_void,
+    pub alloc_flags: [u8; 8],
+}
+
+/// `CUmemAccessDesc`, 12 bytes in the driver layout.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct MemAccessDesc {
+    pub location: MemLocation,
+    pub flags: c_int,
+}
+
+type CuMemGranularity =
+    unsafe extern "C" fn(*mut usize, *const MemAllocationProp, c_int) -> CUresult;
+type CuMemImport = unsafe extern "C" fn(*mut u64, *mut c_void, c_int) -> CUresult;
+type CuMemCreate = unsafe extern "C" fn(*mut u64, usize, *const MemAllocationProp, u64) -> CUresult;
+type CuMemRelease = unsafe extern "C" fn(u64) -> CUresult;
+type CuMemReserve = unsafe extern "C" fn(*mut u64, usize, usize, u64, u64) -> CUresult;
+type CuMemAddrFree = unsafe extern "C" fn(u64, usize) -> CUresult;
+type CuMemMap = unsafe extern "C" fn(u64, usize, usize, u64, u64) -> CUresult;
+type CuMemUnmap = unsafe extern "C" fn(u64, usize) -> CUresult;
+type CuMemSetAccess = unsafe extern "C" fn(u64, usize, *const MemAccessDesc, usize) -> CUresult;
+
+mod vmm_dl {
+    use super::{
+        CuMemAddrFree, CuMemCreate, CuMemGranularity, CuMemImport, CuMemMap, CuMemRelease,
+        CuMemReserve, CuMemSetAccess, CuMemUnmap,
+    };
+
+    tessera_dl::library! {
+        /// Optional CUDA virtual-memory symbols for display carveout.
+        pub(crate) struct VmmTable as "CUDA VMM" in ["libcuda.so.1"] {
+            pub(crate) cu_mem_granularity: CuMemGranularity = "cuMemGetAllocationGranularity",
+            pub(crate) cu_mem_import: CuMemImport = "cuMemImportFromShareableHandle",
+            pub(crate) cu_mem_create: CuMemCreate = "cuMemCreate",
+            pub(crate) cu_mem_release: CuMemRelease = "cuMemRelease",
+            pub(crate) cu_mem_reserve: CuMemReserve = "cuMemAddressReserve",
+            pub(crate) cu_mem_addr_free: CuMemAddrFree = "cuMemAddressFree",
+            pub(crate) cu_mem_map: CuMemMap = "cuMemMap",
+            pub(crate) cu_mem_unmap: CuMemUnmap = "cuMemUnmap",
+            pub(crate) cu_mem_set_access: CuMemSetAccess = "cuMemSetAccess",
+        }
+    }
+
+    pub(crate) fn open() -> Result<VmmTable, String> {
+        VmmTable::open()
+    }
+}
+
+pub(crate) use vmm_dl::VmmTable;
+
+/// Optional process-wide CUDA VMM table.
+pub(crate) fn vmm_table() -> Option<&'static VmmTable> {
+    static VMM: OnceLock<Option<VmmTable>> = OnceLock::new();
+    VMM.get_or_init(|| vmm_dl::open().ok()).as_ref()
+}
+
+/// CUDA VMM adapter bound to one active device context.
+pub(crate) struct CudaVmm<'a> {
+    pub(crate) driver: &'a Driver,
+    pub(crate) table: Option<&'static VmmTable>,
+    pub(crate) device: CUdevice,
+}
+
+impl CudaVmm<'_> {
+    fn prop(&self, handle_types: c_int) -> MemAllocationProp {
+        MemAllocationProp {
+            kind: CU_MEM_ALLOCATION_TYPE_PINNED,
+            handle_types,
+            location: MemLocation {
+                kind: CU_MEM_LOCATION_TYPE_DEVICE,
+                id: self.device,
+            },
+            win32_metadata: std::ptr::null_mut(),
+            alloc_flags: [0; 8],
+        }
+    }
+
+    fn ok(&self, code: CUresult, what: &str) -> Result<(), String> {
+        self.driver.check(code, what).map_err(|e| e.to_string())
+    }
+}
+
+impl crate::attic::Vmm for CudaVmm<'_> {
+    fn granularity(&self) -> Option<usize> {
+        let table = self.table?;
+        let mut g_plain = 0usize;
+        let mut g_fd = 0usize;
+        let p_plain = self.prop(CU_MEM_HANDLE_TYPE_NONE);
+        let p_fd = self.prop(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+        let rc1 = unsafe {
+            (table.cu_mem_granularity)(&mut g_plain, &p_plain, CU_MEM_ALLOC_GRANULARITY_MINIMUM)
+        };
+        let rc2 = unsafe {
+            (table.cu_mem_granularity)(&mut g_fd, &p_fd, CU_MEM_ALLOC_GRANULARITY_MINIMUM)
+        };
+        if rc1 != CUDA_SUCCESS || rc2 != CUDA_SUCCESS || g_plain == 0 || g_fd == 0 {
+            return None;
+        }
+        Some(crate::attic::lcm(g_plain, g_fd))
+    }
+
+    fn import_fd(&self, fd: i32) -> Result<u64, String> {
+        let mut h = 0u64;
+        let raw = fd as usize as *mut c_void;
+        let table = self.table.ok_or("CUDA VMM unavailable")?;
+        let rc =
+            unsafe { (table.cu_mem_import)(&mut h, raw, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) };
+        self.ok(rc, "cuMemImportFromShareableHandle")?;
+        Ok(h)
+    }
+
+    fn create(&self, size: usize) -> Result<u64, String> {
+        let mut h = 0u64;
+        let prop = self.prop(CU_MEM_HANDLE_TYPE_NONE);
+        let table = self.table.ok_or("CUDA VMM unavailable")?;
+        let rc = unsafe { (table.cu_mem_create)(&mut h, size, &prop, 0) };
+        self.ok(rc, "cuMemCreate")?;
+        Ok(h)
+    }
+
+    fn release(&self, handle: u64) {
+        if let Some(t) = self.table {
+            unsafe { (t.cu_mem_release)(handle) };
+        }
+    }
+
+    fn reserve(&self, size: usize, align: usize) -> Result<u64, String> {
+        let mut va = 0u64;
+        let table = self.table.ok_or("CUDA VMM unavailable")?;
+        let rc = unsafe { (table.cu_mem_reserve)(&mut va, size, align, 0, 0) };
+        self.ok(rc, "cuMemAddressReserve")?;
+        Ok(va)
+    }
+
+    fn free_va(&self, va: u64, size: usize) {
+        if let Some(t) = self.table {
+            unsafe { (t.cu_mem_addr_free)(va, size) };
+        }
+    }
+
+    fn map(&self, va: u64, size: usize, handle: u64) -> Result<(), String> {
+        let table = self.table.ok_or("CUDA VMM unavailable")?;
+        let rc = unsafe { (table.cu_mem_map)(va, size, 0, handle, 0) };
+        self.ok(rc, "cuMemMap")
+    }
+
+    fn unmap(&self, va: u64, size: usize) {
+        if let Some(t) = self.table {
+            unsafe { (t.cu_mem_unmap)(va, size) };
+        }
+    }
+
+    fn set_access(&self, va: u64, size: usize) -> Result<(), String> {
+        let desc = MemAccessDesc {
+            location: MemLocation {
+                kind: CU_MEM_LOCATION_TYPE_DEVICE,
+                id: self.device,
+            },
+            flags: CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+        };
+        let table = self.table.ok_or("CUDA VMM unavailable")?;
+        let rc = unsafe { (table.cu_mem_set_access)(va, size, &desc, 1) };
+        self.ok(rc, "cuMemSetAccess")
+    }
+
+    fn sync(&self) {
+        unsafe { (self.driver.cu_stream_synchronize)(std::ptr::null_mut()) };
+    }
+}

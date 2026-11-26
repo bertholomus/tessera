@@ -50,6 +50,10 @@ pub trait Device: Clone + Send + Sync + 'static {
     /// The device as asked, with its table row.
     fn platform(&self) -> Platform;
     fn alloc(&self, size: usize) -> Result<u64, Error>;
+    /// Allocates device memory for kept KV rows.
+    fn alloc_kept(&self, size: usize) -> Result<u64, Error> {
+        self.alloc(size)
+    }
     /// Skipped when the context is already gone.
     fn free(&self, ptr: u64);
     /// Device bytes free now, where the backend can tell.
@@ -256,6 +260,16 @@ impl<D: Device> DeviceBuffer<D> {
     pub fn alloc(ctx: &D, size: usize) -> Result<Self, Error> {
         Ok(Self {
             ptr: ctx.alloc(size)?,
+            ctx: ctx.clone(),
+            size,
+            host: None,
+        })
+    }
+
+    /// Allocates one device buffer for kept KV rows.
+    pub fn kept(ctx: &D, size: usize) -> Result<Self, Error> {
+        Ok(Self {
+            ptr: ctx.alloc_kept(size)?,
             ctx: ctx.clone(),
             size,
             host: None,

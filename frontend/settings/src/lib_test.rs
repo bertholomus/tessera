@@ -11,6 +11,8 @@ fn reads_variables() {
         std::env::set_var("TESSERA_KERNEL_CACHE", "/tmp/kcache");
         std::env::set_var("TESSERA_NVRTC", "--maxrregcount=128 -use_fast_math");
         std::env::set_var("TESSERA_DUMP_SITES", "/tmp/sites.jsonl");
+        std::env::set_var("TESSERA_ATTIC", "/tmp/attic.sock");
+        std::env::set_var("TESSERA_ATTIC_KEY_FILE", "/tmp/attic.key");
     }
     let s = crate::read();
     assert_eq!(s.host_lanes, 8);
@@ -27,6 +29,13 @@ fn reads_variables() {
     assert_eq!(
         s.dump_sites,
         Some(std::path::PathBuf::from("/tmp/sites.jsonl"))
+    );
+    assert_eq!(
+        s.attic,
+        Some(tessera_engine::Attic {
+            socket: std::path::PathBuf::from("/tmp/attic.sock"),
+            key_file: std::path::PathBuf::from("/tmp/attic.key"),
+        })
     );
 }
 

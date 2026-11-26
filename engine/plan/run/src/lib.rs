@@ -135,6 +135,7 @@ pub fn configure(settings: &Settings) {
         tessera_gpukit::device::select(ordinal);
     }
     tessera_gpukit::cache::configure(settings);
+    tessera_gpukit::attic::configure(settings);
 }
 
 /// Picks the GPU ordinal opened on first context use.
