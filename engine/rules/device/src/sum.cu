@@ -44,13 +44,20 @@ __device__ bool stage_send(const float* src, float* dst, u32 len, u32 first, u32
 
 // Packs `len` floats as BF16 into the send buffer.
 __device__ bool stage_bf16(const float* src, u16* dst, u32 len, u32 first, u32 stride) {
-    bool vec4 = (len & 3u) == 0u && (reinterpret_cast<u64>(src) & 15ull) == 0ull
-                && (reinterpret_cast<u64>(dst) & 7ull) == 0ull;
-    if (vec4) {
+    u64 sa = reinterpret_cast<u64>(src), da = reinterpret_cast<u64>(dst);
+    if ((len & 7u) == 0u && ((sa | da) & 15ull) == 0ull) {
+        for (u32 i = first << 3; i < len; i += stride << 3) {
+            float4 a = *reinterpret_cast<const float4*>(src + i), b = *reinterpret_cast<const float4*>(src + i + 4);
+            *reinterpret_cast<uint4*>(dst + i) = make_uint4(
+                prim::to_bf16x2(a.x, a.y), prim::to_bf16x2(a.z, a.w),
+                prim::to_bf16x2(b.x, b.y), prim::to_bf16x2(b.z, b.w));
+        }
+        return ((blockIdx.x * blockDim.x) << 3) < len;
+    }
+    if ((len & 3u) == 0u && (sa & 15ull) == 0ull && (da & 7ull) == 0ull) {
         for (u32 i = first << 2; i < len; i += stride << 2) {
             float4 v = *reinterpret_cast<const float4*>(src + i);
-            uint2 h = make_uint2(prim::to_bf16x2(v.x, v.y), prim::to_bf16x2(v.z, v.w));
-            *reinterpret_cast<uint2*>(dst + i) = h;
+            *reinterpret_cast<uint2*>(dst + i) = make_uint2(prim::to_bf16x2(v.x, v.y), prim::to_bf16x2(v.z, v.w));
         }
         return ((blockIdx.x * blockDim.x) << 2) < len;
     }
@@ -58,36 +65,53 @@ __device__ bool stage_bf16(const float* src, u16* dst, u32 len, u32 first, u32 s
     return (blockIdx.x * blockDim.x) < len;
 }
 
+struct sum_round { ticket r; u32 done, len, shift; bool reads; };
+
+// Stages and triggers one sum round.
+template <bool BF16>
+__device__ bool issue_sum(session& s, const float* from, const float* to, u32 done, u32 len,
+                          u32 first, u32 stride, sum_round& o) {
+    o.done = done; o.len = len;
+    o.r = prepare(s, BF16 ? 0 : 2);
+    void* part = BF16 ? static_cast<void*>(send_buffer<u16>(o.r)) : static_cast<void*>(send_buffer<float>(o.r));
+    if (part == nullptr) return false;
+    bool active = BF16 ? stage_bf16(from + done, static_cast<u16*>(part), len, first, stride)
+                       : stage_send(from + done, static_cast<float*>(part), len, first, stride);
+    u64 ta = reinterpret_cast<u64>(to + done) & 15ull, pa = reinterpret_cast<u64>(part);
+    o.shift = (BF16 && (len & 7u) == 0u && ta == 0ull && (pa & 15ull) == 0ull) ? 3u
+            : ((len & 3u) == 0u && ta == 0ull && (pa & (BF16 ? 7ull : 15ull)) == 0ull) ? 2u : 0u;
+    o.reads = ((blockIdx.x * blockDim.x) << o.shift) < len;
+    return trigger(o.r, len, active);
+}
+
 // Lane 0 sums BF16 parts, lane 2 F32 parts.
 template <bool BF16>
-__device__ bool run_sum(session& s, const float* from, float* to, u32 n, u32 room, u32 first,
-                        u32 stride) {
+__device__ bool run_sum(session& s, const float* from, float* to, u32 n, u32 room, u32 first, u32 stride) {
+    if (n == 0u) return true;
     u32 sum_room = BF16 ? room << 1 : room;
-    for (u32 done = 0; done < n; done += sum_room) {
-        u32 len = min(sum_room, n - done);
-        ticket r = prepare(s, BF16 ? 0 : 2);
-        void* part = BF16 ? static_cast<void*>(send_buffer<u16>(r))
-                          : static_cast<void*>(send_buffer<float>(r));
-        if (part == nullptr) return false;
-        bool active = BF16 ? stage_bf16(from + done, static_cast<u16*>(part), len, first, stride)
-                           : stage_send(from + done, static_cast<float*>(part), len, first, stride);
-        u64 align = BF16 ? 7ull : 15ull;
-        bool vec4 = (len & 3u) == 0u && (reinterpret_cast<u64>(to + done) & 15ull) == 0ull
-                    && (reinterpret_cast<u64>(part) & align) == 0ull;
-        bool reads = vec4 ? ((blockIdx.x * blockDim.x) << 2) < len
-                          : (blockIdx.x * blockDim.x) < len;
-        if (!trigger(r, len, active)) return false;
-        if (!wait(r, reads)) return false;
-        if (reads) {
-            parts got = received(r);
-            if (vec4) {
-                for (u32 i = first << 2; i < len; i += stride << 2) {
-                    *reinterpret_cast<float4*>(to + done + i) = got.sum4(i);
+    sum_round cur, nxt;
+    if (!issue_sum<BF16>(s, from, to, 0u, min(sum_room, n), first, stride, cur)) return false;
+    for (;;) {
+        u32 nd = cur.done + sum_room;
+        bool has_next = nd < n;
+        if (has_next && !issue_sum<BF16>(s, from, to, nd, min(sum_room, n - nd), first, stride, nxt)) return false;
+        if (!wait(cur.r, cur.reads)) return false;
+        if (cur.reads) {
+            parts got = received(cur.r);
+            if (cur.shift == 3u) {
+                for (u32 i = first << 3; i < cur.len; i += stride << 3) {
+                    float4 lo, hi; got.sum8_bf16(i, lo, hi);
+                    *reinterpret_cast<float4*>(to + cur.done + i) = lo;
+                    *reinterpret_cast<float4*>(to + cur.done + i + 4) = hi;
                 }
+            } else if (cur.shift == 2u) {
+                for (u32 i = first << 2; i < cur.len; i += stride << 2) *reinterpret_cast<float4*>(to + cur.done + i) = got.sum4(i);
             } else {
-                for (u32 i = first; i < len; i += stride) to[done + i] = got.sum(i);
+                for (u32 i = first; i < cur.len; i += stride) to[cur.done + i] = got.sum(i);
             }
         }
+        if (!has_next) break;
+        cur = nxt;
     }
     return true;
 }
@@ -136,7 +160,7 @@ __device__ bool run_gather(session& s, const float* from, float* to, u32 n, u32 
 }
 
 // Values: floats per round, job. Zero floats stop.
-extern "C" __global__ void tessera_sums(const table* t) {
+extern "C" __global__ __launch_bounds__(512) void tessera_sums(const table* t) {
     if (!check(t)) return;
     u32 room = value(t, 0);
     job* j = address<job>(t, 1);

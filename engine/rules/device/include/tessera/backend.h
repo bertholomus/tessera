@@ -76,6 +76,12 @@ TESSERA_FN uint2 load_fresh4(const u16* p) {
     return v;
 }
 
+TESSERA_FN uint4 load_fresh8(const u16* p) {
+    uint4 v;
+    asm volatile("ld.global.cv.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+
 TESSERA_FN void pause() {
     __nanosleep(32);
 }
@@ -125,6 +131,11 @@ TESSERA_FN uint2 load_fresh4(const u16* p) {
     u32 lo = u32(load_fresh(p)) | (u32(load_fresh(p + 1)) << 16);
     u32 hi = u32(load_fresh(p + 2)) | (u32(load_fresh(p + 3)) << 16);
     return make_uint2(lo, hi);
+}
+
+TESSERA_FN uint4 load_fresh8(const u16* p) {
+    uint2 a = load_fresh4(p), b = load_fresh4(p + 4);
+    return make_uint4(a.x, a.y, b.x, b.y);
 }
 
 // Sleeps the whole wave. Use it in leader spins only.

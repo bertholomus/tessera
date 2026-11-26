@@ -245,27 +245,33 @@ struct parts {
         return s;
     }
 
+    TESSERA_FN static void add_bf16x4(float4& s, uint2 h) {
+        s.x += prim::from_bits(h.x << 16); s.y += prim::from_bits(h.x & 0xFFFF0000u);
+        s.z += prim::from_bits(h.y << 16); s.w += prim::from_bits(h.y & 0xFFFF0000u);
+    }
+
     // Four aligned elements of the sum, in rank order.
     TESSERA_FN float4 sum4(u32 i) const {
         float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         if (elem == BF16) {
-            for (u32 k = 0; k < count; k++) {
-                uint2 h = prim::load_fresh4(static_cast<const u16*>(part[k]) + i);
-                s.x += prim::from_bits(h.x << 16);
-                s.y += prim::from_bits(h.x & 0xFFFF0000u);
-                s.z += prim::from_bits(h.y << 16);
-                s.w += prim::from_bits(h.y & 0xFFFF0000u);
-            }
+            for (u32 k = 0; k < count; k++)
+                add_bf16x4(s, prim::load_fresh4(static_cast<const u16*>(part[k]) + i));
             return s;
         }
         for (u32 k = 0; k < count; k++) {
             float4 v = prim::load_fresh4(static_cast<const float*>(part[k]) + i);
-            s.x += v.x;
-            s.y += v.y;
-            s.z += v.z;
-            s.w += v.w;
+            s.x += v.x; s.y += v.y; s.z += v.z; s.w += v.w;
         }
         return s;
+    }
+
+    // Eight aligned BF16 elements of the sum, in rank order.
+    TESSERA_FN void sum8_bf16(u32 i, float4& lo, float4& hi) const {
+        lo = make_float4(0.0f, 0.0f, 0.0f, 0.0f); hi = lo;
+        for (u32 k = 0; k < count; k++) {
+            uint4 h = prim::load_fresh8(static_cast<const u16*>(part[k]) + i);
+            add_bf16x4(lo, make_uint2(h.x, h.y)); add_bf16x4(hi, make_uint2(h.z, h.w));
+        }
     }
 
     TESSERA_FN float load(u32 k, u32 i) const {
