@@ -324,7 +324,7 @@ impl DualState {
     ) -> Result<(Vec<u32>, Option<usize>), Error> {
         let block = dflash.block();
         let d_start = step.start - self.d_base;
-        let can_dflash = step.start + block <= step.max_ctx && d_start + block <= step.max_ctx;
+        let can_dflash = step.start + block <= step.max_ctx && d_start + block <= dflash.context();
         let (use_mtp, switched) = self.selector.decide_next(can_dflash);
         self.round_mtp = use_mtp;
         self.switched = switched;
@@ -481,10 +481,14 @@ fn run_dual_req(
     emit: &mut dyn FnMut(Event) -> bool,
 ) -> Result<SpecStats, Error> {
     let block = dflash.block();
-    let d_width = dflash.tap_width();
-    let m_width = mtp.hidden();
-    let total = d_width + m_width;
-    let max_ctx = target.context().min(dflash.context()).min(mtp.context());
+    let (d_width, m_width) = (dflash.tap_width(), mtp.hidden());
+    let (total, max_ctx, d_ctx) = (
+        d_width + m_width,
+        target.context().min(mtp.context()),
+        dflash.context(),
+    );
+    let win = dflash.sliding_window();
+    let drop_before = win.map_or(0, |w| req.request.tokens.len().saturating_sub(w));
     let mut pair = (dflash, mtp);
     run_speculate(
         target,
@@ -495,9 +499,14 @@ fn run_dual_req(
             let raw = taps.into_host(&*target.runner, total)?;
             let (d_taps, m_taps) = split_taps(&raw, len, d_width, m_width);
             let end = pos + len;
-            if prompt.len() + block <= max_ctx {
-                let wants = dflash.draft_wants();
-                dflash.run_taps(0, prompt[end], end, pos, TapsIn::Host(&d_taps), wants)?;
+            if end > drop_before && (prompt.len() - drop_before) + block <= d_ctx {
+                let skip = drop_before.saturating_sub(pos);
+                let (d_end, d_pos) = (end - drop_before, pos + skip - drop_before);
+                let (in_t, w) = (
+                    TapsIn::Host(&d_taps[skip * d_width..]),
+                    dflash.draft_wants(),
+                );
+                dflash.run_taps(0, prompt[end], d_end, d_pos, in_t, w)?;
             }
             if prompt.len() <= max_ctx {
                 let shifted = &prompt[pos + 1..end + 1];
@@ -509,11 +518,14 @@ fn run_dual_req(
         |target, _, pos, prompt, anchor, taps| {
             let len = prompt.len() - pos;
             let raw = taps.into_host(&*target.runner, total)?;
-            let (d_pending, m_taps) = split_taps(&raw, len, d_width, m_width);
+            let (d_all, m_taps) = split_taps(&raw, len, d_width, m_width);
+            let skip = drop_before.saturating_sub(pos);
+            let (d_pending, d_ctx_pos) =
+                (d_all[skip * d_width..].to_vec(), pos + skip - drop_before);
             let m_tokens: Vec<u32> = prompt[pos + 1..].iter().copied().chain([anchor]).collect();
             Ok(DualState::new(
                 selector,
-                (0, pos, d_pending),
+                (drop_before, d_ctx_pos, d_pending),
                 (pos as u32, m_tokens, m_taps),
             ))
         },

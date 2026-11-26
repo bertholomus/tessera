@@ -45,13 +45,20 @@ pub(crate) struct D2dCopy {
 
 impl TapsBuf {
     pub(crate) fn as_in(&self) -> TapsIn<'_> {
+        self.as_in_from(0, 0)
+    }
+
+    pub(crate) fn as_in_from(&self, skip: usize, width: usize) -> TapsIn<'_> {
         match self {
-            TapsBuf::Device { addr, rows, .. } => TapsIn::Device {
-                addr: *addr,
-                rows: *rows,
-                stride: 0,
-            },
-            TapsBuf::Host(v) => TapsIn::Host(v),
+            TapsBuf::Device { addr, rows, .. } => {
+                let (s, off) = (skip.min(*rows), (skip.min(*rows) * width * 4) as u64);
+                TapsIn::Device {
+                    addr: *addr + off,
+                    rows: *rows - s,
+                    stride: 0,
+                }
+            }
+            TapsBuf::Host(v) => TapsIn::Host(&v[(skip * width).min(v.len())..]),
         }
     }
 

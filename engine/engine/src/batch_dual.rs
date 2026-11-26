@@ -64,10 +64,7 @@ impl<'a> BatchMtp<'a> {
         if width != d_width + m_width {
             return Err(Error::Rows);
         }
-        let max_ctx = target
-            .context()
-            .min(drafter.context())
-            .min(dflash.context());
+        let max_ctx = target.context().min(drafter.context());
         let block = dflash.block();
         let peer = DualPeer {
             dflash,
@@ -110,8 +107,7 @@ impl<'a> BatchMtp<'a> {
             return Ok(());
         }
         p.solo_mode = false;
-        let slot = p.slot;
-        let skip = p.skip;
+        let (slot, m_start) = (p.slot, p.m_start_init);
         let m_toks = std::mem::take(&mut p.m_tok_buf);
         let m_taps = std::mem::take(&mut p.m_tap_buf);
         if let Some(peer) = &self.dual {
@@ -121,13 +117,13 @@ impl<'a> BatchMtp<'a> {
         flush_mtp(
             self.drafter,
             slot,
-            skip as u32,
+            m_start,
             &m_toks,
             &m_taps,
             self.core.prefill_chunk,
         )?;
         if let Some(p) = self.prefilling.front_mut() {
-            p.mtp_valid = skip + m_toks.len();
+            p.mtp_valid = m_start as usize + m_toks.len();
         }
         Ok(())
     }

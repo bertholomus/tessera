@@ -399,12 +399,13 @@ pub(crate) struct Admitted {
 /// Admitted sequence advancing through chunked prompt prefill.
 pub(crate) struct PrefillSeq {
     pub(crate) slot: u32,
-    pub(crate) skip: usize,
     pub(crate) request: Request,
     pub(crate) sink: Option<Sink>,
     pub(crate) pos: usize,
     pub(crate) mtp_valid: usize,
     pub(crate) solo_mode: bool,
+    pub(crate) drop_before: usize,
+    pub(crate) m_start_init: u32,
     pub(crate) d_buf: Vec<f32>,
     pub(crate) m_tok_buf: Vec<u32>,
     pub(crate) m_tap_buf: Vec<f32>,
@@ -567,14 +568,20 @@ impl BatchMtp<'_> {
                 && admitted.len() == 1;
             for mut item in admitted {
                 notify_kept(&mut item.sink, item.skip);
+                let n = item.request.tokens.len();
+                let win = solo_admit
+                    .then(|| self.dual.as_ref()?.dflash.sliding_window())
+                    .flatten();
+                let drop_before = win.map_or(item.skip, |w| n.saturating_sub(w).max(item.skip));
                 self.prefilling.push_back(PrefillSeq {
                     slot: item.slot,
-                    skip: item.skip,
                     request: item.request,
                     sink: item.sink,
                     pos: item.skip,
                     mtp_valid: item.skip,
                     solo_mode: solo_admit,
+                    drop_before,
+                    m_start_init: item.skip as u32,
                     d_buf: Vec::new(),
                     m_tok_buf: Vec::new(),
                     m_tap_buf: Vec::new(),
@@ -615,10 +622,17 @@ impl BatchMtp<'_> {
             let shifted = &seq.request.tokens[pos0 + 1..pos0 + len + 1];
             if let Some((d_w, m_w)) = dual_widths {
                 if seq.solo_mode {
-                    let (dt, mt) = self.split_dual_taps(taps, len)?;
-                    seq.d_buf.extend_from_slice(&dt);
-                    seq.m_tok_buf.extend_from_slice(shifted);
-                    seq.m_tap_buf.extend_from_slice(&mt);
+                    if pos0 + len <= seq.drop_before {
+                        let (sl, p0, end) = (seq.slot, pos0 as u32, pos0 + len);
+                        self.run_mtp_prefill_chunk(sl, p0, shifted, &taps, d_w, m_w)?;
+                        (seq.m_start_init, seq.mtp_valid) = (end as u32, end);
+                    } else {
+                        let (dt, mt) = self.split_dual_taps(taps, len)?;
+                        let skip = seq.drop_before.saturating_sub(pos0);
+                        seq.d_buf.extend_from_slice(&dt[skip * d_w..]);
+                        seq.m_tok_buf.extend_from_slice(shifted);
+                        seq.m_tap_buf.extend_from_slice(&mt);
+                    }
                 } else {
                     if self.active.len() + self.prefilling.len() < 2 {
                         let dt = self.read_dual_d_taps(&taps, len)?;
@@ -653,14 +667,16 @@ impl BatchMtp<'_> {
         shifted.push(act.anchor);
         if seq.solo_mode {
             let (dt, mt) = self.split_dual_taps(taps, len)?;
-            seq.d_buf.extend_from_slice(&dt);
+            let skip = seq.drop_before.saturating_sub(pos0);
+            seq.d_buf
+                .extend_from_slice(&dt[skip * dual_widths.expect("dual widths").0..]);
             seq.m_tok_buf.extend_from_slice(&shifted);
             seq.m_tap_buf.extend_from_slice(&mt);
             let selector = self.dual.as_ref().expect("dual peer").selector.fresh();
             act.solo = Some(DualState::new(
                 selector,
-                (seq.skip, 0, seq.d_buf),
-                (seq.skip as u32, seq.m_tok_buf, seq.m_tap_buf),
+                (seq.drop_before, 0, seq.d_buf),
+                (seq.m_start_init, seq.m_tok_buf, seq.m_tap_buf),
             ));
             self.active.push(act);
             let idx = self.active.len() - 1;
