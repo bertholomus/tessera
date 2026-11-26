@@ -114,3 +114,17 @@ fn thinking_keys() {
         assert_eq!((status, &error["error"]["param"]), (400, &json!(key)));
     }
 }
+
+#[test]
+fn reasoning_effort_forwards() {
+    let slot = loaded(&Arc::new(MockGenerator::default()), true);
+    let body = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "low",
+    });
+    assert_eq!(
+        json(&slot, "/v1/chat/completions", Some(body.clone())).0,
+        200
+    );
+    assert_eq!(json(&slot, "/tokenize", Some(body)).0, 200);
+}

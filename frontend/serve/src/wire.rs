@@ -557,6 +557,8 @@ pub(crate) struct Messages {
     #[serde(default)]
     pub(crate) tools: Option<Vec<Tool>>,
     #[serde(default)]
+    pub(crate) reasoning_effort: Option<String>,
+    #[serde(default)]
     pub(crate) chat_template_kwargs: Kwargs,
 }
 

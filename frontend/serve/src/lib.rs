@@ -61,7 +61,10 @@ fn render(model: &Model, m: Messages, allow_tools: bool) -> Result<(String, bool
             tools.push(tool.to_value()?);
         }
     }
-    let effort = m.chat_template_kwargs.reasoning_effort.as_deref();
+    let effort = m
+        .reasoning_effort
+        .as_deref()
+        .or(m.chat_template_kwargs.reasoning_effort.as_deref());
     let think = m
         .chat_template_kwargs
         .enable_thinking
