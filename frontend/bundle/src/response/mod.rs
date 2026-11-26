@@ -404,6 +404,11 @@ pub struct ResponseStream<'a> {
 }
 
 impl<'a> ResponseStream<'a> {
+    /// Whether the stream is inside a thinking block.
+    pub fn in_thinking(&self) -> bool {
+        self.mode == Mode::Thinking
+    }
+
     /// Feeds raw decoded text and appends completed events.
     pub fn push(&mut self, piece: &str, out: &mut Vec<ResponseEvent>) {
         if self.mode == Mode::Closed || piece.is_empty() {

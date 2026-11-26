@@ -6,7 +6,7 @@ use crate::{Model, Slot, with_model};
 use serde_json::{Map, Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use tessera_bundle::{ResponseEvent, ResponseParser, ToolCall};
+use tessera_bundle::{ResponseEvent, ResponseParser, ResponseStream, ToolCall};
 use tessera_engine::Ask;
 use tessera_tasks::api::{Finish, Params, Refused, Step};
 
@@ -294,8 +294,8 @@ impl Started {
         })
     }
 
-    /// `usage` holds the answer's tokens and the cached prompt tokens.
-    fn body(&self, choices: Value, usage: Option<(usize, usize)>) -> Value {
+    /// `usage` holds answer, reasoning, and cached prompt token counts.
+    fn body(&self, choices: Value, usage: Option<(usize, usize, usize)>) -> Value {
         let mut body = json!({
             "id": self.id,
             "object": self.object(),
@@ -303,13 +303,17 @@ impl Started {
             "model": self.model,
             "choices": choices,
         });
-        if let Some((tokens, cached)) = usage {
-            body["usage"] = json!({
+        if let Some((tokens, reasoning, cached)) = usage {
+            let mut u = json!({
                 "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": tokens,
                 "total_tokens": self.prompt_tokens + tokens,
                 "prompt_tokens_details": {"cached_tokens": cached},
             });
+            if reasoning > 0 {
+                u["completion_tokens_details"] = json!({"reasoning_tokens": reasoning});
+            }
+            body["usage"] = u;
         }
         body
     }
@@ -317,18 +321,35 @@ impl Started {
     /// Waits for the end and answers in one body.
     fn whole(self) -> Response {
         let mut text = String::new();
+        let mut reasoning = 0usize;
+        let mut stream = self
+            .parsing
+            .parser
+            .as_ref()
+            .map(|p| p.stream(self.parsing.tools, self.parsing.thinking));
+        let mut events = Vec::new();
         while let Ok(step) = self.steps.recv() {
             match step {
-                Step::Token { text: piece, .. } => text += &piece,
+                Step::Token { text: piece, .. } => {
+                    if let Some(s) = &mut stream {
+                        events.clear();
+                        feed_stream(s, &piece, false, &mut events, &mut reasoning);
+                    }
+                    text += &piece;
+                }
                 Step::Done {
                     text: rest,
                     finish,
                     tokens,
                     cached,
                 } => {
+                    if let Some(s) = &mut stream {
+                        events.clear();
+                        feed_stream(s, &rest, true, &mut events, &mut reasoning);
+                    }
                     text += &rest;
                     let choice = self.choice(&text, Some(finish));
-                    let usage = Some((tokens, cached));
+                    let usage = Some((tokens, reasoning.min(tokens), cached));
                     return Response::json(200, &self.body(json!([choice]), usage));
                 }
             }
@@ -361,7 +382,7 @@ impl Started {
                     finish,
                     tokens,
                     cached,
-                } => (text, Some((finish, (tokens, cached)))),
+                } => (text, Some((finish, (tokens, 0, cached)))),
             };
             let choice = self.choice(&text, end.map(|(f, _)| f));
             if !send(self.body(json!([choice]), None)) {
@@ -386,6 +407,7 @@ impl Started {
         let mut stream = parser.stream(self.parsing.tools, self.parsing.thinking);
         let mut events = Vec::new();
         let mut calls = 0usize;
+        let mut reasoning = 0usize;
         while let Ok(step) = self.steps.recv() {
             let (text, end) = match step {
                 Step::Token { text, .. } => (text, None),
@@ -396,10 +418,13 @@ impl Started {
                     cached,
                 } => (text, Some((finish, (tokens, cached)))),
             };
-            stream.push(&text, &mut events);
-            if end.is_some() {
-                stream.finish(&mut events);
-            }
+            feed_stream(
+                &mut stream,
+                &text,
+                end.is_some(),
+                &mut events,
+                &mut reasoning,
+            );
             for event in events.drain(..) {
                 let delta = match event {
                     ResponseEvent::Content(s) => json!({"content": s}),
@@ -415,12 +440,13 @@ impl Started {
                     return;
                 }
             }
-            if let Some((reason, usage)) = end {
+            if let Some((reason, (tokens, cached))) = end {
                 let choice = self.delta_choice(json!({}), Some(finish(reason, calls > 0)));
                 if !send(self.body(json!([choice]), None)) {
                     return;
                 }
                 if self.usage {
+                    let usage = (tokens, reasoning.min(tokens), cached);
                     send(self.body(json!([]), Some(usage)));
                 }
                 let _ = out.send("[DONE]".into());
@@ -473,5 +499,27 @@ pub(crate) fn chat_completions(slot: &Slot, request: &Request) -> Response {
     match with_model(slot, |m| chat(m, &request.body, ask(m, request)?)) {
         Ok(started) => started.respond(),
         Err(refused) => refused.into(),
+    }
+}
+
+/// Feeds one token's text to `stream` and counts reasoning tokens.
+fn feed_stream(
+    stream: &mut ResponseStream<'_>,
+    text: &str,
+    done: bool,
+    events: &mut Vec<ResponseEvent>,
+    reasoning: &mut usize,
+) {
+    let was = stream.in_thinking();
+    let start = events.len();
+    stream.push(text, events);
+    if done {
+        stream.finish(events);
+    }
+    let saw = events[start..]
+        .iter()
+        .any(|e| matches!(e, ResponseEvent::Reasoning(_)));
+    if saw || (!done && (was || stream.in_thinking())) {
+        *reasoning += 1;
     }
 }

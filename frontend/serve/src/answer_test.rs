@@ -139,13 +139,19 @@ fn chat_tool_calls() {
     );
     assert_eq!(c["message"]["reasoning_content"], "check");
     assert_eq!(
+        got["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        1
+    );
+    assert_eq!(
         c["message"]["tool_calls"][0]["function"],
         json!({"name": "ping", "arguments": "{\"a\":\"ok\"}"})
     );
     body["stream"] = json!(true);
+    body["stream_options"] = json!({"include_usage": true});
     let (s_status, sse) = call(&slot, "/v1/chat/completions", Some(body));
     assert_eq!(s_status, 200);
     assert!(sse.contains("\"tool_calls\"") && sse.contains("\"finish_reason\":\"tool_calls\""));
+    assert!(sse.contains("\"reasoning_tokens\":1"));
 }
 
 #[test]
