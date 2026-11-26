@@ -148,6 +148,16 @@ pub(crate) struct SpecReq {
     pub chunk: Option<usize>,
 }
 
+/// Maps slot zero for a shared paged pool.
+pub(crate) fn solo_cap(target: &mut Engine) -> usize {
+    let ctx = target.context();
+    match &mut target.lanes {
+        Some(lanes) if lanes.shared() => ctx.min(lanes.map_solo()),
+        Some(lanes) => ctx.min(lanes.pages() * lanes.page),
+        None => ctx,
+    }
+}
+
 /// Validates a request and broadcasts its header once to followers.
 pub(crate) fn start_req(
     target: &mut Engine,
@@ -160,7 +170,8 @@ pub(crate) fn start_req(
     if (request.guide.is_some() || request.min_tokens > 0) && target.control.is_some() {
         return Err(Error::Guided);
     }
-    if request.tokens.is_empty() || request.tokens.len() > target.context() {
+    let cap = solo_cap(target);
+    if request.tokens.is_empty() || request.tokens.len() > cap {
         let _ = emit(Event::Done(Reason::Context));
         return Ok(false);
     }
@@ -411,7 +422,10 @@ pub(crate) fn run_speculate<D, S>(
             }
             prompt.append(&mut g.queue);
         }
-        if prompt.len() > target.context() {
+        let cap = target.lanes.as_ref().map_or(target.context(), |l| {
+            target.context().min(l.pages() * l.page)
+        });
+        if prompt.len() > cap {
             break 'run Some(Reason::Context);
         }
         let n = prompt.len();

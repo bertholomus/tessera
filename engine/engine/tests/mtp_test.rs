@@ -623,3 +623,31 @@ fn batch_mtp_paged_ranked() {
     target.dismiss().unwrap();
     follower.join().unwrap();
 }
+
+#[test]
+fn solo_mtp_paged() {
+    let mut paged = Recipe::default();
+    paged.share_kept(1);
+    let page = paged.kept.page().expect("paged layout");
+    let ctx = page * 3;
+    paged.share_kept(page * 4);
+    let mut cfg = mla_cfg(true, 16);
+    (cfg.stack.max_seqs, cfg.stack.max_context) = (2, ctx as u64);
+    let tg = mla::stepper::<mla::Moe>(&cfg);
+    let mg = mtp::stepper::<mla::Moe>(&mtp::config(&cfg, true));
+    let (tw, mw) = (weights(&tg, &mut Noise(157)), weights(&mg, &mut Noise(163)));
+    let (ts, s) = (float_weights(&tg, 157), host_settings());
+    let p: Vec<u32> = (0..(page + 5) as u32).map(|i| (i * 5 + 1) % 16).collect();
+    let want = gen_ids(&mut open_target(&tg, &tw, ctx, &s), req(&p, 8));
+    let mut target = Engine::open(tg, ctx, &paged, &s).unwrap();
+    target.load(&ts).unwrap();
+    let mut drafter = open_mtp(&mg, &mw, ctx, &s);
+    let mut sp = MtpSpeculate::new(&mut target, &mut drafter, 2)
+        .unwrap()
+        .with_prefill_chunk(page);
+    let (got, _) = spec_events(|e| sp.generate(req(&p, 8), e));
+    assert_eq!(collect_ids(&got), want);
+    let long: Vec<u32> = (0..=ctx as u32).map(|i| i % 16).collect();
+    let (cap, _) = spec_events(|e| sp.generate(req(&long, 4), e));
+    assert_eq!(cap, vec![Event::Done(Reason::Context)]);
+}
