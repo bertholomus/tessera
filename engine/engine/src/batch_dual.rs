@@ -555,12 +555,7 @@ impl<'a> BatchDFlash<'a> {
         let (Some(kept), Some(lanes)) = (&mut self.kept, &mut self.target.lanes) else {
             return Ok(());
         };
-        for r in rows {
-            if let Some(pages) = kept.grow(r.slot, r.position as usize + 1)? {
-                lanes.set(r.slot, pages);
-            }
-        }
-        Ok(())
+        kept.grow_rows(rows, lanes)
     }
 
     fn exec_round(&mut self, admitted: Vec<Admitted>, follower: bool) -> Result<(), Error> {
