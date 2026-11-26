@@ -265,6 +265,8 @@ pub struct Engine {
     disk: Option<tessera_kv::DiskKv>,
     /// Whether slots carry state that a kept prefix cannot restore.
     stateful: bool,
+    /// Max rows per launch when sliding KV rings are active.
+    ring_chunk: usize,
     /// Rows a pending verify can promote, if any.
     verified: Option<usize>,
 }
@@ -432,7 +434,8 @@ impl Engine {
         let edit_cap = edit_cap.map(|d| d.size.max() as usize / 3);
         let taps = width(&graph, full, Role::Taps);
         let vocab = width(&graph, full, Role::Logits);
-        let stateful = graph.nodes.iter().any(|n| n.op.recurrent());
+        let ring_chunk = schedule::ring_chunk(&graph);
+        let stateful = graph.nodes.iter().any(|n| n.op.recurrent()) || ring_chunk > 0;
         let split = place.and_then(|_| ranks::build_split(&graph, full, settings.split_rows));
         Ok(Self {
             graph,
@@ -457,6 +460,7 @@ impl Engine {
             ple: None,
             disk: None,
             stateful,
+            ring_chunk,
             verified: None,
         })
     }

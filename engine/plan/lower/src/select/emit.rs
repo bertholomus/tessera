@@ -234,29 +234,29 @@ impl Emit {
         if let Some(val) = self.kept.get(&index) {
             return Ok(*val);
         }
-        let (len, room, info, form, packed) = match tree.kept_rows(index) {
-            Some((t, context)) => {
+        let (len, room, info, form, packed) = match tree.kept_layout(index) {
+            Some((t, layout, context)) => {
                 let node = tree.node(t);
                 let all = &node.shape;
                 let width: usize = all[2..].iter().product();
-                let (rows, pool_pages) = match (tree.kept.page(), tree.kept_rows) {
+                let (rows, pool_pages) = match (layout.page(), tree.kept_rows) {
                     (Some(page), Some(cap)) => {
                         let pages = cap.max(context).div_ceil(page);
                         (pages * page, pages)
                     }
                     (Some(page), None) => {
-                        let rows = tree.kept.rows(all[0], context);
+                        let rows = layout.rows(all[0], context);
                         (rows, rows / page)
                     }
-                    (None, _) => (tree.kept.rows(all[0], context), 0),
+                    (None, _) => (layout.rows(all[0], context), 0),
                 };
                 let room = rows * width;
-                let entries = kept::entries(tree.kept, all[0], context);
+                let entries = kept::entries(layout, all[0], context);
                 self.out.table = self.out.table.max(entries);
                 self.out.pool_pages = self.out.pool_pages.max(pool_pages);
                 let len: usize = all.iter().product();
-                let interleaved = tree.kept.name() == "interleaved";
-                let page_rows = match (tree.kept.page(), interleaved) {
+                let interleaved = layout.name() == "interleaved";
+                let page_rows = match (layout.page(), interleaved) {
                     (Some(page), _) => page as u32,
                     (None, true) => 1,
                     (None, false) => context as u32,

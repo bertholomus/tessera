@@ -42,7 +42,7 @@ pub use tessera_mem::{Buffer, DType, Tensor, View};
 pub use tessera_platform::{Limits, Platform};
 pub use tessera_sim::{Cluster, Fit, Link, Zone, ZoneKind};
 pub use tessera_work::{Load, Ops};
-pub use tree::{Node, T, Term, Tree, Wants};
+pub use tree::{Node, RING_CHUNK, T, Term, Tree, Wants, sliding_ring};
 
 use tessera_graph::{DimName, Graph};
 

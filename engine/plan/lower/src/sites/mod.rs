@@ -112,7 +112,7 @@ impl Region {
                 }
             }
             if let Term::Op(Op::Append(index)) = node.term {
-                let (_, context) = tree.kept_rows(index)?;
+                let (_, _, context) = tree.kept_layout(index)?;
                 let place = |a: &T| inputs.iter().position(|i| i == a);
                 kept.push(Appended {
                     index,

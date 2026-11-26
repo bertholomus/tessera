@@ -761,3 +761,91 @@ fn indexer_128k_scratch() {
         assert!(f_cost.bytes * 2 < u_cost.bytes);
     }
 }
+
+#[test]
+fn sliding_ring_wraps() {
+    let dim = |name, size| Dim { name, size };
+    let dims = vec![
+        dim(Seqs, Size::Bounded(2)),
+        dim(Rows, Size::Bounded(4)),
+        dim(Context, Size::Bounded(24)),
+        dim(Heads, Size::Fixed(4)),
+        dim(KvHeads, Size::Fixed(2)),
+        dim(HeadDim, Size::Fixed(16)),
+    ];
+    let m = Model::new(dims);
+    let floats = |h| TensorType::new([Rows, h, HeadDim], DType::F32);
+    let ids = TensorType::new([Rows], DType::U32);
+    let [q, k, v, slots, positions] = m.entry(
+        EntryKind::Step,
+        [
+            Port {
+                role: Role::Tokens,
+                ty: floats(Heads),
+            },
+            Port {
+                role: Role::Tokens,
+                ty: floats(KvHeads),
+            },
+            Port {
+                role: Role::Tokens,
+                ty: floats(KvHeads),
+            },
+            Port {
+                role: Role::Slots,
+                ty: ids.clone(),
+            },
+            Port {
+                role: Role::Positions,
+                ty: ids,
+            },
+        ],
+    );
+    let kept = TensorType::new([Seqs, Context, KvHeads, HeadDim], DType::F32);
+    let (keys, values) = (m.kept(kept.clone()), m.kept(kept));
+    let by = [&slots, &positions];
+    let (k, v) = (k.append(&keys, by), v.append(&values, by));
+    let out = m.attend_rows(Mask::Back(3), 0.25, [&q, &k, &v], by, None);
+    let g = m.finish([(Role::Logits, &out)]);
+    let mut draws = Noise(71);
+    let mut batches = Vec::new();
+    let mut store = Store::default();
+    for step in 0..6u32 {
+        let pos = step * 4;
+        let (s, p) = rows(&[(0, pos, 2), (1, pos, 2)]);
+        let (s2, p2) = rows(&[(0, pos + 2, 2), (1, pos + 2, 2)]);
+        for (sl, po) in [(s, p), (s2, p2)] {
+            let n = sl.len();
+            let feeds = vec![
+                noise(vec![n, 4, 16], &mut draws),
+                noise(vec![n, 2, 16], &mut draws),
+                noise(vec![n, 2, 16], &mut draws),
+                Tensor::u32(vec![n], sl),
+                Tensor::u32(vec![n], po),
+            ];
+            let want = run_kept(&g, &[], &mut store, 0, &feeds).unwrap().remove(0);
+            batches.push((feeds, want));
+        }
+    }
+    for settings in runs() {
+        for layout in [kept::DENSE, &kept::PAGED16] {
+            let mut device = Device::guess(&settings);
+            device.kept = layout;
+            let mut runner: Option<Box<dyn Run>> = None;
+            for (feeds, want) in &batches {
+                let sizes = [(Seqs, 2), (Rows, 4), (Context, 24)];
+                let plan = lower(&g, 0, &sizes, &device).unwrap();
+                assert_eq!(plan.kept_info[0].context, 8);
+                assert!(plan.table.is_none());
+                let got = step_plan(&mut runner, plan, &settings, feeds);
+                let off = max_abs_diff(got.floats().unwrap(), want.floats().unwrap());
+                assert!(
+                    off < 1e-4,
+                    "{:?} {}: off {off:e}",
+                    settings.backend,
+                    layout.name()
+                );
+            }
+        }
+    }
+}

@@ -35,12 +35,12 @@ impl Pattern for Gather {
         // Weight tables are matrices. Values may have more axes.
         let kept = match tree.node(table).term {
             Term::Op(Op::Append(index)) => {
-                let (_, context) = tree.kept_rows(index)?;
+                let (_, layout, context) = tree.kept_layout(index)?;
                 let keys = *tree.node(table).shape.get(1)?;
                 Some(KeptGather {
                     keys,
                     context,
-                    layout: tree.kept,
+                    layout,
                 })
             }
             _ => None,
