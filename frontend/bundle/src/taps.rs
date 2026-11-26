@@ -2,7 +2,7 @@
 
 use crate::decoder::family;
 use crate::tokenize::hf::Hf;
-use crate::{Overrides, Template, config, pull};
+use crate::{Overrides, Stream, Template, Weights, config, numbered, pins};
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::Shards;
@@ -10,9 +10,24 @@ use tessera_engine::{Graph, Pins, Weight};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
+struct TappedStream {
+    graph: Graph,
+    shards: Shards,
+}
+
+impl Stream for TappedStream {
+    fn stream(
+        &self,
+        shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
+        take: &mut dyn FnMut(u32, Weight) -> Result<()>,
+    ) -> Result<()> {
+        numbered(&self.graph, &self.shards, &[], shares, take)
+    }
+}
+
 pub struct Tapped {
     pub graph: Graph,
-    pub weights: Vec<Weight>,
+    pub weights: Weights,
     pub pins: Pins,
     pub tokenizer: Hf,
     pub template: Template,
@@ -42,7 +57,12 @@ pub fn tapped(
     }
     config.stack.layers = deepest;
     let graph = (family(&arch)?.taps)(&config, layers);
-    let (weights, pins) = pull(&graph, &Shards::open(dir)?, deepest, &[])?;
+    let shards = Shards::open(dir)?;
+    let pins = pins(&graph, &shards, deepest, &[])?;
+    let weights = Weights::Streamed(Box::new(TappedStream {
+        graph: graph.clone(),
+        shards,
+    }));
     let tokenizer = Hf::open(&words.join("tokenizer.json"))?;
     let template = Template::load(words)?.ok_or("no chat template")?;
     Ok(Tapped {

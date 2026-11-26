@@ -54,7 +54,12 @@ impl Flow {
             pins: t.pins,
             ..Recipe::default()
         };
-        let model = Model::open_loaded(t.graph, &recipe, settings, &t.weights, progress)?;
+        let count = t.graph.weights.len() as u32;
+        let compiling = progress.step("compile", Unit::Items, None);
+        let mut model = Model::open(t.graph, &recipe, settings)?;
+        compiling.finish();
+        t.weights
+            .each_counted(progress, count, |_| None, |at, w| model.load_one(at, w))?;
         Ok(Self { model, text })
     }
 
