@@ -318,29 +318,39 @@ pub(crate) fn packed(
     let name = coded(codes, &format!("{head}trellis.{p}"))?.0;
     let matrix = (hidden * ffn * k as usize / 8) as u64;
     let inner = if p == "down" { 2 } else { 1 };
-    let (entries, ffn_out) = match slice {
+    let alloc = |ffn_out: usize, body: usize| match p {
+        "down" => trellis::alloc_packed(ffn_out, hidden, trellis::INPUT_SIDE, body),
+        _ => trellis::alloc_packed(hidden, ffn_out, 1, body),
+    };
+    let (out, ffn_out) = match slice {
         Some((0, f, c)) => {
-            let (at, n) = (f as u64 * matrix, c as u64 * matrix);
-            (codes.bytes_at(&name, at, Some(n))?, ffn)
+            let (at, n) = (f as u64 * matrix, c * matrix as usize);
+            let mut buf = alloc(ffn, n);
+            codes.read_into(&name, at, &mut buf[trellis::HEAD..])?;
+            (buf, ffn)
         }
         Some((ax, f, c)) if ax == inner && f.is_multiple_of(BLOCK) && c.is_multiple_of(BLOCK) => {
             let entry = (hidden * BLOCK * k as usize / 8) as u64;
-            let (off, take) = ((f / BLOCK) as u64 * entry, (c / BLOCK) as u64 * entry);
-            let mut buf = Vec::with_capacity(experts * take as usize);
+            let (off, take) = ((f / BLOCK) as u64 * entry, (c / BLOCK) * entry as usize);
+            let mut buf = alloc(c, experts * take);
             for m in 0..experts {
                 let at = m as u64 * matrix + off;
-                buf.extend_from_slice(&codes.bytes_at(&name, at, Some(take))?);
+                let dst = trellis::HEAD + m * take;
+                codes.read_into(&name, at, &mut buf[dst..dst + take])?;
             }
             (buf, c)
         }
-        _ => (codes.bytes(&name)?, ffn),
+        _ => {
+            let len = codes.byte_len(&name)? as usize;
+            let mut buf = alloc(ffn, len);
+            codes.read_into(&name, 0, &mut buf[trellis::HEAD..])?;
+            (buf, ffn)
+        }
     };
+    let entries = &out[trellis::HEAD..];
     let per = hidden * ffn_out * k as usize / 8;
     if !tensor && per >= 16 && entries.chunks_exact(per).any(|c| c[..16] == [0; 16]) {
         return Err(Error::Format(format!("{name}: zero-filled expert slice")));
     }
-    Ok(match p {
-        "down" => trellis::packed(ffn_out, hidden, trellis::INPUT_SIDE, &entries),
-        _ => trellis::packed(hidden, ffn_out, 1, &entries),
-    })
+    Ok(out)
 }

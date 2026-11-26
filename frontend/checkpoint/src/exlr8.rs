@@ -78,8 +78,11 @@ fn rows<T: Clone + Send>(
 
 /// Trellis matrix `name` packed: a header, then its entries.
 fn packed(f: &File, name: &str, r: &Record) -> Result<Vec<u8>, Error> {
-    let entries = f.bytes(&coded(f, &format!("{name}.trellis"))?.0)?;
-    Ok(trellis::packed(r.inp, r.out, r.side as u32, &entries))
+    let tensor = coded(f, &format!("{name}.trellis"))?.0;
+    let len = f.byte_len(&tensor)? as usize;
+    let mut out = trellis::alloc_packed(r.inp, r.out, r.side as u32, len);
+    f.read_into(&tensor, 0, &mut out[trellis::HEAD..])?;
+    Ok(out)
 }
 
 /// Trellis matrix `name` as f32 `[out][in]`, before its rotations.
@@ -122,10 +125,12 @@ fn codes_packed(f: &File, name: &str, rows: Option<(usize, usize)>) -> Result<Ve
             "{name}: rows {first}.. are not whole entries"
         )));
     }
-    let entries = f.bytes(&coded(f, &format!("{name}.trellis"))?.0)?;
-    let at = first / 128 * entry;
-    let slice = &entries[at..at + count / 128 * entry];
-    Ok(trellis::packed(r.inp, count, r.side as u32, slice))
+    let tensor = coded(f, &format!("{name}.trellis"))?.0;
+    let at = (first / 128 * entry) as u64;
+    let take = count / 128 * entry;
+    let mut out = trellis::alloc_packed(r.inp, count, r.side as u32, take);
+    f.read_into(&tensor, at, &mut out[trellis::HEAD..])?;
+    Ok(out)
 }
 
 /// Matrix `name` as f32 `[out][in]` before its rotations, if any.
