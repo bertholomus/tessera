@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tessera_codegen::Dialect;
-use tessera_engine_settings::Settings;
+use tessera_engine_settings::{Memory, Settings};
 use tessera_gpukit::backend::OnGpu;
 use tessera_gpukit::device::{Device, DeviceBuffer, cached_context, cached_source};
 use tessera_gpukit::launch::{KernelArgs, Launch, launch_1d, launch_grid};
@@ -84,7 +84,13 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         let files = |dir: &PathBuf| Overrides::new(dir.clone(), Dialect::of(D::BACKEND));
         let mut runner = Self {
             ctx,
-            base: Base::new(settings.memory, &ctx.platform()),
+            base: {
+                let mut base = Base::new(settings.memory, &ctx.platform());
+                if settings.memory == Memory::Device {
+                    base.extend_budget(tessera_gpukit::attic::available(settings));
+                }
+                base
+            },
             kernels: Vec::new(),
             planned: Vec::new(),
             overrides: settings.kernels.as_ref().map(files),
@@ -648,10 +654,11 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                 if let Some(g) = sum.as_deref_mut() {
                     g.pause()?;
                 }
-                // The host reads weight files straight into pinned memory.
-                let buffer = match unified && holds == Holds::Weights {
-                    true => DeviceBuffer::pinned(ctx, bytes)?,
-                    false => DeviceBuffer::alloc(ctx, bytes)?,
+                // Weights pin when unified. Kept rows borrow carveout when enabled.
+                let buffer = match holds {
+                    Holds::Weights if unified => DeviceBuffer::pinned(ctx, bytes)?,
+                    Holds::Kept => DeviceBuffer::kept(ctx, bytes)?,
+                    _ => DeviceBuffer::alloc(ctx, bytes)?,
                 };
                 // Kernels may read what they are about to write.
                 buffer.zero()?;

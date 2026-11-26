@@ -65,6 +65,27 @@ impl Drop for Ask {
     }
 }
 
+/// Display-carveout lender settings for `spark-attic`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attic {
+    pub socket: PathBuf,
+    pub key_file: PathBuf,
+}
+
+impl Attic {
+    pub const DEFAULT_SOCKET: &str = "/run/spark-attic/attic.sock";
+    pub const DEFAULT_KEY_FILE: &str = "/etc/spark-attic/key";
+}
+
+impl Default for Attic {
+    fn default() -> Self {
+        Self {
+            socket: PathBuf::from(Self::DEFAULT_SOCKET),
+            key_file: PathBuf::from(Self::DEFAULT_KEY_FILE),
+        }
+    }
+}
+
 /// Settings for the planner, the runners and the tools.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -104,6 +125,8 @@ pub struct Settings {
     pub dump_sites: Option<PathBuf>,
     /// GPU device ordinal. `None` picks device 0.
     pub device: Option<usize>,
+    /// Display-carveout lender settings. `None` turns borrowing off.
+    pub attic: Option<Attic>,
 }
 
 impl Default for Settings {
@@ -128,6 +151,7 @@ impl Default for Settings {
             nvrtc: Vec::new(),
             dump_sites: None,
             device: None,
+            attic: None,
         }
     }
 }

@@ -29,7 +29,10 @@ pub fn run(origin: Option<Origin>, rest: &[String]) -> Result<(), Stop> {
     let manifest = at.and_then(|at| flags.get(at + 1)).map(String::as_str);
     let source = Source::open_as(origin, crate::progress::stderr(), (files, manifest))?;
     let options = source.options(&flags)?;
-    let settings = tessera_frontend_settings::read();
+    let mut settings = tessera_frontend_settings::read();
+    if options.attic && settings.attic.is_none() {
+        settings.attic = Some(tessera_frontend_settings::attic_default());
+    }
     let platform = sizer::platform(&settings);
     let [total, available] = sizer::host();
     let free = sizer::free(&settings);
@@ -50,14 +53,22 @@ pub fn run(origin: Option<Origin>, rest: &[String]) -> Result<(), Stop> {
         out["boot"] = self::boot(options, &settings);
     } else {
         let free = free.unwrap_or(platform.memory);
-        plan(options, (free, platform.integrated), &mut out);
+        plan(
+            options,
+            (free, platform.integrated, sizer::attic(&settings)),
+            &mut out,
+        );
     }
     println!("{out}");
     Ok(())
 }
 
 /// Loads with runners that count bytes, then compares with `free`.
-fn plan(options: tessera_serve::start::Options, (free, integrated): (u64, bool), out: &mut Value) {
+fn plan(
+    options: tessera_serve::start::Options,
+    (free, integrated, attic): (u64, bool, u64),
+    out: &mut Value,
+) {
     sizer::sizing();
     crate::task::load(options);
     let sizes = sizer::sized();
@@ -66,14 +77,19 @@ fn plan(options: tessera_serve::start::Options, (free, integrated): (u64, bool),
         true => (free.min(sizer::host()[1]), sizes.largest),
         false => (free, 0),
     };
+    let saved = sizes.kept.min(attic);
+    let avail = free.saturating_add(saved);
     let need = sizes.weights + sizes.kept + sizes.scratch + copy;
     out["weights"] = sizes.weights.into();
     out["kv"] = sizes.kept.into();
     out["scratch"] = sizes.scratch.into();
     out["load_copy"] = copy.into();
     out["need"] = need.into();
-    out["fits"] = (need <= free).into();
-    out["headroom"] = (free as i64 - need as i64).into();
+    if attic > 0 {
+        out["attic"] = attic.into();
+    }
+    out["fits"] = (need <= avail).into();
+    out["headroom"] = (avail as i64 - need as i64).into();
 }
 
 /// A step's name, start and seconds once it ends.

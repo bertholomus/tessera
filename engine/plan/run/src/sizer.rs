@@ -73,6 +73,14 @@ pub fn free(settings: &Settings) -> Option<u64> {
     device::free(settings)
 }
 
+/// Free display-carveout bytes `atticd` can lend now.
+pub fn attic(settings: &Settings) -> u64 {
+    if settings.gpu() != Some(tessera_engine_settings::Backend::Cuda) {
+        return 0;
+    }
+    tessera_gpukit::attic::available(settings)
+}
+
 /// A runner that counts the bytes `Held` allocates.
 pub(crate) struct Sizer {
     base: Base,

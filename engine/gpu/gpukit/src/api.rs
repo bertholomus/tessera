@@ -158,7 +158,13 @@ pub trait Api: Sync + Sized + 'static {
     fn function(&self, module: Handle, name: &CStr) -> Result<Handle, Error>;
     fn launch(&self, call: &Call) -> Result<(), Error>;
     fn alloc(&self, size: usize) -> Result<u64, Error>;
+    fn alloc_kept(&self, _own: &Self::Own, _device: c_int, size: usize) -> Result<u64, Error> {
+        self.alloc(size)
+    }
     fn free(&self, ptr: u64);
+    fn free_ptr(&self, _own: &Self::Own, _device: c_int, ptr: u64) {
+        self.free(ptr);
+    }
     /// Device bytes free now.
     fn free_memory(&self) -> Result<u64, Error>;
     /// Pinned host memory the device maps: (host, device).
@@ -824,6 +830,10 @@ impl<A: Api> Device for Context<A> {
         self.locked(|a| a.alloc(size))
     }
 
+    fn alloc_kept(&self, size: usize) -> Result<u64, Error> {
+        self.locked(|a| a.alloc_kept(&self.0.own, self.0.device, size))
+    }
+
     fn free_memory(&self) -> Option<u64> {
         // Integrated devices count reclaimable host pages as used.
         if A::describe(self).integrated {
@@ -836,7 +846,7 @@ impl<A: Api> Device for Context<A> {
         let _hold = self.hold();
         // At process exit the context may already be gone.
         if self.set_current().is_ok() {
-            self.0.api.free(ptr);
+            self.0.api.free_ptr(&self.0.own, self.0.device, ptr);
         }
     }
 

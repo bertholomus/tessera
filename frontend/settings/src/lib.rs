@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 use std::path::PathBuf;
-use tessera_engine::{Asks, Backend, Memory, Pick, Reads, Settings};
+use tessera_engine::{Asks, Attic, Backend, Memory, Pick, Reads, Settings};
 
 /// The `TESSERA_` variables.
 #[derive(Deserialize)]
@@ -28,6 +28,10 @@ struct Env {
     nvrtc: Option<String>,
     dump_sites: Option<PathBuf>,
     device: Option<usize>,
+    /// Display-carveout lender: `1`/`on`, `off`, or socket path.
+    attic: Option<String>,
+    /// Key file for the display-carveout lender.
+    attic_key_file: Option<PathBuf>,
 }
 
 /// Reads `TESSERA_` variables. Bad values panic, empty ones are unset.
@@ -91,6 +95,7 @@ pub fn read() -> Settings {
         nvrtc,
         dump_sites: env.dump_sites,
         device: env.device,
+        attic: parse_attic(env.attic.as_deref(), env.attic_key_file, &var),
     }
 }
 
@@ -170,6 +175,41 @@ fn reads(value: &str) -> Reads {
         "direct" => Reads::Direct,
         _ => panic!("TESSERA_READS={value}: want cached or direct"),
     }
+}
+
+/// Default `spark-attic` settings, honoring `SPARK_ATTIC_*` overrides.
+#[allow(clippy::disallowed_methods, reason = "the one sanctioned reader")]
+pub fn attic_default() -> Attic {
+    let var = |k: &str| {
+        std::env::var_os(k)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    Attic {
+        socket: var("SPARK_ATTIC_SOCK").unwrap_or_else(|| PathBuf::from(Attic::DEFAULT_SOCKET)),
+        key_file: var("SPARK_ATTIC_KEY_FILE")
+            .unwrap_or_else(|| PathBuf::from(Attic::DEFAULT_KEY_FILE)),
+    }
+}
+
+/// Parses `TESSERA_ATTIC` and `TESSERA_ATTIC_KEY_FILE`.
+fn parse_attic(
+    value: Option<&str>,
+    key_file: Option<PathBuf>,
+    var: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Option<Attic> {
+    let raw = value?;
+    let socket = match raw {
+        "0" | "off" | "false" => return None,
+        "1" | "on" | "true" => {
+            var("SPARK_ATTIC_SOCK").unwrap_or_else(|| PathBuf::from(Attic::DEFAULT_SOCKET))
+        }
+        other => PathBuf::from(other),
+    };
+    let key_file = key_file
+        .or_else(|| var("SPARK_ATTIC_KEY_FILE"))
+        .unwrap_or_else(|| PathBuf::from(Attic::DEFAULT_KEY_FILE));
+    Some(Attic { socket, key_file })
 }
 
 #[cfg(test)]

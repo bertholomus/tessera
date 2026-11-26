@@ -2,6 +2,8 @@
 
 use std::cell::Cell;
 use std::ffi::c_int;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::driver::{
     self, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
@@ -30,12 +32,15 @@ pub type Module = api::Module<Driver>;
 pub type Kernel = api::Kernel<Driver>;
 pub type Graph = api::Graph<Driver>;
 
-/// The driver context and what the device reports.
+/// Driver context, capabilities and carveout state.
 pub struct Own {
     raw: CUcontext,
+    device: c_int,
     compute_capability: (i32, i32),
     limits: Limits,
     platform: Platform,
+    attic: Mutex<crate::attic::Session>,
+    attic_live: AtomicUsize,
 }
 
 impl Context {
@@ -95,10 +100,13 @@ impl Context {
         });
         let own = Own {
             raw,
+            device,
             compute_capability: (major, minor),
             // The table says whether launches may overlap.
             limits: platform.limits,
             platform,
+            attic: Mutex::new(crate::attic::Session::default()),
+            attic_live: AtomicUsize::new(0),
         };
         let pci = driver
             .device_name(
@@ -206,7 +214,50 @@ impl Api for Driver {
         PROGRAMMATIC.with(|p| p.set(on));
     }
 
+    fn alloc_kept(&self, own: &Own, device: c_int, size: usize) -> Result<u64, Error> {
+        let cfg = crate::attic::current();
+        if cfg.is_some() {
+            let vmm = driver::CudaVmm {
+                driver: self,
+                table: driver::vmm_table(),
+                device,
+            };
+            let mut session = own.attic.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(va) = session.alloc(cfg.as_ref(), &vmm, size) {
+                own.attic_live.fetch_add(1, Ordering::Relaxed);
+                return Ok(va);
+            }
+        }
+        self.alloc(size)
+    }
+
+    fn free_ptr(&self, own: &Own, device: c_int, ptr: u64) {
+        if own.attic_live.load(Ordering::Relaxed) > 0 {
+            let vmm = driver::CudaVmm {
+                driver: self,
+                table: driver::vmm_table(),
+                device,
+            };
+            let mut session = own.attic.lock().unwrap_or_else(|e| e.into_inner());
+            if session.free(&vmm, ptr) {
+                own.attic_live.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        self.free(ptr);
+    }
+
     fn close(&self, own: &Own) {
+        if own.attic_live.load(Ordering::Relaxed) > 0 && self.set_current(own, own.device).is_ok() {
+            let vmm = driver::CudaVmm {
+                driver: self,
+                table: driver::vmm_table(),
+                device: own.device,
+            };
+            let mut session = own.attic.lock().unwrap_or_else(|e| e.into_inner());
+            session.release_all(&vmm);
+            own.attic_live.store(0, Ordering::Relaxed);
+        }
         unsafe { (self.cu_ctx_destroy)(own.raw) };
     }
 

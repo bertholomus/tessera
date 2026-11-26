@@ -4,6 +4,9 @@ mod error;
 pub use ::tessera_platform::{Limits, Platform, platform};
 pub use error::Error;
 
+pub mod attic;
+#[cfg(test)]
+mod attic_test;
 pub mod backend;
 #[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
 pub mod cache;
