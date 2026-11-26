@@ -80,7 +80,7 @@ static __device__ __forceinline__ void pf_turn_slot_blk(
   for (u32 i = tid; i < nt * MX8_V4; i += 256u) { dg[i] = sg4[i]; du[i] = su4[i]; }
 }
 
-template <u32 NT>
+template <tessera::u32 NT>
 static __device__ __forceinline__ void pf_load_turned(
     const u32* x_blk, Pf1Smem& sm, u32 tid, u32 nv4) {
   const uint4* xg = reinterpret_cast<const uint4*>(x_blk);
@@ -97,9 +97,10 @@ static __device__ __forceinline__ void pf_load_turned(
 union alignas(16) Pf1Smem { struct { u32 btab_g[8u * MX8_TILE], btab_u[8u * MX8_TILE], wtiles[1][2048]; } k; float out[64][128]; };
 #endif
 struct alignas(16) Pf2Smem { u32 btab[8u * MX8_TILE], wtiles[2048]; };
+union alignas(16) Pf2OutSmem { Pf2Smem k; tessera::u16 out[64][128]; };
 
 // Transposes MMA accumulators via smem into per-warp row vectors.
-template <u32 NT>
+template <tessera::u32 NT>
 static __device__ __forceinline__ void transpose_acc(
     const float acc[NT][4], float sm_out[64][128], float dst[NT][4], u32 n) {
   u32 tid = threadIdx.x, j = tid >> 5u, lane = tid & 31u;
@@ -117,4 +118,25 @@ static __device__ __forceinline__ void transpose_acc(
     u32 r = (ti << 3u) + j;
     if (r < n) trellis::load4(&sm_out[r][lane << 2u], dst[ti]);
   }
+}
+
+// Stages prefill MMA accumulators as FP16 into shared memory.
+template <tessera::u32 NT>
+static __device__ __forceinline__ void fc2_pf_stage_f16(
+    const float acc[NT][4], tessera::u16 sm_out[64][128], tessera::u32 j, tessera::u32 lane,
+    tessera::u32 n) {
+  tessera::prim::block_sync();
+  tessera::u32 scol = (j << 4u) + (lane >> 2u), rc = (lane & 3u) << 1u;
+  auto to_f16 = [](float v) {
+    tessera::u16 o;
+    asm("{.reg .b16 t; cvt.rn.f16.f32 t, %1; mov.b16 %0, t;}" : "=h"(o) : "f"(v));
+    return o;
+  };
+#pragma unroll
+  for (tessera::u32 ti = 0u; ti < NT; ti++) {
+    tessera::u32 r0 = (ti << 3u) + rc;
+    if (r0 < n) { sm_out[r0][scol] = to_f16(acc[ti][0]); sm_out[r0][scol + 8u] = to_f16(acc[ti][2]); }
+    if (r0 + 1u < n) { sm_out[r0 + 1u][scol] = to_f16(acc[ti][1]); sm_out[r0 + 1u][scol + 8u] = to_f16(acc[ti][3]); }
+  }
+  tessera::prim::block_sync();
 }
