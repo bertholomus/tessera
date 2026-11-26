@@ -58,6 +58,7 @@ pub fn noise(seed: u64, n: usize) -> Vec<f32> {
 }
 
 /// The recipe's `[config.pipeline]` table.
+#[derive(Clone)]
 struct Pipeline {
     /// The text model's layers the transformer reads.
     layers: Vec<u64>,
@@ -77,15 +78,22 @@ impl Pipeline {
     }
 }
 
-/// The models, loaded once. Decoders open per size.
+/// Device memory ceiling below which klein runs stages sequentially.
+const OFFLOAD_LIMIT: u64 = 32 * 1024 * 1024 * 1024;
+
+/// The models, loaded once or per stage on small devices.
 pub struct Klein {
     /// The diffusers repository, in Hugging Face's layout.
     dir: PathBuf,
     settings: Settings,
     config: Overrides,
-    features: Features,
-    flow: Flow,
+    pipeline: Pipeline,
+    tokenizer: Hf,
+    features: Option<Features>,
+    flow: Option<Flow>,
     pictures: HashMap<usize, Pictures>,
+    /// Drop earlier stages between encode, flow, and decode.
+    offload: bool,
     /// Latent tokens a side, at most.
     largest: usize,
     /// Pixels a side per latent token.
@@ -94,6 +102,35 @@ pub struct Klein {
 }
 
 impl Klein {
+    fn open_features(&self, progress: &Progress) -> Result<Features, Error> {
+        let words = [self.dir.join("text_encoder"), self.dir.join("tokenizer")];
+        let encoding = progress.step("text encoder", Unit::Items, None);
+        let features = Features::open(
+            words.each_ref().map(|d| d.as_path()),
+            &self.settings,
+            &self.pipeline.layers,
+            [1, self.pipeline.rows],
+            &self.config.under("text_encoder"),
+            &encoding.progress(),
+        )?;
+        encoding.finish();
+        Ok(features)
+    }
+
+    fn open_flow(&self, progress: &Progress) -> Result<Flow, Error> {
+        let sizes = [1, self.pipeline.rows, self.largest * self.largest];
+        let flowing = progress.step("transformer", Unit::Items, None);
+        let flow = Flow::open(
+            &self.dir,
+            &self.settings,
+            sizes,
+            &self.config,
+            &flowing.progress(),
+        )?;
+        flowing.finish();
+        Ok(flow)
+    }
+
     /// The repository in `dir`, up to `largest` pixels a side.
     pub fn open(
         dir: PathBuf,
@@ -105,37 +142,49 @@ impl Klein {
         let patch = vae::config(&dir, [1, 1], &config)?.scale() as usize;
         let largest = largest / patch;
         let pipeline = Pipeline::read(&config)?;
-        let words = [dir.join("text_encoder"), dir.join("tokenizer")];
-        let encoding = progress.step("text encoder", Unit::Items, None);
-        let features = Features::open(
-            words.each_ref().map(|d| d.as_path()),
-            &settings,
-            &pipeline.layers,
-            [1, pipeline.rows],
-            &config.under("text_encoder"),
-            &encoding.progress(),
-        )?;
-        encoding.finish();
-        let sizes = [1, pipeline.rows, largest * largest];
-        let flowing = progress.step("transformer", Unit::Items, None);
-        let flow = Flow::open(&dir, &settings, sizes, &config, &flowing.progress())?;
-        flowing.finish();
-        Ok(Self {
+        let tokenizer = Hf::open(&dir.join("tokenizer/tokenizer.json"))?;
+        let counting = tessera_engine::sizer::counting();
+        let platform = tessera_engine::sizer::platform(&settings);
+        let offload = platform.integrated && platform.memory <= OFFLOAD_LIMIT;
+        let steps = pipeline.steps;
+        let mut klein = Self {
             dir,
             settings,
             config,
-            features,
-            flow,
+            pipeline,
+            tokenizer,
+            features: None,
+            flow: None,
             pictures: HashMap::new(),
+            offload,
             largest,
             patch,
-            steps: pipeline.steps,
-        })
+            steps,
+        };
+        if offload {
+            if counting {
+                drop(klein.open_features(progress)?);
+                drop(klein.open_flow(progress)?);
+                drop(Pictures::open(
+                    &klein.dir,
+                    &klein.settings,
+                    [largest, 1],
+                    &klein.config,
+                )?);
+            }
+        } else {
+            klein.features = Some(klein.open_features(progress)?);
+            klein.flow = Some(klein.open_flow(progress)?);
+            if counting {
+                let _ = Pictures::open(&klein.dir, &klein.settings, [largest, 1], &klein.config)?;
+            }
+        }
+        Ok(klein)
     }
 
     /// The text model's tokenizer.
     pub fn tokenizer(&self) -> &Hf {
-        self.features.tokenizer()
+        &self.tokenizer
     }
 
     /// A picture `patch * side` pixels a side, from `noise` latents.
@@ -144,13 +193,38 @@ impl Klein {
         if side > self.largest || noise.len() != rows * LATENT {
             return Err(format!("{} noise values for {rows} tokens", noise.len()).into());
         }
-        let text = self.features.encode(&[prompt])?.remove(0);
+        let quiet = Progress::default();
+        if self.offload {
+            self.flow = None;
+            self.pictures.clear();
+        }
+        let text = match &mut self.features {
+            Some(f) => f.encode(&[prompt])?.remove(0),
+            None => {
+                let mut f = self.open_features(&quiet)?;
+                let text = f.encode(&[prompt])?.remove(0);
+                if !self.offload {
+                    self.features = Some(f);
+                }
+                text
+            }
+        };
+        if self.offload {
+            self.features = None;
+        }
         let mut x = noise.to_vec();
+        let flow = match &mut self.flow {
+            Some(f) => f,
+            None => self.flow.insert(self.open_flow(&quiet)?),
+        };
         for pair in sigmas(rows, self.steps).windows(2) {
-            let v = self.flow.velocity(&x, &text, side, pair[0])?;
+            let v = flow.velocity(&x, &text, side, pair[0])?;
             x.iter_mut()
                 .zip(&v)
                 .for_each(|(x, v)| *x += (pair[1] - pair[0]) * v);
+        }
+        if self.offload {
+            self.flow = None;
         }
         let pictures = match self.pictures.entry(side) {
             Entry::Occupied(e) => e.into_mut(),
@@ -161,7 +235,11 @@ impl Klein {
                 &self.config,
             )?),
         };
-        Ok(pictures.decode(&x)?.remove(0))
+        let image = pictures.decode(&x)?.remove(0);
+        if self.offload {
+            self.pictures.clear();
+        }
+        Ok(image)
     }
 }
 

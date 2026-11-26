@@ -36,13 +36,47 @@ impl Add for Sizes {
     }
 }
 
+impl Sizes {
+    fn total(self) -> u64 {
+        self.weights + self.kept + self.scratch + self.largest
+    }
+}
+
+/// Live runner byte counts and their peak sum.
+#[derive(Default)]
+struct Tracked {
+    live: Vec<Option<Sizes>>,
+    peak: Sizes,
+}
+
+impl Tracked {
+    fn record(&mut self, at: usize, sizes: Sizes) {
+        if let Some(entry) = self.live.get_mut(at) {
+            let merged = match *entry {
+                Some(prev) => Sizes {
+                    weights: sizes.weights.max(prev.weights),
+                    kept: sizes.kept.max(prev.kept),
+                    scratch: sizes.scratch,
+                    largest: sizes.largest.max(prev.largest),
+                },
+                None => sizes,
+            };
+            *entry = Some(merged);
+            let now = (self.live.iter().flatten().copied()).fold(Sizes::default(), Add::add);
+            if now.total() >= self.peak.total() {
+                self.peak = now;
+            }
+        }
+    }
+}
+
 /// Each sizing runner's sizes, once sizing is on.
-static SIZED: Mutex<Option<Vec<Sizes>>> = Mutex::new(None);
+static SIZED: Mutex<Option<Tracked>> = Mutex::new(None);
 
 /// From now on, `open` gives runners that only count bytes.
 pub fn sizing() {
     let mut sized = SIZED.lock().expect("sizes");
-    sized.get_or_insert_default();
+    *sized = Some(Tracked::default());
 }
 
 /// Whether `open` gives runners that only count bytes.
@@ -50,11 +84,10 @@ pub fn counting() -> bool {
     SIZED.lock().expect("sizes").is_some()
 }
 
-/// The bytes of every runner opened since `sizing`.
+/// The peak bytes of runners live together since `sizing`.
 pub fn sized() -> Sizes {
     let sized = SIZED.lock().expect("sizes");
-    let all = sized.iter().flatten().copied();
-    all.fold(Sizes::default(), Add::add)
+    sized.as_ref().map_or(Sizes::default(), |t| t.peak)
 }
 
 /// Host memory: total, then available without swapping.
@@ -88,9 +121,9 @@ impl Sizer {
     pub(crate) fn open(plan: &Plan, settings: &Settings) -> Option<Box<dyn Run>> {
         let at = {
             let mut sized = SIZED.lock().expect("sizes");
-            let sized = sized.as_mut()?;
-            sized.push(Sizes::default());
-            sized.len() - 1
+            let tracked = sized.as_mut()?;
+            tracked.live.push(None);
+            tracked.live.len() - 1
         };
         let mut sizer = Sizer {
             base: Base::default(),
@@ -138,11 +171,19 @@ impl Sizer {
         let largest = plan.weights.iter().map(|l| l.slot.bytes() as u64).max();
         sizes.largest = largest.unwrap_or(0);
         let mut sized = SIZED.lock().expect("sizes");
-        if let Some(entry) = sized.as_mut().and_then(|s| s.get_mut(self.at)) {
-            sizes.weights = sizes.weights.max(entry.weights);
-            sizes.kept = sizes.kept.max(entry.kept);
-            sizes.largest = sizes.largest.max(entry.largest);
-            *entry = sizes;
+        if let Some(tracked) = sized.as_mut() {
+            tracked.record(self.at, sizes);
+        }
+    }
+}
+
+impl Drop for Sizer {
+    fn drop(&mut self) {
+        if let Ok(mut sized) = SIZED.lock()
+            && let Some(tracked) = sized.as_mut()
+            && let Some(entry) = tracked.live.get_mut(self.at)
+        {
+            *entry = None;
         }
     }
 }

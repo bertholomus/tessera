@@ -2,16 +2,17 @@
 
 use crate::Error;
 use std::path::Path;
-use tessera_bundle::Message;
-use tessera_bundle::Overrides;
-use tessera_bundle::taps::{Tapped, tapped};
+use tessera_bundle::taps::tapped;
 use tessera_bundle::tokenize::hf::Hf;
+use tessera_bundle::{Message, Overrides, Template};
 use tessera_engine::progress::{Progress, Unit};
 use tessera_engine::{Model, Recipe, Settings, Tensor};
 
 pub struct Features {
     model: Model,
-    tapped: Tapped,
+    tokenizer: Hf,
+    template: Template,
+    pad: u32,
     /// Rows per prompt, pads included.
     rows: usize,
 }
@@ -30,27 +31,33 @@ impl Features {
         let t = tapped(dirs, [seqs as u64, rows as u64], layers, config)?;
         reading.finish();
         let recipe = Recipe {
-            pins: t.pins.clone(),
+            pins: t.pins,
             ..Recipe::default()
         };
-        let graph = t.graph.clone();
-        let model = Model::open_loaded(graph, &recipe, settings, &t.weights, progress)?;
+        let count = t.graph.weights.len() as u32;
+        let compiling = progress.step("compile", Unit::Items, None);
+        let mut model = Model::open(t.graph, &recipe, settings)?;
+        compiling.finish();
+        t.weights
+            .each_counted(progress, count, |_| None, |at, w| model.load_one(at, w))?;
         Ok(Self {
             model,
-            tapped: t,
+            tokenizer: t.tokenizer,
+            template: t.template,
+            pad: t.pad,
             rows,
         })
     }
 
     pub fn tokenizer(&self) -> &Hf {
-        &self.tapped.tokenizer
+        &self.tokenizer
     }
 
     /// The prompt as a user turn, without thinking.
     pub fn ids(&self, prompt: &str) -> Result<Vec<u32>, Error> {
         let message = Message::text("user", prompt);
-        let text = self.tapped.template.render(&[message], false)?;
-        let mut ids = self.tapped.tokenizer.encode_special(&text)?;
+        let text = self.template.render(&[message], false)?;
+        let mut ids = self.tokenizer.encode_special(&text)?;
         ids.truncate(self.rows);
         Ok(ids)
     }
@@ -62,7 +69,7 @@ impl Features {
         for p in prompts {
             let mut ids = self.ids(p)?;
             let len = ids.len().max(1);
-            ids.resize(rows, self.tapped.pad);
+            ids.resize(rows, self.pad);
             tokens.extend(ids);
             for row in 0..rows {
                 let last = row.min(len - 1);
