@@ -88,17 +88,40 @@ impl Model {
         &self,
         mask: Mask,
         scale: f32,
-        [q, k, v]: [&Tensor; 3],
+        qkv: [&Tensor; 3],
         keys: Option<&Tensor>,
     ) -> Tensor {
-        let picked = keys.is_some();
+        self.attend_with(mask, scale, qkv, keys, None)
+    }
+
+    /// Whole-sequence attention with per-head sink logits `[Heads]`.
+    pub fn attend_sinks(
+        &self,
+        mask: Mask,
+        scale: f32,
+        qkv: [&Tensor; 3],
+        keys: Option<&Tensor>,
+        sinks: &Tensor,
+    ) -> Tensor {
+        self.attend_with(mask, scale, qkv, keys, Some(sinks))
+    }
+
+    fn attend_with(
+        &self,
+        mask: Mask,
+        scale: f32,
+        [q, k, v]: [&Tensor; 3],
+        keys: Option<&Tensor>,
+        sinks: Option<&Tensor>,
+    ) -> Tensor {
         let op = Op::Attend(Attend {
             mask,
             scale,
-            picked,
+            picked: keys.is_some(),
             ragged: false,
+            sinks: sinks.is_some(),
         });
-        let args: Vec<&Tensor> = [q, k, v].into_iter().chain(keys).collect();
+        let args: Vec<&Tensor> = [q, k, v].into_iter().chain(keys).chain(sinks).collect();
         push(&self.g, op, &args)
     }
 
@@ -107,19 +130,46 @@ impl Model {
         &self,
         mask: Mask,
         scale: f32,
+        qkv: [&Tensor; 3],
+        by: [&Tensor; 2],
+        keys: Option<&Tensor>,
+    ) -> Tensor {
+        self.attend_rows_with(mask, scale, qkv, by, keys, None)
+    }
+
+    /// Ragged attention with per-head sink logits `[Heads]`.
+    pub fn attend_rows_sinks(
+        &self,
+        mask: Mask,
+        scale: f32,
+        qkv: [&Tensor; 3],
+        by: [&Tensor; 2],
+        keys: Option<&Tensor>,
+        sinks: &Tensor,
+    ) -> Tensor {
+        self.attend_rows_with(mask, scale, qkv, by, keys, Some(sinks))
+    }
+
+    fn attend_rows_with(
+        &self,
+        mask: Mask,
+        scale: f32,
         [q, k, v]: [&Tensor; 3],
         [slots, positions]: [&Tensor; 2],
         keys: Option<&Tensor>,
+        sinks: Option<&Tensor>,
     ) -> Tensor {
         let op = Op::Attend(Attend {
             mask,
             scale,
             picked: keys.is_some(),
             ragged: true,
+            sinks: sinks.is_some(),
         });
         let args: Vec<&Tensor> = [q, k, v, slots, positions]
             .into_iter()
             .chain(keys)
+            .chain(sinks)
             .collect();
         push(&self.g, op, &args)
     }

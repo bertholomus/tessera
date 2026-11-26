@@ -675,16 +675,22 @@ impl Context<'_> {
             Op::Weight(i) => weight(&self.weights[*i as usize]),
             Op::Matmul => cpu::matmul(num, args[0], args[1]),
             Op::Attend(a) if a.ragged => {
-                let keys = args.get(5).copied();
+                let keys = a.ids_arg().map(|i| args[i]);
+                let sinks = a.sinks_arg().map(|i| args[i]);
                 cpu::attend_rows(
                     num,
                     a,
                     [args[0], args[1], args[2]],
                     [args[3], args[4]],
                     keys,
+                    sinks,
                 )
             }
-            Op::Attend(a) => cpu::attend(num, a, [args[0], args[1], args[2]], args.get(3).copied()),
+            Op::Attend(a) => {
+                let keys = a.ids_arg().map(|i| args[i]);
+                let sinks = a.sinks_arg().map(|i| args[i]);
+                cpu::attend(num, a, [args[0], args[1], args[2]], keys, sinks)
+            }
             Op::Conv(c) => cpu::conv(args[0], args[1], c.dilation as usize),
             Op::Delta(d) => cpu::delta(num, d, [args[0], args[1], args[2], args[3], args[4]]),
             Op::Mask(mask) => masked(*mask, args[0]),

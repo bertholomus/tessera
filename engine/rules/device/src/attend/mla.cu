@@ -124,15 +124,29 @@ static __device__ __forceinline__ void attn_store_partials(
         part[ob + WIDTH] = m[tid]; part[ob + WIDTH + 1u] = l[tid];
     }
 }
+static __device__ __forceinline__ void attn_init_head_state(
+    float& m, float& l, const float* sinks, u32 has_sinks, u32 split, u32 h) {
+    if (has_sinks != 0u && split == 0u) {
+        float sv = sinks[h];
+        m = sv;
+        l = (sv > attn_neg_inf()) ? 1.0f : 0.0f;
+    } else {
+        m = attn_neg_inf();
+        l = 0.0f;
+    }
+}
 template <u32 WIDTH, u32 STRIDE, u32 NTH>
 static __device__ __forceinline__ void attn_store_empty(
-    float* part, u32 row, u32 heads, u32 h0, u32 nh, u32 split, u32 splits, u32 tid) {
+    float* part, const float* sinks, u32 has_sinks, u32 row, u32 heads, u32 h0, u32 nh, u32 split,
+    u32 splits, u32 tid) {
     if (splits == 1u) {
         float* base = part + u64(row * heads + h0) * WIDTH;
         for (u32 q = tid; q < nh * (WIDTH >> 2); q += NTH) reinterpret_cast<float4*>(base)[q] = make_float4(0.f, 0.f, 0.f, 0.f);
     } else if (tid < nh) {
         u64 ob = (u64(row * heads + h0 + tid) * splits + split) * STRIDE;
-        part[ob + WIDTH] = attn_neg_inf(); part[ob + WIDTH + 1u] = 0.0f;
+        float m, l;
+        attn_init_head_state(m, l, sinks, has_sinks, split, h0 + tid);
+        part[ob + WIDTH] = m; part[ob + WIDTH + 1u] = l;
     }
 }
 
@@ -188,8 +202,9 @@ static __device__ __forceinline__ void mla_prefetch_fp8(const u8* kv, const u32*
 template <u32 KV_FMT>
 static __device__ __forceinline__ void mla_attend_body(
     const float* q, const void* kv_ptr, const u32* ids, const u32* slots, const u32* positions,
-    float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 picks, u32 from_list,
-    u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift, mla_smem& sm) {
+    const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads,
+    u32 picks, u32 from_list, u32 before, u32 after, u32 splits, const u32* page_table,
+    u32 page_shift, u32 has_sinks, mla_smem& sm) {
     u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
     u32 wg = warp >> 2, wl = warp & 3u, hgroups = heads >> 4;
     u32 split = blockIdx.x, rb = blockIdx.y / hgroups, hg = blockIdx.y % hgroups;
@@ -210,7 +225,7 @@ static __device__ __forceinline__ void mla_attend_body(
         }
         sm.stop = stop;
     }
-    if (tid < 16u) { sm.m[tid] = attn_neg_inf(); sm.l[tid] = 0.0f; }
+    if (tid < 16u) { attn_init_head_state(sm.m[tid], sm.l[tid], sinks, has_sinks, split, h0 + tid); }
     prim::block_sync();
     u32 stop = sm.stop, total_p = (stop > start) ? (stop - start) : 0u;
     u32 per = ((((total_p + 31u) >> 5) + splits - 1u) / splits) << 5;
@@ -218,7 +233,7 @@ static __device__ __forceinline__ void mla_attend_body(
     if (p_begin > stop) p_begin = stop;
     if (p_end > stop) p_end = stop;
     if (p_begin >= p_end) {
-        attn_store_empty<576u, 580u, 256u>(part, row, heads, h0, 16u, split, splits, tid);
+        attn_store_empty<576u, 580u, 256u>(part, sinks, has_sinks, row, heads, h0, 16u, split, splits, tid);
         return;
     }
     constexpr bool USE_BF16 = (KV_FMT == 1u);
@@ -347,9 +362,9 @@ static __device__ __forceinline__ void mla_attend_body(
 }
 
 #define MLA_DEF(NAME, T, FMT) \
-    extern "C" __global__ __launch_bounds__(256, 2) void NAME(const float* q, const T* kv, const u32* ids, const u32* slots, const u32* positions, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 picks, u32 from_list, u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift) { \
+    extern "C" __global__ __launch_bounds__(256, 2) void NAME(const float* q, const T* kv, const u32* ids, const u32* slots, const u32* positions, const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 picks, u32 from_list, u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift, u32 has_sinks) { \
         __shared__ mla_smem sm; \
-        mla_attend_body<FMT>(q, kv, ids, slots, positions, part, scale, rows, keys, context, heads, picks, from_list, before, after, splits, page_table, page_shift, sm); \
+        mla_attend_body<FMT>(q, kv, ids, slots, positions, sinks, part, scale, rows, keys, context, heads, picks, from_list, before, after, splits, page_table, page_shift, has_sinks, sm); \
     }
 
 MLA_DEF(tessera_mla_attend_fp8, u8, 0u)
@@ -418,8 +433,9 @@ static __device__ __forceinline__ void gqa_stage_vec(const void* ptr, u64 rb, u3
 template <u32 KV_FMT>
 static __device__ __forceinline__ void gqa_attend_body(
     const float* q, const void* k_ptr, const void* v_ptr, const u32* slots, const u32* positions,
-    float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 kv_heads, u32 before,
-    u32 after, u32 splits, const u32* page_table, u32 page_shift, gqa_smem& sm) {
+    const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads,
+    u32 kv_heads, u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift,
+    u32 has_sinks, gqa_smem& sm) {
     u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
     u32 gqa = heads / kv_heads, nh = (gqa < 16u) ? gqa : 16u, per_kv = (gqa + 15u) >> 4;
     u32 kg_groups = kv_heads * per_kv, split = blockIdx.x, rb = blockIdx.y / kg_groups, kg = blockIdx.y % kg_groups;
@@ -434,7 +450,7 @@ static __device__ __forceinline__ void gqa_attend_body(
     if (p_begin > to) p_begin = to;
     if (p_end > to) p_end = to;
     if (p_begin >= p_end) {
-        attn_store_empty<128u, 132u, 128u>(part, row, heads, h0, nh, split, splits, tid);
+        attn_store_empty<128u, 132u, 128u>(part, sinks, has_sinks, row, heads, h0, nh, split, splits, tid);
         return;
     }
     u32 tk = tid >> 3, lane8 = tid & 7u;
@@ -449,7 +465,9 @@ static __device__ __forceinline__ void gqa_attend_body(
         *reinterpret_cast<uint2*>(&sm.q[tk][q4 * 2u]) = v;
     }
     if (tid < 16u) {
-        sm.m[tid] = attn_neg_inf(); sm.l[tid] = 0.0f; sm.corr[tid] = 0.0f;
+        if (tid < nh) { attn_init_head_state(sm.m[tid], sm.l[tid], sinks, has_sinks, split, h0 + tid); }
+        else { sm.m[tid] = attn_neg_inf(); sm.l[tid] = 0.0f; }
+        sm.corr[tid] = 0.0f;
 #pragma unroll
         for (u32 c = 0u; c < 8u; c++) sm.p16[tid][c] = 0u;
     }
@@ -479,9 +497,9 @@ static __device__ __forceinline__ void gqa_attend_body(
 }
 
 #define GQA_DEF(NAME, T, FMT) \
-    extern "C" __global__ __launch_bounds__(128, 4) void NAME(const float* q, const T* k, const T* v, const u32* slots, const u32* positions, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 kv_heads, u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift) { \
+    extern "C" __global__ __launch_bounds__(128, 4) void NAME(const float* q, const T* k, const T* v, const u32* slots, const u32* positions, const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 kv_heads, u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift, u32 has_sinks) { \
         __shared__ gqa_smem sm; \
-        gqa_attend_body<FMT>(q, k, v, slots, positions, part, scale, rows, keys, context, heads, kv_heads, before, after, splits, page_table, page_shift, sm); \
+        gqa_attend_body<FMT>(q, k, v, slots, positions, sinks, part, scale, rows, keys, context, heads, kv_heads, before, after, splits, page_table, page_shift, has_sinks, sm); \
     }
 
 GQA_DEF(tessera_gqa_attend_fp8, u8, 0u)

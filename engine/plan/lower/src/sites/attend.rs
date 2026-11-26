@@ -77,7 +77,7 @@ impl Pattern for Attend {
                 rows: Some([node.args[3], node.args[4]]),
             });
         }
-        if a.picked {
+        if a.picked || a.sinks {
             return None;
         }
         Self::whole(tree, at)
@@ -101,6 +101,9 @@ impl Attend {
         let Term::Op(Op::Attend(a)) = &node.term else {
             return None;
         };
+        if a.sinks {
+            return None;
+        }
         let wide = |t: T| &tree.node(t).shape;
         let (q, k, v) = (node.args[0], node.args[1], node.args[2]);
         if wide(v).last() != wide(q).last() {

@@ -4,9 +4,8 @@ use tessera_codegen::kept::{self, Dense, Layout};
 use tessera_codegen::prelude::*;
 use tessera_graph::{Op, Order};
 use tessera_lower::form::{Load as Stored, plain, writable};
-use tessera_lower::sites::Attend;
 use tessera_lower::{
-    Arg, Attn, Draft, Extent, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Term, Tree,
+    Arg, Draft, Extent, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Term, Tree,
 };
 
 /// Elements one wide load brings per lane.
@@ -36,6 +35,7 @@ fn listed_attend(
     ids: Buf<U32>,
     slots: Buf<U32>,
     positions: Buf<U32>,
+    sinks: Buf<F32>,
     #[form(out_form)] mut out: BufMut<Dyn>,
     scale: f32,
     lists: u32,
@@ -48,6 +48,7 @@ fn listed_attend(
     from_list: u32,
     before: u32,
     after: u32,
+    has_sinks: u32,
     #[build] width: u32,
     #[build] q_form: &'static dyn Stored,
     #[build] k_form: &'static dyn Stored,
@@ -179,13 +180,20 @@ fn listed_attend(
         }
     }
     barrier();
-    let mut best = f32::NEG_INFINITY;
+    let mut sink = f32::NEG_INFINITY;
+    if has_sinks == 1 {
+        sink = sinks[head as u64];
+    }
+    let mut best = sink;
     for w in 0..WARPS {
         if l_s[w] > 0.0 {
             best = max(best, m_s[w]);
         }
     }
     let mut denom = 0.0f32;
+    if has_sinks == 1 && sink > f32::NEG_INFINITY {
+        denom = exp(sink - best);
+    }
     for w in 0..WARPS {
         if l_s[w] > 0.0 {
             denom += l_s[w] * exp(m_s[w] - best);
@@ -271,12 +279,25 @@ fn listed_scores(
 
 /// One thread per list: peak, total, and kept picks.
 #[kernel]
-fn listed_stats(scores: Buf<F32>, mut out: BufMut<F32>, len: u32, picks: u32) {
+fn listed_stats(
+    scores: Buf<F32>,
+    sinks: Buf<F32>,
+    mut out: BufMut<F32>,
+    len: u32,
+    picks: u32,
+    heads: u32,
+    has_sinks: u32,
+) {
     if gid() >= len {
         return;
     }
+    let head = gid() % heads;
     let at = gid() as u64 * picks as u64;
-    let mut peak = f32::NEG_INFINITY;
+    let mut sink = f32::NEG_INFINITY;
+    if has_sinks == 1 {
+        sink = sinks[head as u64];
+    }
+    let mut peak = sink;
     let mut end = 0u32;
     for p in 0..picks {
         let score = scores[at + p as u64];
@@ -286,6 +307,9 @@ fn listed_stats(scores: Buf<F32>, mut out: BufMut<F32>, len: u32, picks: u32) {
         }
     }
     let mut total = 0.0f32;
+    if has_sinks == 1 && sink > f32::NEG_INFINITY {
+        total = exp(sink - peak);
+    }
     for p in 0..end {
         let score = scores[at + p as u64];
         if score > f32::NEG_INFINITY {
@@ -375,6 +399,7 @@ pub(crate) struct Sizes {
     pub ragged: bool,
     /// Without a list, pick `p` is key `p`.
     pub from_list: bool,
+    pub has_sinks: bool,
     pub scale: f32,
     /// Keys a query sees before and after its position.
     pub window: (usize, usize),
@@ -449,7 +474,7 @@ impl Sizes {
     }
 
     /// Three-pass listed attention for any backend.
-    fn passes(self, [q, k, v, ids, slots, positions]: [T; 6]) -> Vec<Draft> {
+    fn passes(self, [q, k, v, ids, slots, positions, sinks]: [T; 7]) -> Vec<Draft> {
         let mix = [
             Read::Draft(0),
             Read::Draft(1),
@@ -463,7 +488,11 @@ impl Sizes {
                 [q, k, ids, slots, positions],
                 self.scores(),
             ),
-            Draft::new(ListedStats(self), [Read::Draft(0)], self.lists() * 3),
+            Draft::new(
+                ListedStats(self),
+                [Read::Draft(0), Read::Node(sinks)],
+                self.lists() * 3,
+            ),
             Draft::new(ListedMix(self), mix, self.len),
         ]
     }
@@ -483,7 +512,7 @@ impl Sizes {
     }
 
     /// Single-launch split-K attention when width fits.
-    fn fused(self, reads: [T; 6]) -> Option<Vec<Draft>> {
+    fn fused(self, reads: [T; 7]) -> Option<Vec<Draft>> {
         self.check_fused().ok()?;
         Some(vec![Draft::new(ListedAttend(self), reads, self.len)])
     }
@@ -510,6 +539,9 @@ fn attend_accepts(k: &ListedAttend, input: usize, form: &dyn Stored) -> bool {
         0 => form.name() == k.0.q_form.name(),
         1 => form.name() == k.0.k_form.name(),
         2 => form.name() == k.0.v_form.name(),
+        3 if !k.0.from_list => true,
+        4 | 5 if !k.0.ragged => true,
+        6 if !k.0.has_sinks => true,
         _ => !form.narrow(),
     }
 }
@@ -556,6 +588,7 @@ fn attend_launches(k: &ListedAttend, step: &Step) -> Vec<Launch> {
         usize::from(s.from_list),
         s.window.0,
         s.window.1,
+        usize::from(s.has_sinks),
     ];
     args.extend(counts.into_iter().map(Arg::count));
     args.extend(s.kept_scalars());
@@ -578,6 +611,8 @@ fn scores_accepts(k: &ListedScores, input: usize, form: &dyn Stored) -> bool {
     match input {
         0 => form.name() == k.0.q_form.name(),
         1 => form.name() == k.0.k_form.name(),
+        2 if !k.0.from_list => true,
+        3 | 4 if !k.0.ragged => true,
         _ => !form.narrow(),
     }
 }
@@ -603,13 +638,25 @@ fn scores_launches(k: &ListedScores, step: &Step) -> Vec<Launch> {
     name = "listed_stats",
     sizes = [self.0.len, self.0.picks],
     work = self.0.scores(),
+    accepts = stats_accepts,
     launches = stats_launches,
 )]
 pub(crate) struct ListedStats(pub Sizes);
 
+fn stats_accepts(k: &ListedStats, input: usize, form: &dyn Stored) -> bool {
+    match input {
+        1 if !k.0.has_sinks => true,
+        _ => !form.narrow(),
+    }
+}
+
 fn stats_launches(k: &ListedStats, step: &Step) -> Vec<Launch> {
     let len = k.0.lists();
-    vec![Launch::plain(step, &[len, k.0.picks], Shape::Line(len))]
+    vec![Launch::plain(
+        step,
+        &[len, k.0.picks, k.0.heads, usize::from(k.0.has_sinks)],
+        Shape::Line(len),
+    )]
 }
 
 /// The softmax of the scores over the listed values.
@@ -628,6 +675,8 @@ pub(crate) struct ListedMix(pub Sizes);
 fn mix_accepts(k: &ListedMix, input: usize, form: &dyn Stored) -> bool {
     match input {
         2 => form.name() == k.0.v_form.name(),
+        3 if !k.0.from_list => true,
+        4 if !k.0.ragged => true,
         _ => !form.narrow(),
     }
 }
@@ -647,53 +696,97 @@ fn mix_launches(k: &ListedMix, step: &Step) -> Vec<Launch> {
     k.0.launch(step, k.0.len, None)
 }
 
-/// Ragged rows over kept or computed keys.
-fn rows(tree: &Tree, at: T) -> Option<(Sizes, [T; 6])> {
+/// Ragged or whole attention with listed keys or sinks.
+fn site(tree: &Tree, at: T) -> Option<(Sizes, [T; 7])> {
     let node = tree.node(at);
     let Term::Op(Op::Attend(a)) = &node.term else {
         return None;
     };
     let (q, k, v) = (node.args[0], node.args[1], node.args[2]);
-    if !a.ragged {
-        return None;
-    }
     let wide = |t: T| &tree.node(t).shape;
-    let (&[rows, heads, width], &[seqs, most, kv_heads, _]) = (&wide(q)[..], &wide(k)[..]) else {
+    let &[seqs, most, kv_heads, _] = &wide(k)[..] else {
         return None;
+    };
+    let (len, queries, heads, width, keys, context, kept, fallback) = if a.ragged {
+        let &[rows, heads, width] = &wide(q)[..] else {
+            return None;
+        };
+        let (kept, context): (&'static dyn Layout, usize) =
+            match (&tree.node(k).term, &tree.node(v).term) {
+                (Term::Op(Op::Append(ki)), Term::Op(Op::Append(vi))) => {
+                    let (_, ctx) = tree.kept_rows(*ki)?;
+                    if tree.kept_rows(*vi)?.1 != ctx {
+                        return None;
+                    }
+                    (tree.kept, ctx)
+                }
+                (Term::Op(Op::Append(_)), _) | (_, Term::Op(Op::Append(_))) => return None,
+                _ => (&Dense, most),
+            };
+        (
+            rows * heads * width,
+            1,
+            heads,
+            width,
+            tree.node(k).extents[1],
+            context,
+            kept,
+            node.args[4],
+        )
+    } else {
+        if !a.picked && !a.sinks {
+            return None;
+        }
+        let &[_, queries, heads, width] = &wide(q)[..] else {
+            return None;
+        };
+        let keys_ext = tree.node(k).extents[1];
+        if keys_ext.runtime() || tree.kept.run(keys_ext.most()) < keys_ext.most() {
+            return None;
+        }
+        let keys = keys_ext.most();
+        (
+            seqs * queries * heads * width,
+            queries,
+            heads,
+            width,
+            Extent::Fixed(keys),
+            keys,
+            &Dense as &dyn Layout,
+            q,
+        )
     };
     if wide(v).last() != Some(&width) {
         return None;
     }
-    let (kept, context): (&'static dyn Layout, usize) =
-        match (&tree.node(k).term, &tree.node(v).term) {
-            (Term::Op(Op::Append(ki)), Term::Op(Op::Append(vi))) => {
-                let (_, ctx) = tree.kept_rows(*ki)?;
-                if tree.kept_rows(*vi)?.1 != ctx {
-                    return None;
-                }
-                (tree.kept, ctx)
-            }
-            (Term::Op(Op::Append(_)), _) | (_, Term::Op(Op::Append(_))) => return None,
-            _ => (&Dense, most),
-        };
-    let [slots, positions] = [node.args[3], node.args[4]];
-    let (ids, picks) = match node.args.get(5) {
-        Some(&ids) => (ids, *wide(ids).last()?),
-        None => (positions, most),
+    let (ids, picks) = match a.ids_arg() {
+        Some(i) => {
+            let ids = node.args[i];
+            (ids, *wide(ids).last()?)
+        }
+        None => (fallback, most),
     };
+    // Unread buffers stand in for absent slots or ids.
+    let [slots, positions] = if a.ragged {
+        [node.args[3], node.args[4]]
+    } else {
+        [ids, ids]
+    };
+    let sinks = a.sinks_arg().map_or(q, |i| node.args[i]);
     let sizes = Sizes {
-        len: rows * heads * width,
+        len,
         seqs,
-        queries: 1,
-        keys: tree.node(k).extents[1],
+        queries,
+        keys,
         context,
         kept,
         heads,
         kv_heads,
         width,
         picks,
-        ragged: true,
+        ragged: a.ragged,
         from_list: a.picked,
+        has_sinks: a.sinks,
         scale: a.scale,
         window: a.mask.window(most),
         q_form: plain(tree.node(q).form),
@@ -701,42 +794,7 @@ fn rows(tree: &Tree, at: T) -> Option<(Sizes, [T; 6])> {
         v_form: plain(tree.node(v).form),
         out_form: writable(node.form),
     };
-    Some((sizes, [q, k, v, ids, slots, positions]))
-}
-
-/// Sequences whose keys are all present, under any mask.
-fn whole((site, ids, picks): (Attend, T, usize)) -> (Sizes, [T; 6]) {
-    let a: Attn = site.sizes;
-    let keys = a.keys.most();
-    let sizes = Sizes {
-        len: a.seqs * a.queries * a.heads * a.width,
-        seqs: a.seqs,
-        queries: a.queries,
-        keys: Extent::Fixed(keys),
-        context: keys,
-        kept: &Dense,
-        heads: a.heads,
-        kv_heads: a.kv_heads,
-        width: a.width,
-        picks,
-        ragged: false,
-        from_list: true,
-        scale: site.scale,
-        window: a.mask.window(keys),
-        q_form: site.q_form,
-        k_form: a.k_form,
-        v_form: a.v_form,
-        out_form: a.out_form,
-    };
-    // Slots and positions go unread, so the list stands in.
-    (sizes, [site.q, site.k, site.v, ids, ids, ids])
-}
-
-fn site(tree: &Tree, at: T) -> Option<(Sizes, [T; 6])> {
-    match Attend::listed(tree, at) {
-        Some(found) => Some(whole(crate::fixed_list(tree, found)?)),
-        None => rows(tree, at),
-    }
+    Some((sizes, [q, k, v, ids, slots, positions, sinks]))
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
