@@ -1,7 +1,8 @@
-use crate::mocks::{MockGenerator, json, loaded};
+use crate::mocks::{MockGenerator, call, json, loaded, loaded_with};
 use crate::wire::ResponseFormat;
 use serde_json::json;
 use std::sync::Arc;
+use tessera_bundle::ResponseParser;
 use tessera_tasks::api::Format;
 
 #[test]
@@ -167,4 +168,38 @@ fn tool_choice_validation() {
     });
     let (status, error) = json(&slot, "/v1/chat/completions", Some(req_body));
     assert_eq!((status, &error["error"]["param"]), (400, &json!("tools")));
+}
+
+#[test]
+fn caps_parallel_calls() {
+    let cfg = r#"{"response_template":{"fields":{"tool_calls":{
+      "open_pattern":"<tool_call>\\s*(?P<name>[^<\\s]+)","close":"</tool_call>","content":"tags",
+      "content_args":{"pattern":"<arg_key>(?P<key>[\\s\\S]*?)</arg_key>\\s*<arg_value>(?P<value>[\\s\\S]*?)</arg_value>"},
+      "transform":{"type":"function","function":{"name":"{name}","arguments":"{content}"}}}}}}"#;
+    let parser = ResponseParser::from_config(cfg).unwrap().unwrap();
+    let mock = Arc::new(MockGenerator {
+        pieces: vec![
+            "<tool_call>ping<arg_key>a</arg_key><arg_value>one</arg_value></tool_call>".into(),
+            "<tool_call>ping<arg_key>a</arg_key><arg_value>two</arg_value></tool_call>".into(),
+        ],
+        ..MockGenerator::default()
+    });
+    let slot = loaded_with(&mock, true, Some(parser));
+    let tool = json!({"type": "function", "function": {"name": "ping"}});
+    let mut body = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [tool],
+        "parallel_tool_calls": false,
+    });
+    let (status, got) = json(&slot, "/v1/chat/completions", Some(body.clone()));
+    assert_eq!(status, 200);
+    let calls = got["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["function"]["arguments"], "{\"a\":\"one\"}");
+    body["stream"] = json!(true);
+    let (s_status, sse) = call(&slot, "/v1/chat/completions", Some(body));
+    assert_eq!(s_status, 200);
+    assert!(sse.contains(r#"\"one\""#) && !sse.contains(r#"\"two\""#));
 }
