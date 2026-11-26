@@ -3,6 +3,43 @@ use crate::mocks::{MockGenerator, call, json, loaded};
 use serde_json::json;
 use std::sync::{Arc, OnceLock};
 
+fn auth_status(method: &str, path: &str, hdr: Option<(&str, &str)>) -> Option<u16> {
+    let headers = hdr.into_iter().map(|(a, b)| (a.into(), b.into())).collect();
+    let req = crate::http::Request {
+        method: method.into(),
+        path: path.into(),
+        query: String::new(),
+        headers,
+        body: Vec::new(),
+    };
+    crate::start::check_auth("k", &req).map(|r| r.status)
+}
+
+#[test]
+fn api_key_auth() {
+    let mut o = crate::start::Options::default();
+    assert!(o.flag("--api-key", String::new()).is_none());
+    assert!(o.flag("--api-key", "k".into()).is_some());
+    assert_eq!(auth_status("GET", "/health", None), None);
+    assert_eq!(auth_status("POST", "/v1/chat/completions", None), Some(401));
+    assert_eq!(
+        auth_status("POST", "/v1/messages", Some(("x-api-key", "x"))),
+        Some(401)
+    );
+    assert_eq!(
+        auth_status(
+            "POST",
+            "/v1/chat/completions",
+            Some(("authorization", "Bearer k"))
+        ),
+        None
+    );
+    assert_eq!(
+        auth_status("POST", "/v1/messages", Some(("x-api-key", "k"))),
+        None
+    );
+}
+
 #[test]
 fn health_waits() {
     let empty: Slot = Arc::new(OnceLock::new());
