@@ -73,6 +73,10 @@ pub struct Pool {
     /// Each page's holders: live runs, then retained runs.
     live: Vec<u32>,
     kept: Vec<u32>,
+    /// Pages held by at least one live run.
+    active: usize,
+    /// Pages held only by retained runs.
+    reclaimable: usize,
     free: BTreeSet<u32>,
     slots: Vec<Slot>,
     retirements: u64,
@@ -85,6 +89,8 @@ impl Pool {
             page,
             live: vec![0; pages],
             kept: vec![0; pages],
+            active: 0,
+            reclaimable: 0,
             free: (0..pages as u32).collect(),
             slots: Vec::new(),
             retirements: 0,
@@ -105,9 +111,7 @@ impl Pool {
 
     /// Free pages, and pages that only retained runs hold.
     pub fn spare(&self) -> usize {
-        let reclaimable = self.live.iter().zip(&self.kept);
-        let reclaimable = reclaimable.filter(|&(l, k)| *l == 0 && *k > 0).count();
-        self.free.len() + reclaimable
+        self.free.len() + self.reclaimable
     }
 
     /// Pages live runs may take before their worst case.
@@ -119,10 +123,9 @@ impl Pool {
     }
 
     pub fn stats(&self) -> Stats {
-        let held = self.live.iter().filter(|l| **l > 0).count();
         let mut stats = Stats {
             size: self.live.len() * self.page,
-            active: held * self.page,
+            active: self.active * self.page,
             ..Stats::default()
         };
         for run in self.slots.iter().filter_map(|s| s.run.as_ref()) {
@@ -176,8 +179,8 @@ impl Pool {
         let need = self.span(worst) - shared.len() + mine as usize + theirs as usize;
         self.fits(need, lost)?;
         let (tag, pages) = (src.tag, shared.to_vec());
-        for p in &pages {
-            self.live[*p as usize] += 1;
+        for &p in &pages {
+            self.hold_live(p);
         }
         let run = Run {
             tag,
@@ -197,7 +200,9 @@ impl Pool {
             return Ok(());
         }
         let extra = self.span(worst).saturating_sub(self.span(cur));
-        self.fits(extra, 0)?;
+        if extra > 0 {
+            self.fits(extra, 0)?;
+        }
         self.run_mut(at).worst = worst;
         debug_assert!(self.consistent());
         Ok(())
@@ -218,7 +223,7 @@ impl Pool {
         let last = self.run_mut(at).pages.last().copied();
         if let Some(from) = last.filter(|p| written > 0 && self.holders(*p) > 1) {
             let to = self.take();
-            self.live[from as usize] -= 1;
+            self.unhold(from, false);
             *self.run_mut(at).pages.last_mut().expect("a last page") = to;
             copies.push(PageCopy {
                 from,
@@ -264,11 +269,10 @@ impl Pool {
         let at = self.live_at(run)?;
         self.retirements += 1;
         let retired = self.retirements;
-        let r = self.run_mut(at);
-        r.retired = Some(retired);
-        for p in r.pages.clone() {
-            self.live[p as usize] -= 1;
-            self.kept[p as usize] += 1;
+        self.run_mut(at).retired = Some(retired);
+        for i in 0..self.run_at(at).pages.len() {
+            let p = self.run_at(at).pages[i];
+            self.live_to_kept(p);
         }
         debug_assert!(self.consistent());
         Ok(())
@@ -297,9 +301,9 @@ impl Pool {
         }
         let r = self.run_mut(at);
         (r.rows, r.worst, r.retired) = (rows, worst, None);
-        for p in r.pages.clone() {
-            self.kept[p as usize] -= 1;
-            self.live[p as usize] += 1;
+        for i in 0..self.run_at(at).pages.len() {
+            let p = self.run_at(at).pages[i];
+            self.kept_to_live(p);
         }
         // The retained id is now stale.
         self.slots[at].generation += 1;
@@ -383,6 +387,7 @@ impl Pool {
             self.end(at);
         };
         self.live[page as usize] = 1;
+        self.active += 1;
         page
     }
 
@@ -395,14 +400,56 @@ impl Pool {
         }
     }
 
+    fn hold_live(&mut self, page: u32) {
+        let at = page as usize;
+        if self.live[at] == 0 {
+            self.active += 1;
+            if self.kept[at] > 0 {
+                self.reclaimable -= 1;
+            }
+        }
+        self.live[at] += 1;
+    }
+
+    fn live_to_kept(&mut self, page: u32) {
+        let at = page as usize;
+        self.live[at] -= 1;
+        self.kept[at] += 1;
+        if self.live[at] == 0 {
+            self.active -= 1;
+            self.reclaimable += 1;
+        }
+    }
+
+    fn kept_to_live(&mut self, page: u32) {
+        let at = page as usize;
+        let was_only_kept = self.live[at] == 0;
+        self.kept[at] -= 1;
+        self.live[at] += 1;
+        if was_only_kept {
+            self.active += 1;
+            self.reclaimable -= 1;
+        }
+    }
+
     fn unhold(&mut self, page: u32, retained: bool) {
-        let count = match retained {
-            true => &mut self.kept[page as usize],
-            false => &mut self.live[page as usize],
-        };
-        *count -= 1;
-        if self.holders(page) == 0 {
-            self.free.insert(page);
+        let at = page as usize;
+        if retained {
+            self.kept[at] -= 1;
+            if self.live[at] == 0 && self.kept[at] == 0 {
+                self.reclaimable -= 1;
+                self.free.insert(page);
+            }
+            return;
+        }
+        self.live[at] -= 1;
+        if self.live[at] == 0 {
+            self.active -= 1;
+            if self.kept[at] > 0 {
+                self.reclaimable += 1;
+            } else {
+                self.free.insert(page);
+            }
         }
     }
 
@@ -456,8 +503,16 @@ impl Pool {
         }
         let free =
             (0..self.live.len() as u32).filter(|p| live[*p as usize] + kept[*p as usize] == 0);
+        let active = live.iter().filter(|l| **l > 0).count();
+        let reclaimable = live
+            .iter()
+            .zip(&kept)
+            .filter(|&(l, k)| *l == 0 && *k > 0)
+            .count();
         live == self.live
             && kept == self.kept
+            && active == self.active
+            && reclaimable == self.reclaimable
             && free.eq(self.free.iter().copied())
             && self.promised() <= self.spare()
     }
