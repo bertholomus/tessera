@@ -1,4 +1,4 @@
-use crate::hub::{exlr8_files, manifest_widths, safe_path, wanted};
+use crate::hub::{exlr8_files, has_weights, manifest_widths, safe_path, wanted};
 
 fn owned(list: &[&str]) -> Vec<String> {
     list.iter().map(|n| n.to_string()).collect()
@@ -34,6 +34,10 @@ fn plain_repo() {
         "onnx/config.json",
     ]);
     assert_eq!(wanted(&names, None), ["config.json", "model.safetensors"]);
+    let pt_only = owned(&["config.json", "model.pt", "README.md"]);
+    assert_eq!(wanted(&pt_only, None), ["config.json", "model.pt"]);
+    assert!(has_weights(&["config.json", "model.pt"]));
+    assert!(!has_weights(&["config.json", "README.md"]));
     assert!(safe_path("vae/config.json"));
     for bad in ["../x.json", "a/../b.json", "/etc/x.json", "a\\b.json"] {
         assert!(!safe_path(bad), "{bad}");
