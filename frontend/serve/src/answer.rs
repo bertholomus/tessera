@@ -21,6 +21,7 @@ enum Kind {
 struct Parsing {
     parser: Option<ResponseParser>,
     tools: bool,
+    parallel_tools: bool,
     thinking: bool,
     tool_choice: ToolChoice,
 }
@@ -30,6 +31,7 @@ impl Parsing {
         Self {
             parser: None,
             tools: false,
+            parallel_tools: true,
             thinking: false,
             tool_choice: ToolChoice::Auto,
         }
@@ -237,6 +239,7 @@ fn chat(model: &Model, body: &[u8], ask: Option<Ask>) -> Result<Started, Refusal
     let parsing = Parsing {
         parser,
         tools,
+        parallel_tools: c.parallel_tool_calls.unwrap_or(true),
         thinking,
         tool_choice,
     };
@@ -296,9 +299,14 @@ impl Started {
             msg.insert("reasoning_content".into(), Value::String(parsed.reasoning));
         }
         if called {
+            let limit = match self.parsing.parallel_tools {
+                true => parsed.tool_calls.len(),
+                false => 1,
+            };
             let calls: Vec<Value> = parsed
                 .tool_calls
                 .iter()
+                .take(limit)
                 .map(|c| format_call(c, None))
                 .collect();
             msg.insert("tool_calls".into(), Value::Array(calls));
@@ -447,6 +455,9 @@ impl Started {
                     ResponseEvent::Content(s) => json!({"content": s}),
                     ResponseEvent::Reasoning(s) => json!({"reasoning_content": s}),
                     ResponseEvent::ToolCall(tc) => {
+                        if !self.parsing.parallel_tools && calls > 0 {
+                            continue;
+                        }
                         let chunk = format_call(&tc, Some(calls));
                         calls += 1;
                         json!({"tool_calls": [chunk]})

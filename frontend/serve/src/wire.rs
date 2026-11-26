@@ -70,7 +70,6 @@ fn neutral(key: &str, value: &Value) -> Option<bool> {
         "tool_choice" => {
             return Some(value.is_null() || ["none", "auto"].map(Value::from).contains(value));
         }
-        "parallel_tool_calls" => return Some(value.is_null() || *value == json!(true)),
         "encoding_format" => return Some(value.is_null() || *value == json!("float")),
         "dimensions" => return Some(value.is_null()),
         _ => return None,
@@ -636,6 +635,8 @@ pub(crate) struct Chat {
     pub(crate) messages: Messages,
     #[serde(default)]
     pub(crate) tool_choice: Option<ToolChoice>,
+    #[serde(default)]
+    pub(crate) parallel_tool_calls: Option<bool>,
     pub(crate) max_completion_tokens: Option<usize>,
     #[serde(flatten)]
     pub(crate) common: Common,
