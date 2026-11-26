@@ -16,7 +16,7 @@ fn part(_: &Arch, cut: &Cut) -> Result<Part> {
     let c = config(&cut.dir, cut.sized(512), &Overrides::default())?;
     let (dir, layers) = (cut.dir.clone(), c.stack.layers);
     Ok(Part::new(program::<Linear>(&c), move |g| {
-        Ok((weights(&dir, layers, g)?, Pins::default()))
+        weights(&dir, layers, g)
     }))
 }
 
@@ -56,6 +56,7 @@ pub(crate) struct Embeds {
 pub struct Encoder {
     pub graph: Graph,
     pub weights: Vec<Weight>,
+    pub pins: Pins,
     pub tokenizer: Hf,
 }
 
@@ -81,11 +82,12 @@ pub fn encoder(
         true => batched::<Linear>(&config),
         false => program::<Linear>(&config),
     };
-    let weights = weights(dir, config.stack.layers, &graph)?;
+    let (weights, pins) = weights(dir, config.stack.layers, &graph)?;
     let tokenizer = Hf::open(&dir.join("tokenizer.json"))?;
     Ok(Encoder {
         graph,
         weights,
+        pins,
         tokenizer,
     })
 }
@@ -95,9 +97,9 @@ pub fn config(dir: &Path, [seqs, context]: [u64; 2], overrides: &Overrides) -> R
     overrides.config(dir, |k| Config::read(k, seqs, context))
 }
 
-/// The weights `graph` reads from the release in `dir`.
-pub fn weights(dir: &Path, layers: u64, graph: &Graph) -> Result<Vec<Weight>> {
+/// The weights and storage pins `graph` reads from `dir`.
+pub fn weights(dir: &Path, layers: u64, graph: &Graph) -> Result<(Vec<Weight>, Pins)> {
     let rules = repo("eg2").unwrap_or_default();
     let offer = tessera_checkpoint::open(dir, None)?;
-    Ok(pull(graph, offer.as_ref(), layers, &[&rules])?.0)
+    pull(graph, offer.as_ref(), layers, &[&rules])
 }

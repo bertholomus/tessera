@@ -4,7 +4,7 @@ use tessera_codegen::prelude::*;
 use tessera_graph::{Op, Order, Stage};
 use tessera_kernels::{BLOCK, spin, spin_inline};
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{Draft, Kernel, Load, Needs, Shape, T, Term, Tree};
+use tessera_lower::{Draft, Kernel, Load, Needs, Shape, Source, T, Term, Tree};
 
 /// Its row limit: each thread keeps one sum per row.
 const ROWS: usize = 8;
@@ -90,6 +90,7 @@ fn turned(
     accepts = accepts,
     needs = turned_needs(),
     order = Order::PerConfig,
+    source = turned_source,
     load = turned_load,
     unproven,
 )]
@@ -98,6 +99,13 @@ pub struct Turned {
     pub n: usize,
     pub k: usize,
     pub form: &'static dyn Stored,
+}
+
+fn turned_source(t: &Turned) -> Source {
+    Source::named(
+        turned_ir(t.m, t.form),
+        format!("plan_turned_{}_m{}", t.form.name(), t.m),
+    )
 }
 
 fn accepts(t: &Turned, input: usize, form: &dyn Stored) -> bool {

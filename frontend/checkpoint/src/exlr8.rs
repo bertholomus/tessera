@@ -215,10 +215,14 @@ fn blocks(
 }
 
 /// A trellis matrix as a rotated file, rotations after codes.
-fn turned(f: &File, name: &str) -> Result<Vec<u8>, Error> {
-    let mut bytes = codes_packed(f, name, None)?;
+fn turned(f: &File, name: &str, rows: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
+    let mut bytes = codes_packed(f, name, rows)?;
     bytes.extend(f.bytes(&format!("{name}.suh"))?);
-    bytes.extend(f.bytes(&format!("{name}.svh"))?);
+    let svh = f.bytes(&format!("{name}.svh"))?;
+    match rows {
+        Some((first, count)) => bytes.extend_from_slice(&svh[2 * first..2 * (first + count)]),
+        None => bytes.extend(svh),
+    }
     Ok(bytes)
 }
 
@@ -695,7 +699,7 @@ impl Release {
                 };
                 Ok(slice.iter().flat_map(narrow).collect())
             }
-            Ok(r) if r.format == TRELLIS && whole => turned(f, &matrix),
+            Ok(r) if r.format == TRELLIS && whole => turned(f, &matrix, range),
             Ok(_) => codes_packed(f, &matrix, range),
             Err(e) => {
                 if f.is_half(&local) {
@@ -814,8 +818,8 @@ impl Release {
         out
     }
 
-    /// A shard's slices. GLM's take their most compact forms.
-    fn offered(f: &File, shard: &Shard, dense: bool) -> Vec<Slice> {
+    /// A shard's slices, keeping each matrix in its compact form.
+    fn offered(f: &File, shard: &Shard) -> Vec<Slice> {
         let raw = f.slices();
         let shape = |name: &str| raw.iter().find(|s| s.name == name).map(|s| s.shape.clone());
         let mut out = Vec::new();
@@ -833,9 +837,9 @@ impl Release {
             let (Some(suh), Some(svh)) = (side("suh"), side("svh")) else {
                 // Other formats decode to the HF weight.
                 if let Ok(r) = r {
-                    let stored = match (dense, r.format) {
-                        (false, _) | (true, FP32) => Stored::F32,
-                        (true, format) => block_form(format).map_or(Stored::BF16, Stored::Form),
+                    let stored = match r.format {
+                        FP32 => Stored::F32,
+                        format => block_form(format).map_or(Stored::BF16, Stored::Form),
                     };
                     out.push(Slice {
                         name: name("weight"),
@@ -856,11 +860,8 @@ impl Release {
             let Some(form) = trellis::form_for(k, book) else {
                 continue;
             };
-            // GLM keeps the matrix packed, its rotations beside the codes.
-            let whole = match (dense, trellis::turned_for(k, book)) {
-                (true, Some(turned)) => Stored::Form(turned),
-                _ => Stored::F32,
-            };
+            // Keep the matrix packed, its rotations beside the codes.
+            let whole = trellis::turned_for(k, book).map_or(Stored::F32, Stored::Form);
             out.push(Slice {
                 name: name("weight"),
                 shape: vec![outp, inp],
@@ -910,8 +911,7 @@ impl Offer for Release {
     fn slices(&self) -> Vec<Slice> {
         let mut out = Vec::new();
         for shard in self.shards() {
-            let dense = self.dense.is_some();
-            let slices = self.with(&shard.file, |f| Ok(Self::offered(f, &shard, dense)));
+            let slices = self.with(&shard.file, |f| Ok(Self::offered(f, &shard)));
             out.extend(slices.unwrap_or_default());
         }
         let Some(dense) = &self.dense else {
