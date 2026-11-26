@@ -466,6 +466,7 @@ pub struct BatchDFlash<'a> {
     spec_len: SpecLen,
     prefill_chunk: usize,
     max_ctx: usize,
+    draft_ctx: usize,
     block: usize,
     tap_width: usize,
     kept: Option<Kept>,
@@ -486,7 +487,8 @@ impl<'a> BatchDFlash<'a> {
             return Err(Error::Rows);
         }
         let slots = target.slots().min(drafter.slots());
-        let max_ctx = target.context().min(drafter.context());
+        let max_ctx = target.context();
+        let draft_ctx = drafter.context();
         if let Some(lanes) = &mut target.lanes {
             lanes.reset();
         }
@@ -507,6 +509,7 @@ impl<'a> BatchDFlash<'a> {
             spec_len,
             prefill_chunk: DEFAULT_CHUNK,
             max_ctx,
+            draft_ctx,
             block,
             tap_width: width,
             kept,
@@ -528,6 +531,17 @@ impl<'a> BatchDFlash<'a> {
 
     fn admit_limit(&self, len: usize) -> usize {
         if self.reuse { len.saturating_sub(1) } else { 0 }
+    }
+
+    fn initial_d_base(&self, prompt_len: usize) -> usize {
+        if prompt_len + self.block <= self.draft_ctx {
+            return 0;
+        }
+        let keep = self
+            .draft_ctx
+            .saturating_sub(self.block + self.prefill_chunk)
+            .min(self.draft_ctx / 2);
+        (prompt_len.saturating_sub(keep) / self.prefill_chunk) * self.prefill_chunk
     }
 
     fn free_slot(&mut self, slot: u32, history: Vec<u32>) {
@@ -566,12 +580,13 @@ impl<'a> BatchDFlash<'a> {
             {
                 let _ = cb(Event::Kept(skip));
             }
+            let d_base = skip + self.initial_d_base(item.request.tokens.len() - skip);
             self.prefilling.push_back(DFlashPrefill {
                 slot: item.slot,
                 request: item.request,
                 sink: item.sink,
                 pos: skip,
-                d_base: skip,
+                d_base,
             });
         }
         if !self.prefilling.is_empty() {
@@ -605,15 +620,14 @@ impl<'a> BatchDFlash<'a> {
         );
         self.ensure_pages(&rows)?;
         let wants = self.drafter.draft_wants();
-        let d_pos0 = pos0 - seq.d_base;
         if end < n {
             let (_, taps) = self.target.step_taps_local(&rows)?;
-            if n - seq.d_base + self.block <= self.max_ctx {
+            if pos0 >= seq.d_base && end - seq.d_base + self.block <= self.draft_ctx {
                 self.drafter.run_taps(
                     seq.slot,
                     seq.request.tokens[end],
                     end - seq.d_base,
-                    d_pos0,
+                    pos0 - seq.d_base,
                     taps.as_in(),
                     wants,
                 )?;
@@ -650,11 +664,19 @@ impl<'a> BatchDFlash<'a> {
         let mut last_pred = 1.0;
         let mut last_lp = None;
         let room = act.room(self.max_ctx);
-        let d_start = n - seq.d_base;
-        if d_start + self.block <= self.max_ctx && room > 0 {
-            let outs =
-                self.drafter
-                    .run_taps(act.slot, anchor, d_start, d_pos0, taps.as_in(), wants)?;
+        let mut d_base = seq.d_base.min(pos0);
+        if n - d_base + self.block > self.draft_ctx {
+            d_base = pos0;
+        }
+        if n - d_base + self.block <= self.draft_ctx && room > 0 {
+            let outs = self.drafter.run_taps(
+                act.slot,
+                anchor,
+                n - d_base,
+                pos0 - d_base,
+                taps.as_in(),
+                wants,
+            )?;
             let (mut drafts, lp) = self.drafter.read_draft(&outs)?;
             let avail = drafts.len().min(room);
             let (k, pred) = spec.choose(lp.as_deref(), avail, drafts.len());
@@ -668,7 +690,7 @@ impl<'a> BatchDFlash<'a> {
             spec,
             last_pred,
             last_lp,
-            d_base: seq.d_base,
+            d_base,
             history,
         });
         Ok(())
@@ -701,9 +723,12 @@ impl<'a> BatchDFlash<'a> {
                 continue;
             }
             let avail = item.seq.room(self.max_ctx);
+            if item.seq.start - item.d_base + self.block > self.draft_ctx {
+                item.d_base = old_start;
+            }
             let d_old = old_start - item.d_base;
             let d_new = item.seq.start - item.d_base;
-            if d_new + self.block <= self.max_ctx && avail > 0 {
+            if d_new + self.block <= self.draft_ctx && avail > 0 {
                 jobs.push(DFlashJob {
                     active_idx: i,
                     slot: item.seq.slot,
