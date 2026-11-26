@@ -8,8 +8,8 @@ use tessera_trace::DimName::*;
 use tessera_trace::hf::*;
 use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, DimName, Embed, Graph, Kept, Linear, Linears, Mask, Model,
-    Norm, Pairs, Role, Size, Tensor, TensorType, Weights, listed, pick, sparse_ports, step_ports,
-    tokens,
+    Norm, Pairs, Role, Size, Tensor, TensorType, Vector, Weights, listed, pick, sparse_ports,
+    step_ports, tokens,
 };
 
 /// Steps a query or key head passes through before RoPE.
@@ -27,6 +27,25 @@ impl HeadNorm for Norm {
 /// Llama does not.
 impl HeadNorm for () {
     fn apply(&self, x: Tensor, _: f32) -> Tensor {
+        x
+    }
+}
+
+/// Optional additive bias on Q, K, and V projections.
+pub trait QkvBias: Weights {
+    fn add(&self, x: Tensor) -> Tensor;
+}
+
+/// Qwen2 adds a bias vector to Q, K, and V.
+impl QkvBias for Vector {
+    fn add(&self, x: Tensor) -> Tensor {
+        x.add_vector(self)
+    }
+}
+
+/// Llama, Qwen3, and Granite omit Q/K/V bias.
+impl QkvBias for () {
+    fn add(&self, x: Tensor) -> Tensor {
         x
     }
 }
@@ -117,8 +136,9 @@ impl Config {
     /// The decoder `k` describes, for these launch bounds.
     pub fn read(k: &mut Keys, max_seqs: u64, max_context: u64) -> Self {
         let top = At::top();
+        let kind = k.read_or(&top, MODEL_TYPE, String::new());
         k.fix(&top, HIDDEN_ACT.name, json!("silu"));
-        k.fix(&top, ATTENTION_BIAS.name, json!(false));
+        k.fix(&top, ATTENTION_BIAS.name, json!(kind == "qwen2"));
         k.fix(&top, MLP_BIAS.name, json!(false));
         k.fix(&top, ROPE_SCALING.name, json!(null));
         k.fix(&top, USE_SLIDING_WINDOW.name, json!(false));
@@ -147,6 +167,20 @@ impl Config {
                 logits: 1.0 / k.or(&["logits_scaling"], 1.0),
             },
             tied: k.read_or(&top, TIED, false),
+        }
+    }
+
+    /// Qwen2 14B sizes. Q, K, and V carry additive biases.
+    pub fn qwen2(max_seqs: u64, max_context: u64) -> Self {
+        Self {
+            stack: Stack::sized([152_064, 5120, 48, 40, 128, 13_824], max_seqs, max_context),
+            kv_heads: 8,
+            rope_theta: 1e6,
+            eps: 1e-6,
+            experts: 0,
+            top_k: 0,
+            scales: Scales::default(),
+            tied: false,
         }
     }
 
@@ -203,6 +237,13 @@ impl Config {
             stack: Stack::sized([262_144, 640, 18, 4, 256, 2048], max_seqs, max_context),
             kv_heads: 1,
             ..Self::qwen3(max_seqs, max_context)
+        }
+    }
+
+    pub fn qwen2_small() -> Self {
+        Self {
+            tied: false,
+            ..Self::qwen3_small()
         }
     }
 
@@ -266,7 +307,7 @@ impl Config {
 }
 
 #[derive(Weights)]
-pub struct Layer<N: HeadNorm, M: Mlp, D: Dense = Linear> {
+pub struct Layer<N: HeadNorm, M: Mlp, D: Dense = Linear, B: QkvBias = ()> {
     #[shape(Hidden)]
     pub ln1: Norm,
     #[shape(Hidden, Heads * HeadDim)]
@@ -275,6 +316,12 @@ pub struct Layer<N: HeadNorm, M: Mlp, D: Dense = Linear> {
     pub k: D,
     #[shape(Hidden, KvHeads * HeadDim)]
     pub v: D,
+    #[shape(Heads * HeadDim)]
+    pub q_bias: B,
+    #[shape(KvHeads * HeadDim)]
+    pub k_bias: B,
+    #[shape(KvHeads * HeadDim)]
+    pub v_bias: B,
     #[shape(HeadDim)]
     pub q_norm: N,
     #[shape(HeadDim)]
@@ -288,11 +335,11 @@ pub struct Layer<N: HeadNorm, M: Mlp, D: Dense = Linear> {
 
 /// The trunk's weights. Untied heads are declared beside them.
 #[derive(Weights)]
-pub struct Decoder<N: HeadNorm, M: Mlp> {
+pub struct Decoder<N: HeadNorm, M: Mlp, B: QkvBias = ()> {
     #[shape(Vocab, Hidden)]
     pub embed: Embed,
     #[shape(Layers)]
-    pub layers: Vec<Layer<N, M>>,
+    pub layers: Vec<Layer<N, M, Linear, B>>,
     #[shape(Hidden)]
     pub norm: Norm,
 }
@@ -323,10 +370,10 @@ fn scaled(x: Tensor, by: f32) -> Tensor {
     }
 }
 
-pub fn forward<N: HeadNorm, M: Mlp>(
+pub fn forward<N: HeadNorm, M: Mlp, B: QkvBias>(
     m: &Model,
     c: &Config,
-    (w, head): (&Decoder<N, M>, Option<&Embed>),
+    (w, head): (&Decoder<N, M, B>, Option<&Embed>),
     tokens: &Tensor,
     positions: &Tensor,
 ) -> Tensor {
@@ -345,9 +392,9 @@ pub fn forward<N: HeadNorm, M: Mlp>(
 
 impl Pass<'_> {
     /// With `kept`, each layer also reads earlier launches' rows.
-    fn logits<N: HeadNorm, M: Mlp>(
+    fn logits<N: HeadNorm, M: Mlp, B: QkvBias>(
         &self,
-        w: &Decoder<N, M>,
+        w: &Decoder<N, M, B>,
         tokens: &Tensor,
         kept: Option<&[Cache]>,
     ) -> Tensor {
@@ -355,9 +402,9 @@ impl Pass<'_> {
     }
 
     /// Logits, and joined tapped layers when requested.
-    fn logits_taps<N: HeadNorm, M: Mlp>(
+    fn logits_taps<N: HeadNorm, M: Mlp, B: QkvBias>(
         &self,
-        w: &Decoder<N, M>,
+        w: &Decoder<N, M, B>,
         tokens: &Tensor,
         kept: Option<&[Cache]>,
         layers: &[u64],
@@ -380,9 +427,9 @@ impl Pass<'_> {
     }
 
     /// Each row's normed state, before the unembed.
-    fn hidden<N: HeadNorm, M: Mlp>(
+    fn hidden<N: HeadNorm, M: Mlp, B: QkvBias>(
         &self,
-        w: &Decoder<N, M>,
+        w: &Decoder<N, M, B>,
         tokens: &Tensor,
         kept: Option<&[Cache]>,
     ) -> Tensor {
@@ -391,9 +438,9 @@ impl Pass<'_> {
     }
 
     /// The residual rows. `tap` sees each layer's, counting from 1.
-    fn trunk<N: HeadNorm, M: Mlp>(
+    fn trunk<N: HeadNorm, M: Mlp, B: QkvBias>(
         &self,
-        w: &Decoder<N, M>,
+        w: &Decoder<N, M, B>,
         tokens: &Tensor,
         kept: Option<&[Cache]>,
         mut tap: impl FnMut(u64, &Tensor),
@@ -418,9 +465,9 @@ impl Pass<'_> {
     }
 
     /// Queries and keys pass through `N` per head, then rotate.
-    fn attention<N: HeadNorm, M: Mlp>(
+    fn attention<N: HeadNorm, M: Mlp, B: QkvBias>(
         &self,
-        l: &Layer<N, M>,
+        l: &Layer<N, M, Linear, B>,
         h: &Tensor,
         kept: Option<&Cache>,
     ) -> Tensor {
@@ -438,24 +485,43 @@ impl Pass<'_> {
         };
         let root = 1.0 / (c.stack.head_dim as f32).sqrt();
         let scale = c.scales.attention.unwrap_or(root);
-        heads.apply([&l.q, &l.k, &l.v], h, turn, |[q, k, v]| {
-            match (kept, self.slots) {
-                (Some([keys, values]), Some(slots)) => {
-                    let by = [slots, self.positions];
-                    let (k, v) = (k.append(keys, by), v.append(values, by));
-                    (self.m).attend_rows(Mask::Causal, scale, [q, &k, &v], by, None)
-                }
-                _ => match self.keys {
-                    Some(keys) => self
-                        .m
-                        .attend(Mask::Bidirectional, scale, [q, k, v], Some(keys)),
-                    None => self.m.attend(Mask::Causal, scale, [q, k, v], None),
-                },
+        let proj = |w: &Linear, b: &B, side: Side| {
+            let count: DimExpr = match side {
+                Side::Query => Heads.into(),
+                Side::Key | Side::Value => KvHeads.into(),
+            };
+            let t = turn(heads.split(b.add(w.apply(h)), count, HeadDim), side);
+            match side {
+                Side::Query | Side::Key => heads.rotate(t),
+                Side::Value => t,
             }
-        })
+        };
+        let q = proj(&l.q, &l.q_bias, Side::Query);
+        let k = proj(&l.k, &l.k_bias, Side::Key);
+        let v = proj(&l.v, &l.v_bias, Side::Value);
+        let out = match (kept, self.slots) {
+            (Some([keys, values]), Some(slots)) => {
+                let by = [slots, self.positions];
+                let (k, v) = (k.append(keys, by), v.append(values, by));
+                (self.m).attend_rows(Mask::Causal, scale, [&q, &k, &v], by, None)
+            }
+            _ => match self.keys {
+                Some(keys) => self
+                    .m
+                    .attend(Mask::Bidirectional, scale, [&q, &k, &v], Some(keys)),
+                None => self.m.attend(Mask::Causal, scale, [&q, &k, &v], None),
+            },
+        };
+        heads.merge(out)
     }
 }
 
+crate::preset::preset!(
+    "qwen2",
+    small: || stepper_with::<(), Swiglu, Vector>(&Config::qwen2_small()),
+    step: |n| stepper_with::<(), Swiglu, Vector>(&Config::qwen2(1, n)),
+    forward: |n| program_with::<(), Swiglu, Vector>(&Config::qwen2(1, n)),
+);
 crate::preset::traced!("qwen3", Config::qwen3_small, Config::qwen3, [Norm, Swiglu]);
 crate::preset::traced!(
     "smollm2",
@@ -467,8 +533,13 @@ crate::preset::traced!("granite", Config::granite_small, Config::granite, [(), M
 
 /// One forward entry: tokens and positions in, logits out.
 pub fn program<N: HeadNorm, M: Mlp>(c: &Config) -> Graph {
+    program_with::<N, M, ()>(c)
+}
+
+/// Forward entry parameterized by optional Q/K/V bias `B`.
+pub fn program_with<N: HeadNorm, M: Mlp, B: QkvBias>(c: &Config) -> Graph {
     let m = Model::new(c.dims());
-    let (w, head) = with_head::<Decoder<N, M>>(&m, c.tied);
+    let (w, head) = with_head::<Decoder<N, M, B>>(&m, c.tied);
     let [tokens, positions] = tokens(&m);
     let logits = forward(&m, c, (&w, head.as_ref()), &tokens, &positions);
     m.finish([(Role::Logits, &logits)])
@@ -476,8 +547,13 @@ pub fn program<N: HeadNorm, M: Mlp>(c: &Config) -> Graph {
 
 /// Residual rows after `layers`, joined on the last axis.
 pub fn taps<N: HeadNorm, M: Mlp>(c: &Config, layers: &[u64]) -> Graph {
+    taps_with::<N, M, ()>(c, layers)
+}
+
+/// Residual taps parameterized by optional Q/K/V bias `B`.
+pub fn taps_with<N: HeadNorm, M: Mlp, B: QkvBias>(c: &Config, layers: &[u64]) -> Graph {
     let m = Model::new(c.dims());
-    let (w, _) = with_head::<Decoder<N, M>>(&m, c.tied);
+    let (w, _) = with_head::<Decoder<N, M, B>>(&m, c.tied);
     // Key lists keep padding out of each row's attention.
     let [tokens, positions, keys] = listed(&m);
     let pass = Pass {
@@ -497,15 +573,20 @@ pub fn taps<N: HeadNorm, M: Mlp>(c: &Config, layers: &[u64]) -> Graph {
 
 /// One step entry: rows in, each row's likeliest token out.
 pub fn stepper<N: HeadNorm, M: Mlp>(c: &Config) -> Graph {
+    stepper_with::<N, M, ()>(c)
+}
+
+/// Step entry parameterized by optional Q/K/V bias `B`.
+pub fn stepper_with<N: HeadNorm, M: Mlp, B: QkvBias>(c: &Config) -> Graph {
     let mut dims = c.dims();
     let size = Size::Bounded(c.stack.max_context);
     dims.push(Dim { name: Rows, size });
     let m = Model::new(dims);
-    let (w, head) = with_head::<Decoder<N, M>>(&m, c.tied);
+    let (w, head) = with_head::<Decoder<N, M, B>>(&m, c.tied);
     let masked = c.stack.steps == Steps::Masked;
     let ([tokens, positions, slots], allowed) = step_ports(&m, masked);
     let ty = TensorType::new([Seqs, Context, KvHeads, HeadDim], DType::F32);
-    let cache = |_: &Layer<N, M>| [m.kept(ty.clone()), m.kept(ty.clone())];
+    let cache = |_: &Layer<N, M, Linear, B>| [m.kept(ty.clone()), m.kept(ty.clone())];
     let kept: Vec<Cache> = w.layers.iter().map(cache).collect();
     let (positions, rows) = (&positions, Rows);
     let pass = Pass {

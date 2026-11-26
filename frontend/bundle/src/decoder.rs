@@ -5,8 +5,8 @@ use crate::parts::{Cut, Part};
 use crate::{Overrides, config, held, pull};
 use std::error::Error;
 use tessera_checkpoint::Shards;
-use tessera_engine::decoder::{Config, Moe, Swiglu, stepper, taps};
-use tessera_engine::{Graph, Norm};
+use tessera_engine::decoder::{Config, Moe, Swiglu, stepper_with, taps_with};
+use tessera_engine::{Graph, Norm, Vector};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -44,21 +44,22 @@ fn part(arch: &Arch, cut: &Cut) -> Result<Part> {
     }))
 }
 
-/// Registers decoders by `model_type`, head norm, MLP and extra fields.
+/// Registers decoders by model type, head norm, MLP, bias.
 macro_rules! decoders {
-    ($($name:literal: $norm:ty, $mlp:ty $(, $field:ident: $value:expr)*;)*) => {
+    ($($name:literal: $norm:ty, $mlp:ty, $bias:ty $(, $field:ident: $value:expr)*;)*) => {
         $(arch!($name, [Spot::Type($name)], step: step, part: part $(, $field: $value)*);)*
 
         const FAMILIES: &[Family] = &[$(Family {
             name: $name,
-            step: stepper::<$norm, $mlp>,
-            taps: taps::<$norm, $mlp>,
+            step: stepper_with::<$norm, $mlp, $bias>,
+            taps: taps_with::<$norm, $mlp, $bias>,
         }),*];
     };
 }
 
 decoders! {
-    "qwen3": Norm, Swiglu;
-    "llama": (), Swiglu;
-    "granitemoe": (), Moe;
+    "qwen2": (), Swiglu, Vector;
+    "qwen3": Norm, Swiglu, ();
+    "llama": (), Swiglu, ();
+    "granitemoe": (), Moe, ();
 }
