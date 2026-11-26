@@ -178,7 +178,7 @@ pub(super) fn open_drafter(
                 .with_wire(o.ranks.sum_wire());
             Drafter::open_ranked(
                 pair.graph.clone(),
-                o.max_model_len,
+                pair.context,
                 pair.block,
                 pair.mask_token,
                 (&recipe, settings),
@@ -189,7 +189,7 @@ pub(super) fn open_drafter(
         }
         None => Drafter::open(
             pair.graph.clone(),
-            o.max_model_len,
+            pair.context,
             pair.block,
             pair.mask_token,
             &recipe,

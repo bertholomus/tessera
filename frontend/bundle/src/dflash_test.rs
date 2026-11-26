@@ -348,3 +348,10 @@ fn rotated_pins() {
     assert!(cfg.shared_tap_gauge && cfg.tap_layers() == vec![1002, 1006]);
     check_rotated_pins(&cfg);
 }
+
+#[test]
+fn sliding_context_cap() {
+    assert_eq!(crate::dflash::draft_context(1_048_576, Some(2048)), 65_536);
+    assert_eq!(crate::dflash::draft_context(4096, Some(2048)), 4096);
+    assert_eq!(crate::dflash::draft_context(1_048_576, None), 1_048_576);
+}
