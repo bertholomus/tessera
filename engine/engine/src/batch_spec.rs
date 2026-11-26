@@ -69,6 +69,24 @@ pub(crate) fn drive_follow(host: &mut impl RoundHost) -> Result<(), Error> {
     }
 }
 
+/// Turns on slot retention. Returns false for a stateful `target`.
+pub(crate) fn keep_slots(
+    target: &Engine,
+    slots: usize,
+    max_ctx: usize,
+    kept: &mut Option<Kept>,
+    free: &mut Vec<u32>,
+) -> bool {
+    if target.stateful() {
+        return false;
+    }
+    if kept.is_none() {
+        *kept = Some(Kept::new(slots, max_ctx));
+        free.clear();
+    }
+    true
+}
+
 /// Removes finished `slots` from `active` and notifies `on_free`.
 pub(crate) fn retire_from<T>(
     active: &mut Vec<T>,
@@ -284,42 +302,50 @@ impl<'a> BatchMtp<'a> {
             hash: 2166136261,
         })
     }
-
-    /// Sets the maximum prompt rows per prefill step.
-    pub fn with_prefill_chunk(mut self, rows: usize) -> Self {
-        self.prefill_chunk = rows.max(1);
-        self
-    }
-
-    /// Retains finished slots for prefix reuse.
-    pub fn reuse(&mut self) {
-        if self.target.stateful() {
-            return;
-        }
-        let slots = self.target.slots().min(self.drafter.slots());
-        self.kept = Some(Kept::new(slots, self.max_ctx));
-    }
-
-    /// Queues an answer. Unfit requests finish at once.
-    pub fn submit(&mut self, request: Request, sink: Sink) {
-        queue_request(&mut self.waiting, self.max_ctx, request, sink);
-    }
-
-    /// Whether any answer is waiting, prefilling, or decoding.
-    pub fn busy(&self) -> bool {
-        !self.waiting.is_empty() || !self.prefilling.is_empty() || !self.active.is_empty()
-    }
-
-    /// Runs one round: admit, prefill, shared verify, and batched draft.
-    pub fn step(&mut self) -> Result<bool, Error> {
-        drive_step(self)
-    }
-
-    /// Follower rank loop executing rank 0's batched rounds.
-    pub fn follow(&mut self) -> Result<(), Error> {
-        drive_follow(self)
-    }
 }
+
+/// Public driver methods shared by the batched speculative decoders.
+macro_rules! batch_methods {
+    ($ty:ident $(, $flag:ident)?) => {
+        impl $ty<'_> {
+            /// Retains finished slots for prefix reuse.
+            pub fn reuse(&mut self) {
+                let slots = self.target.slots().min(self.drafter.slots());
+                let _on = keep_slots(self.target, slots, self.max_ctx, &mut self.kept, &mut self.free);
+                $(self.$flag = _on;)?
+            }
+
+            /// Sets the maximum prompt rows per prefill step.
+            pub fn with_prefill_chunk(mut self, rows: usize) -> Self {
+                self.prefill_chunk = rows.max(1);
+                self
+            }
+
+            /// Queues an answer. Unfit requests finish at once.
+            pub fn submit(&mut self, request: Request, sink: Sink) {
+                queue_request(&mut self.waiting, self.max_ctx, request, sink);
+            }
+
+            /// Whether any answer is waiting, prefilling, or decoding.
+            pub fn busy(&self) -> bool {
+                !self.waiting.is_empty() || !self.prefilling.is_empty() || !self.active.is_empty()
+            }
+
+            /// Runs one round: admit, prefill, verify, and draft.
+            pub fn step(&mut self) -> Result<bool, Error> {
+                drive_step(self)
+            }
+
+            /// Follower rank loop executing rank 0's batched rounds.
+            pub fn follow(&mut self) -> Result<(), Error> {
+                drive_follow(self)
+            }
+        }
+    };
+}
+pub(crate) use batch_methods;
+
+batch_methods!(BatchMtp);
 
 impl RoundHost for BatchMtp<'_> {
     fn target(&mut self) -> &mut Engine {
