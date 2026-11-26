@@ -17,7 +17,7 @@ const ENTRY: &str = "tessera_sums";
 const HAND: &str = "tessera_hand";
 /// Floats per round. A longer sum takes several.
 const ROOM: u32 = 256 << 10;
-const THREADS: u32 = 256;
+const THREADS: u32 = 512;
 /// The grid stays up, so it keeps few blocks.
 const SHARE: u32 = 64;
 /// Bytes of the job the hand kernel passes.
@@ -33,7 +33,7 @@ pub const RELAY: usize = ROOM as usize * 4;
 /// One two-way pool of every rank, slots of `RELAY` bytes.
 pub(crate) fn pool(ranks: u32) -> PoolPlan {
     PoolPlan {
-        depth: 2,
+        depth: 4,
         one_way: false,
         group: (0..ranks).collect(),
         send_bytes: RELAY as u32,
@@ -42,27 +42,18 @@ pub(crate) fn pool(ranks: u32) -> PoolPlan {
 }
 
 pub(crate) fn plan(ranks: u32) -> Plan {
+    let lane = |op, elem| LanePlan {
+        op,
+        elem,
+        pool: 0,
+        block: 0,
+    };
     Plan {
         pools: vec![pool(ranks)],
         lanes: vec![
-            LanePlan {
-                op: Op::Sum,
-                elem: crate::layout::BF16,
-                pool: 0,
-                block: 0,
-            },
-            LanePlan {
-                op: Op::Gather,
-                elem: crate::layout::F32,
-                pool: 0,
-                block: 0,
-            },
-            LanePlan {
-                op: Op::Sum,
-                elem: crate::layout::F32,
-                pool: 0,
-                block: 0,
-            },
+            lane(Op::Sum, crate::layout::BF16),
+            lane(Op::Gather, crate::layout::F32),
+            lane(Op::Sum, crate::layout::F32),
         ],
         items: Vec::new(),
         forms: Vec::new(),
