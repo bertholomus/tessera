@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use tessera_engine::DType;
-use tessera_engine::comm::{Fabric, Transport};
+use tessera_engine::comm::{Error as CommError, Fabric, Transport};
 use tessera_engine::sums::Sum;
 use tessera_engine::{Engine, Graph, Grid, Knobs, Place, Recipe, Settings};
 use tessera_frontend_comm::{
@@ -83,7 +83,7 @@ impl Ranks {
 
     /// This rank runs rank 0's launches and serves nothing.
     pub(crate) fn follows(&self) -> bool {
-        self.rank != 0
+        self.rank != 0 && !tessera_engine::sizer::counting()
     }
 
     /// Whether routed experts split along inner width.
@@ -108,6 +108,16 @@ impl Ranks {
         }
         if self.rank as usize >= self.peers.len() {
             return Err(format!("--rank {} needs --peers with it", self.rank));
+        }
+        if tessera_engine::sizer::counting() {
+            let ranks = self.peers.len() as u32;
+            let dry = || {
+                Box::new(DryRank {
+                    rank: self.rank,
+                    ranks,
+                }) as Box<dyn Transport>
+            };
+            return Ok(Some(([dry(), dry()], Grids::None)));
         }
         let mut met: Box<dyn Transport> =
             Box::new(meet(self.rank, &self.peers, None).map_err(|e| e.to_string())?);
@@ -163,5 +173,25 @@ impl Ranks {
             }
         };
         opened.map_err(|e| e.to_string())
+    }
+}
+
+/// Offline transport used when sizing a ranked layout.
+struct DryRank {
+    rank: u32,
+    ranks: u32,
+}
+
+impl Transport for DryRank {
+    fn rank(&self) -> u32 {
+        self.rank
+    }
+
+    fn ranks(&self) -> u32 {
+        self.ranks
+    }
+
+    fn exchange(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, CommError> {
+        Ok(vec![mine.to_vec(); self.ranks as usize])
     }
 }

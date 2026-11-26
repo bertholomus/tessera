@@ -63,3 +63,22 @@ fn ranks_match() {
     assert!(bad.flag("--peers", "nowhere").is_none());
     assert!(bad.flag("--rank", "1").is_some() && bad.follows());
 }
+
+#[test]
+fn sizes_ranks_offline() {
+    tessera_engine::sizer::sizing();
+    let mut ranks = Ranks::default();
+    ranks.flag("--rank", "1").unwrap();
+    ranks.flag("--peers", "127.0.0.1:1,127.0.0.2:1").unwrap();
+    ranks.flag("--sums", "arx").unwrap();
+    assert!(!ranks.follows());
+    let settings = Settings {
+        backend: Pick::Host,
+        ..Settings::default()
+    };
+    let links = ranks.join(&settings, &Default::default()).unwrap();
+    let g = stepper::<Norm, Swiglu>(&decoder::Config::qwen3_small());
+    let at = (&Recipe::default(), &settings);
+    let _engine = ranks.open(links, g, 16, at).unwrap();
+    assert!(tessera_engine::sizer::sized().weights > 0);
+}
