@@ -1,6 +1,7 @@
 //! Shared SPMD speculative decode loop and device tap helpers.
 
 use crate::guide::{MinTokens, Rules, Stacked, settle, walk};
+use crate::lanes::{decode_patches, encode_patches};
 use crate::sample::{Sampler, Sampling, Target, accept, take};
 use crate::spec_len::SpecStats;
 use crate::{Allowed, Edit, Engine, Error, Event, Guide, Head, Reason, Request, Row};
@@ -168,18 +169,18 @@ pub(crate) fn start_req(
         return Ok(false);
     }
     if target.control.as_ref().is_some_and(|c| c.rank() == 0) {
-        let table = target
+        let patches = target
             .lanes
             .as_ref()
-            .and_then(crate::lanes::Lanes::pending)
-            .unwrap_or(&[]);
+            .map(crate::lanes::Lanes::pending)
+            .unwrap_or_default();
         let mut w = Writer(Vec::new());
         w.u32(SPEC_REQ_TAG)
             .u32(request.max_tokens as u32)
             .u32(spec_req.chunk.unwrap_or(0) as u32)
             .u32s(&request.tokens)
-            .u32s(&request.stop)
-            .u32s(table);
+            .u32s(&request.stop);
+        encode_patches(&mut w, &patches);
         request.sampling.encode(&mut w);
         extra(&mut w);
         target.told(&w.0)?;
@@ -187,10 +188,12 @@ pub(crate) fn start_req(
     Ok(true)
 }
 
+type DecodedReq<T> = (SpecReq, Vec<(u32, Vec<u32>)>, T);
+
 fn decode_req<T>(
     bytes: &[u8],
     extra: impl FnOnce(&mut Reader) -> Option<T>,
-) -> Option<(SpecReq, Vec<u32>, T)> {
+) -> Option<DecodedReq<T>> {
     let mut r = Reader(bytes);
     if r.u32()? != SPEC_REQ_TAG {
         return None;
@@ -199,7 +202,7 @@ fn decode_req<T>(
     let chunk = r.u32()? as usize;
     let tokens = r.u32s()?;
     let stop = r.u32s()?;
-    let table = r.u32s()?;
+    let patches = decode_patches(&mut r)?;
     let sampling = Sampling::decode(&mut r)?;
     let policy = extra(&mut r)?;
     let req = SpecReq {
@@ -212,7 +215,7 @@ fn decode_req<T>(
         },
         chunk: (chunk > 0).then_some(chunk),
     };
-    Some((req, table, policy))
+    Some((req, patches, policy))
 }
 
 /// Shared follower outer loop receiving SPMD speculative requests.
@@ -229,13 +232,13 @@ pub(crate) fn follow_loop<T>(
         let Some(told) = target.told(&mine)? else {
             return Ok(());
         };
-        let Some((req, table, policy)) = decode_req(&told, &mut decode) else {
+        let Some((req, patches, policy)) = decode_req(&told, &mut decode) else {
             return Ok(());
         };
         if let Some(lanes) = &mut target.lanes
-            && !table.is_empty()
+            && !patches.is_empty()
         {
-            lanes.replace(table);
+            lanes.apply(&patches);
         }
         run(target, req, policy)?;
     }
