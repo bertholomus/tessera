@@ -60,7 +60,10 @@ impl Embedder {
         let reading = progress.step("read model", Unit::Items, None);
         let (shape, e) = encoder::open(dir, padded, config)?;
         reading.finish();
-        let recipe = Recipe::default();
+        let recipe = Recipe {
+            pins: e.pins,
+            ..Recipe::default()
+        };
         let model = Model::open_loaded(e.graph, &recipe, settings, &e.weights, progress)?;
         Ok(Self {
             model,

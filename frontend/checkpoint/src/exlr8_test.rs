@@ -79,6 +79,8 @@ fn glm_dense_formats() {
         ramp(2 * 64, 13),
         [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
     );
+    let mut tr = record(1, 128, 128, 1);
+    tr[24..32].copy_from_slice(&2i64.to_le_bytes());
     write(
         &dir.join("dense/exlr8-dense-000.safetensors"),
         &[
@@ -94,7 +96,7 @@ fn glm_dense_formats() {
             ("qi.record", "I64", vec![8], record(2, 2, 128, 2)),
             ("qi.q4", "U8", vec![1, 2, 64], q4_in.clone()),
             ("qi.s4", "F16", vec![1, 2, 4], halves(&s4_in)),
-            ("tr.record", "I64", vec![8], record(1, 128, 128, 1)),
+            ("tr.record", "I64", vec![8], tr),
             ("tr.trellis", "U8", vec![1, 4096], ramp(4096, 3)),
             ("tr.suh", "F16", vec![128], halves(&[0.5; 128])),
             ("tr.svh", "F16", vec![128], halves(&[2.0; 128])),
@@ -172,10 +174,12 @@ fn glm_dense_formats() {
     // Trellis stays packed, its rotations after the codes.
     let file = release.packed("model.layers.0.tr.weight", None).unwrap();
     let codes = trellis::packed(128, 128, 1, &ramp(4096, 3));
-    assert_eq!(
-        file,
-        [codes, halves(&[0.5; 128]), halves(&[2.0; 128])].concat()
-    );
+    let whole = [codes, halves(&[0.5; 128]), halves(&[2.0; 128])].concat();
+    assert_eq!(file, whole);
+    let cut = release
+        .packed("model.layers.0.tr.weight", Some((0, 128)))
+        .unwrap();
+    assert_eq!(cut, whole);
     // Block formats stay packed, whole or by row.
     let forms = [
         ("q", &q, &INT4_G32 as &dyn Form),
