@@ -332,7 +332,7 @@ struct alignas(16) fg_bf16_smem {
 template <u32 KS, bool SPLIT>
 static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, const float* other,
                                                   float* out, u32 m, u32 n, u32 k, u32 w_stride,
-                                                  u32 r0, u32 mode, u32 ks, fg_bf16_smem<KS>& sm) {
+                                                  u32 x_rs, u32 o_rs, u32 r0, u32 mode, u32 ks, fg_bf16_smem<KS>& sm) {
     constexpr u32 NTILES = 4u / KS;
     constexpr u32 BN = 8u * NTILES;
     constexpr u32 BK = 64u * KS;
@@ -353,7 +353,7 @@ static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, 
             for (u32 dr = 0u; dr < 16u; dr += 8u) {
                 u32 r = xr + dr;
                 if (r0 + r < m) {
-                    const float* xp = x + u64(r0 + r) * k + k0 + (s << 6) + xc;
+                    const float* xp = x + u64(r0 + r) * x_rs + k0 + (s << 6) + xc;
                     float4 xv = *reinterpret_cast<const float4*>(xp);
                     u32 h0 = fg_bf16x2(xv.x, xv.y);
                     u32 h1 = fg_bf16x2(xv.z, xv.w);
@@ -402,11 +402,11 @@ static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, 
         if (r0 + g + 8u < m) *reinterpret_cast<float2*>(out + (u64(p) * m + r0 + g + 8u) * n + col) = make_float2(acc[2], acc[3]);
     } else {
         if (r0 + g < m) {
-            u64 off = u64(r0 + g) * n + col;
+            u64 off = u64(r0 + g) * o_rs + col;
             *reinterpret_cast<float2*>(out + off) = fg_epilogue2(acc[0], acc[1], other, off, col, mode);
         }
         if (r0 + g + 8u < m) {
-            u64 off = u64(r0 + g + 8u) * n + col;
+            u64 off = u64(r0 + g + 8u) * o_rs + col;
             *reinterpret_cast<float2*>(out + off) = fg_epilogue2(acc[2], acc[3], other, off, col, mode);
         }
     }
@@ -416,14 +416,14 @@ static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, 
 extern "C" __global__ __launch_bounds__(128, 6) void tessera_mm_bf16(
     const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_bf16_smem<1u> sm;
-    fg_bf16_mm<1u, false>(x, w, other, out, m, n, k, k, blockIdx.y << 4, mode, 1u, sm);
+    fg_bf16_mm<1u, false>(x, w, other, out, m, n, k, k, k, n, blockIdx.y << 4, mode, 1u, sm);
 }
 
 // Split-K BF16 Tensor-Core small-batch matmul, 16x16 per block.
 extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_bf16_ks2(
     const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_bf16_smem<2u> sm;
-    fg_bf16_mm<2u, false>(x, w, other, out, m, n, k, k, blockIdx.y << 4, mode, 1u, sm);
+    fg_bf16_mm<2u, false>(x, w, other, out, m, n, k, k, k, n, blockIdx.y << 4, mode, 1u, sm);
 }
 
 // Cross-CTA split-K BF16 Tensor-Core matmul, 16x16 per block.
@@ -431,7 +431,7 @@ extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_bf16_sk(
     const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
     u32 ks) {
     __shared__ fg_bf16_smem<2u> sm;
-    fg_bf16_mm<2u, true>(x, w, other, out, m, n, k, k, blockIdx.y << 4, mode, ks, sm);
+    fg_bf16_mm<2u, true>(x, w, other, out, m, n, k, k, k, n, blockIdx.y << 4, mode, ks, sm);
 }
 
 union alignas(16) fg_mx_smem {
@@ -747,22 +747,22 @@ extern "C" __global__ __launch_bounds__(256, 2) void tessera_gemv_bf16_narrow(
 // Tensor-Core BF16 stacked matmul, 16x16 per block.
 extern "C" __global__ __launch_bounds__(128, 4) void tessera_stacked_lanes_tc(
     const float* x, const u16* w, float* out, u32 rows, u32 n, u32 k, u32 block, u32 first,
-    u32 col_step) {
+    u32 col_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
     __shared__ fg_bf16_smem<2u> sm;
     u32 rtiles = (rows + 15u) >> 4u;
     u32 batch = blockIdx.y / rtiles;
     u32 r0 = (blockIdx.y % rtiles) << 4u;
-    const float* xb = x + (u64(batch) * rows + r0) * k;
+    const float* xb = x + u64(batch) * x_bs + u64(r0) * x_rs;
     const u16* wb = w + u64(batch) * block + first;
-    float* ob = out + (u64(batch) * rows + r0) * n;
+    float* ob = out + u64(batch) * o_bs + u64(r0) * o_rs;
     u32 nr = min(rows - r0, 16u);
-    fg_bf16_mm<2u, false>(xb, wb, nullptr, ob, nr, n, k, col_step, 0u, 0u, 1u, sm);
+    fg_bf16_mm<2u, false>(xb, wb, nullptr, ob, nr, n, k, col_step, x_rs, o_rs, 0u, 0u, 1u, sm);
 }
 
 // Streaming 8-BF16 stacked matmul, up to 8 rows per warp.
 extern "C" __global__ __launch_bounds__(256, 2) void tessera_stacked_lanes(
     const float* x, const u16* w, float* out, u32 len, u32 rows, u32 n, u32 k, u32 block,
-    u32 first, u32 col_step) {
+    u32 first, u32 col_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
     u32 idx = blockIdx.x * TM_WARPS + (threadIdx.x >> 5);
     if (idx >= len) return;
     u32 lane = threadIdx.x & 31u;
@@ -771,7 +771,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void tessera_stacked_lanes(
     u32 r0 = blockIdx.y * 8u;
     u32 nr = min(rows - r0, 8u);
     const u16* wr = w + u64(batch) * block + first + u64(col) * col_step;
-    const float* xb = x + (u64(batch) * rows + r0) * k;
+    const float* xb = x + u64(batch) * x_bs + u64(r0) * x_rs;
     float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     for (u32 i = lane << 3; i < k; i += 256u) {
         uint4 h = fg_ld_nc4(wr + i);
@@ -782,7 +782,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void tessera_stacked_lanes(
 #pragma unroll
         for (u32 r = 0u; r < 8u; r++) {
             if (r >= nr) break;
-            const float* xp = xb + u64(r) * k + i;
+            const float* xp = xb + u64(r) * x_rs + i;
             float4 x0 = *reinterpret_cast<const float4*>(xp);
             float4 x1 = *reinterpret_cast<const float4*>(xp + 4u);
             acc[r] = fmaf(a0, x0.x, fmaf(a1, x0.y, fmaf(a2, x0.z, fmaf(a3, x0.w, acc[r]))));
@@ -793,7 +793,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void tessera_stacked_lanes(
     for (u32 r = 0u; r < 8u; r++) {
         if (r >= nr) break;
         float s = fg_warp_sum(acc[r]);
-        if (lane == 0u) out[(u64(batch) * rows + r0 + r) * n + col] = s;
+        if (lane == 0u) out[u64(batch) * o_bs + u64(r0 + r) * o_rs + col] = s;
     }
 }
 
@@ -806,20 +806,20 @@ struct alignas(16) fg_stacked_smem {
 // Tensor-Core BF16 transposed stacked matmul, 16x32 per CTA.
 extern "C" __global__ __launch_bounds__(128, 6) void tessera_stacked_wide(
     const float* x, const u16* w, float* out, u32 rows, u32 n, u32 k, u32 block, u32 first,
-    u32 k_step) {
+    u32 k_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
     __shared__ fg_stacked_smem sm;
     u32 tile = blockIdx.x, rtiles = (rows + 15u) >> 4u;
     u32 batch = blockIdx.y / rtiles, r0 = (blockIdx.y % rtiles) * 16u;
     u32 tid = threadIdx.x, wt = tid >> 5u, lane = tid & 31u, g = lane >> 2u, t = lane & 3u;
     u32 xr = tid >> 3u, xc = (tid & 7u) << 2u, xw = (tid & 7u) << 1u;
     u32 wk = tid >> 2u, wc = (tid & 3u) << 3u;
-    const float* xb = x + u64(batch) * rows * k;
+    const float* xb = x + u64(batch) * x_bs;
     const u16* wb = w + u64(batch) * block + first + (tile << 5u) + wc;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     uint4 cur = fg_ld_nc4(wb + u64(wk) * k_step);
     for (u32 k0 = 0u; k0 < k; k0 += 32u) {
         if (r0 + xr < rows) {
-            float4 xv = *reinterpret_cast<const float4*>(xb + u64(r0 + xr) * k + k0 + xc);
+            float4 xv = *reinterpret_cast<const float4*>(xb + u64(r0 + xr) * x_rs + k0 + xc);
             u32 h0 = fg_bf16x2(xv.x, xv.y);
             u32 h1 = fg_bf16x2(xv.z, xv.w);
             u32 l0 = fg_bf16x2(xv.x - __uint_as_float(h0 << 16u),
@@ -858,11 +858,11 @@ extern "C" __global__ __launch_bounds__(128, 6) void tessera_stacked_wide(
     }
     u32 col = (tile << 5u) + (wt << 3u) + (t << 1u);
     if (r0 + g < rows) {
-        *reinterpret_cast<float2*>(out + (u64(batch) * rows + r0 + g) * n + col) =
+        *reinterpret_cast<float2*>(out + u64(batch) * o_bs + u64(r0 + g) * o_rs + col) =
             make_float2(acc[0], acc[1]);
     }
     if (r0 + g + 8u < rows) {
-        *reinterpret_cast<float2*>(out + (u64(batch) * rows + r0 + g + 8u) * n + col) =
+        *reinterpret_cast<float2*>(out + u64(batch) * o_bs + u64(r0 + g + 8u) * o_rs + col) =
             make_float2(acc[2], acc[3]);
     }
 }

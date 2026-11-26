@@ -214,6 +214,43 @@ fn mla_prep_launch_reduction() {
     }
 }
 
+#[test]
+fn mla_stacked_permute() {
+    let cfg = mla::Config::glm53(4, 512);
+    let g = mla::stepper::<mla::RotatedMoe>(&cfg);
+    let mut platform = Platform::assumed(Limits::assumed());
+    platform.units = 48;
+    platform.bandwidth = 273e9;
+    platform.row.as_mut().unwrap().bf16_tile = Some([16, 8, 16]);
+    let base = Device::default().pinned(Pins::all(BF16_FORM)).on(platform);
+    let sizes = [(Seqs, 4), (Rows, 8), (Context, 64)];
+    let dev = base
+        .clone()
+        .without("stacked_wide_bf16")
+        .without("stacked_lanes_bf16")
+        .without("batched");
+    let plan = lower(&g, 0, &sizes, &dev).unwrap();
+    let bare = lower(
+        &g,
+        0,
+        &sizes,
+        &base
+            .without("fast_stacked_wide")
+            .without("fast_stacked_lanes"),
+    )
+    .unwrap();
+    let layers = cfg.stack.layers as usize;
+    assert_eq!(count(&plan, "fast_stacked_wide"), layers);
+    assert_eq!(count(&plan, "fast_stacked_lanes"), layers);
+    // Eliminates MLA input and output permute launches.
+    assert!(
+        count(&bare, "strided") >= count(&plan, "strided") + layers * 3,
+        "bare={} plan={}",
+        count(&bare, "strided"),
+        count(&plan, "strided"),
+    );
+}
+
 /// Fused `add_rms_norm` reduces steps and traffic on GLM-5.3 and Qwen3.
 #[test]
 fn glm53_and_qwen3_fuse() {
