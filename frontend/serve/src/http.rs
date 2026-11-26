@@ -71,6 +71,8 @@ pub struct Limits {
     pub write_timeout: Duration,
     /// Time between `: keep-alive` lines in a quiet stream.
     pub keep_alive: Duration,
+    /// Optional `Access-Control-Allow-Origin` header value.
+    pub cors: Option<String>,
 }
 
 impl Default for Limits {
@@ -83,6 +85,7 @@ impl Default for Limits {
             body_timeout: Duration::from_secs(60),
             write_timeout: Duration::from_secs(60),
             keep_alive: Duration::from_secs(5),
+            cors: None,
         }
     }
 }
@@ -108,6 +111,7 @@ fn reason(status: u16) -> &'static str {
     match status {
         100 => "Continue",
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
@@ -155,7 +159,14 @@ where
         if open.fetch_add(1, Ordering::Relaxed) >= limits.max_connections {
             REFUSED.add(1);
             let _ = stream.set_write_timeout(Some(limits.write_timeout));
-            let _ = head(&mut stream, 503, "text/plain", Some(0), true);
+            let _ = head(
+                &mut stream,
+                503,
+                "text/plain",
+                Some(0),
+                true,
+                limits.cors.as_deref(),
+            );
             continue;
         }
         let (limits, route) = (limits.clone(), route.clone());
@@ -176,10 +187,26 @@ fn connection(mut stream: TcpStream, limits: &Limits, route: &dyn Fn(&Request) -
             Ok(None) | Err(Fail::Gone) => return,
             Err(Fail::Status(status)) => {
                 MALFORMED.add(1);
-                let _ = head(&mut stream, status, "text/plain", Some(0), true);
+                let _ = head(
+                    &mut stream,
+                    status,
+                    "text/plain",
+                    Some(0),
+                    true,
+                    limits.cors.as_deref(),
+                );
                 return;
             }
         };
+        if request.method == "OPTIONS"
+            && let Some(origin) = limits.cors.as_deref()
+        {
+            REQUESTS.add(1);
+            if preflight(&mut stream, origin, close).is_err() || close {
+                return;
+            }
+            continue;
+        }
         let response = route(&request);
         REQUESTS.add(1);
         match response.status {
@@ -283,7 +310,7 @@ fn read(
         };
         buffer.drain(..used);
         if expect && (chunked || length > buffer.len()) {
-            head(stream, 100, "", None, false)?;
+            head(stream, 100, "", None, false, None)?;
         }
         let deadline = Instant::now() + limits.body_timeout;
         request.body = match chunked {
@@ -367,6 +394,28 @@ fn read_chunked(
     }
 }
 
+/// Appends CORS origin headers for `origin`.
+fn write_cors(out: &mut String, origin: &str) {
+    *out += &format!("Access-Control-Allow-Origin: {origin}\r\n");
+    if origin != "*" {
+        *out += "Vary: Origin\r\n";
+    }
+}
+
+/// Answers a CORS preflight request with 204 No Content.
+fn preflight(stream: &mut TcpStream, origin: &str, close: bool) -> io::Result<()> {
+    let mut out = format!("HTTP/1.1 204 {}\r\n", reason(204));
+    write_cors(&mut out, origin);
+    out += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
+    out += "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, anthropic-version\r\n";
+    out += "Access-Control-Max-Age: 86400\r\nContent-Length: 0\r\n";
+    if close {
+        out += "Connection: close\r\n";
+    }
+    out += "\r\n";
+    stream.write_all(out.as_bytes())
+}
+
 /// Writes a status line and headers. No length: chunked.
 fn head(
     stream: &mut TcpStream,
@@ -374,6 +423,7 @@ fn head(
     content_type: &str,
     length: Option<usize>,
     close: bool,
+    cors: Option<&str>,
 ) -> io::Result<()> {
     let mut out = format!("HTTP/1.1 {status} {}\r\n", reason(status));
     if status == 100 {
@@ -381,6 +431,9 @@ fn head(
         return stream.write_all(out.as_bytes());
     }
     out += &format!("Content-Type: {content_type}\r\n");
+    if let Some(origin) = cors {
+        write_cors(&mut out, origin);
+    }
     match length {
         Some(n) => out += &format!("Content-Length: {n}\r\n"),
         None => out += "Cache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n",
@@ -417,12 +470,20 @@ fn answer(
                 content_type,
                 Some(bytes.len()),
                 close,
+                limits.cors.as_deref(),
             )?;
             return stream.write_all(&bytes);
         }
         Body::Events(events) => events,
     };
-    head(stream, response.status, "text/event-stream", None, close)?;
+    head(
+        stream,
+        response.status,
+        "text/event-stream",
+        None,
+        close,
+        limits.cors.as_deref(),
+    )?;
     loop {
         match events.recv_timeout(limits.keep_alive) {
             Ok(data) => chunk(stream, format!("data: {data}\n\n").as_bytes())?,

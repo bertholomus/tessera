@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tessera_testkit::{TCP_TIMEOUT, tcp_bind, tcp_connect};
 
 /// A server over the mocks on a free loopback port.
-fn server() -> TcpStream {
+fn server(cors: Option<&str>) -> TcpStream {
     let listener = tcp_bind().unwrap();
     let address = listener.local_addr().unwrap();
     let slot = loaded(&Arc::new(MockGenerator::default()), false);
@@ -16,6 +16,7 @@ fn server() -> TcpStream {
         head_timeout: TCP_TIMEOUT,
         body_timeout: TCP_TIMEOUT,
         write_timeout: TCP_TIMEOUT,
+        cors: cors.map(str::to_string),
         ..Limits::default()
     };
     std::thread::spawn(move || run(listener, limits, move |r| route(&slot, r)));
@@ -24,7 +25,7 @@ fn server() -> TcpStream {
 
 /// Sends `request`, then reads until the server closes.
 fn exchange(request: &str) -> String {
-    let mut stream = server();
+    let mut stream = server(None);
     stream.write_all(request.as_bytes()).unwrap();
     let mut out = String::new();
     stream.read_to_string(&mut out).unwrap();
@@ -95,4 +96,18 @@ fn chunked_request_body() {
         "a".repeat(65)
     );
     assert!(exchange(&too_big).starts_with("HTTP/1.1 413 "));
+}
+
+#[test]
+fn cors_preflight() {
+    let mut stream = server(Some("https://app.example"));
+    let req = "OPTIONS /v1/chat/completions HTTP/1.1\r\n\r\nGET /health HTTP/1.1\r\nConnection: close\r\n\r\n";
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut out = String::new();
+    stream.read_to_string(&mut out).unwrap();
+    assert!(out.starts_with("HTTP/1.1 204 No Content\r\n"), "{out}");
+    assert!(out.contains("Access-Control-Allow-Origin: https://app.example\r\n"));
+    assert!(out.contains("Vary: Origin\r\n"));
+    assert!(out.contains("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"));
+    assert!(out.contains("HTTP/1.1 200 OK\r\n"));
 }
