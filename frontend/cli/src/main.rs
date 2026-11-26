@@ -1,4 +1,4 @@
-//! `tesserax [--recipe <src> | --model <dir | hf:<owner>/<name>[@<revision>]>] <verb>`.
+//! `tesserax [--recipe <src>] [--model <dir | hf:<owner>/<name>[@<revision>]>] <verb>`.
 
 mod fetch;
 mod mcp;
@@ -21,7 +21,7 @@ use std::process::ExitCode;
 use tessera_serve::ranks::FLAGS as RANKS;
 use tessera_serve::start::flags;
 
-const USAGE: &str = "usage: tesserax [--recipe <dir | git+<url>#<commit>> | --model <dir | hf:<owner>/<name>[@<revision>]>] <verb>
+const USAGE: &str = "usage: tesserax [--recipe <dir | git+<url>#<commit>>] [--model <dir | hf:<owner>/<name>[@<revision>]>] <verb>
   [--yes] [--max-tokens <n>] <prompt>...
                  answer one prompt. With no model flag, the default model may
                  pick a command for it instead, and asks first on a terminal

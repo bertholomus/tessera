@@ -41,6 +41,8 @@ pub enum Origin {
     Hub(String),
     /// A recipe built into tesserax, by catalog name.
     Builtin(&'static str),
+    /// A recipe paired with overriding weights.
+    Paired(Box<Origin>, Box<Origin>),
 }
 
 macro_rules! catalog {
@@ -105,7 +107,7 @@ fn hub_spec(value: &str) -> Option<Result<String, Stop>> {
 
 /// Splits out the model flags, up to `--`.
 pub fn split(given: &[String]) -> Result<(Option<Origin>, Vec<String>), Stop> {
-    let mut origin = None;
+    let (mut recipe, mut model) = (None, None);
     let mut rest = Vec::new();
     let mut args = given.iter();
     while let Some(arg) = args.next() {
@@ -119,21 +121,33 @@ pub fn split(given: &[String]) -> Result<(Option<Origin>, Vec<String>), Stop> {
             continue;
         }
         let value = args.next().ok_or(Stop::Usage)?.clone();
-        let found = match arg.as_str() {
+        match arg.as_str() {
             // A directory or source wins over a catalog name.
-            "--recipe" => match CATALOG.iter().find(|(n, _)| *n == value) {
-                Some((name, _)) if !Path::new(&value).exists() => Origin::Builtin(name),
-                _ => Origin::Recipe(value),
-            },
-            _ => match hub_spec(&value) {
-                Some(spec) => Origin::Hub(spec?),
-                None => Origin::Model(value),
-            },
-        };
-        if origin.replace(found).is_some() {
-            return Err(Stop::Usage);
+            "--recipe" => {
+                let found = match CATALOG.iter().find(|(n, _)| *n == value) {
+                    Some((name, _)) if !Path::new(&value).exists() => Origin::Builtin(name),
+                    _ => Origin::Recipe(value),
+                };
+                if recipe.replace(found).is_some() {
+                    return Err(Stop::Usage);
+                }
+            }
+            _ => {
+                let found = match hub_spec(&value) {
+                    Some(spec) => Origin::Hub(spec?),
+                    None => Origin::Model(value),
+                };
+                if model.replace(found).is_some() {
+                    return Err(Stop::Usage);
+                }
+            }
         }
     }
+    let origin = match (recipe, model) {
+        (Some(r), Some(m)) => Some(Origin::Paired(Box::new(r), Box::new(m))),
+        (Some(o), None) | (None, Some(o)) => Some(o),
+        (None, None) => None,
+    };
     Ok((origin, rest))
 }
 
@@ -167,23 +181,34 @@ impl Source {
         let origin = origin.ok_or(Stop::Usage)?;
         let settings = tessera_frontend_settings::read();
         let (cache, token, dump_sites) = (settings.recipes, settings.hf_token, settings.dump_sites);
-        let mut fetched = None;
-        let recipe = match &origin {
-            Origin::Recipe(src) => Some(Recipe::open(src, cache.as_deref())?),
-            Origin::Builtin(name) => Some(builtin(name).ok_or(Stop::Usage)??),
-            Origin::Model(_) => None,
-            Origin::Hub(spec) => {
+        let (recipe_side, model_side) = match &origin {
+            Origin::Paired(r, m) => (Some(r.as_ref()), Some(m.as_ref())),
+            Origin::Recipe(_) | Origin::Builtin(_) => (Some(&origin), None),
+            Origin::Model(_) | Origin::Hub(_) => (None, Some(&origin)),
+        };
+        let recipe = match recipe_side {
+            Some(Origin::Recipe(src)) => Some(Recipe::open(src, cache.as_deref())?),
+            Some(Origin::Builtin(name)) => Some(builtin(name).ok_or(Stop::Usage)??),
+            _ => None,
+        };
+        let manifest = manifest.or_else(|| {
+            recipe
+                .as_ref()
+                .and_then(|r| r.serve.get("manifest"))
+                .and_then(|v| v.as_str())
+        });
+        let fetched = match model_side {
+            Some(Origin::Hub(spec)) => {
                 let dir = cache.as_deref().ok_or(tessera_recipe::Error::NoCache)?;
-                let token = token.as_deref();
-                fetched = Some(tessera_recipe::fetch_hf(
+                Some(tessera_recipe::fetch_hf(
                     spec,
                     dir,
-                    token,
+                    token.as_deref(),
                     &progress,
                     (files, manifest),
-                )?);
-                None
+                )?)
             }
+            _ => None,
         };
         Ok(Source {
             origin,
@@ -234,13 +259,31 @@ impl Source {
         Ok(options)
     }
 
+    /// Explicit weights directory from `--model`, if given.
+    pub fn override_weights(&self) -> Option<PathBuf> {
+        if let Some(dir) = &self.fetched {
+            return Some(dir.clone());
+        }
+        match &self.origin {
+            Origin::Model(dir) => Some(PathBuf::from(dir)),
+            Origin::Paired(_, m) => match m.as_ref() {
+                Origin::Model(dir) => Some(PathBuf::from(dir)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Serve options for this model alone.
     fn one(&self, rest: &[String]) -> Result<Options, Stop> {
         let mut options = Options::default();
         options.progress = self.progress.clone();
+        let custom = self.override_weights();
         if let Some(r) = &self.recipe {
             let (cache, token) = (self.cache.as_deref(), self.token.as_deref());
-            options.model = r.weights_as(self.files, cache, token, &self.progress)?;
+            if custom.is_none() {
+                options.model = r.weights_as(self.files, cache, token, &self.progress)?;
+            }
             options.name = Some(r.name.clone());
             options.lower = r.lower.clone();
             options.names = r.names();
@@ -271,10 +314,8 @@ impl Source {
             let value = given.next().ok_or(Stop::Usage)?;
             apply(&mut options, &flag, Some(value))?;
         }
-        match (&self.origin, &self.fetched) {
-            (Origin::Model(dir), _) => options.model = Path::new(dir).into(),
-            (_, Some(dir)) => options.model = dir.clone(),
-            _ => {}
+        if let Some(dir) = custom {
+            options.model = dir;
         }
         Ok(options)
     }
