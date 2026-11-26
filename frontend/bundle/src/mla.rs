@@ -53,6 +53,7 @@ struct Hf {
     index_head_dim: Option<u64>,
     index_topk: Option<u64>,
     index_topk_freq: Option<u64>,
+    indexer_rope_interleave: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +78,7 @@ pub fn config(json: &str, seqs: u64, context: u64) -> Result<Config, serde_json:
             dim,
             keep,
             every: h.index_topk_freq.unwrap_or(1),
+            rope_interleave: h.indexer_rope_interleave.unwrap_or(true),
         }),
         _ => None,
     };

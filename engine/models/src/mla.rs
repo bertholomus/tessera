@@ -19,6 +19,8 @@ const LATENT: DimName = DimName::named("Latent");
 const DENSE_FFN: DimName = DimName::named("DenseFfn");
 const INDEX_HEADS: DimName = DimName::named("IndexHeads");
 const INDEX_DIM: DimName = DimName::named("IndexDim");
+/// Unrotated tail of an indexer key or query.
+const INDEX_NOPE: DimName = DimName::named("IndexNope");
 /// Keys an indexer keeps for each query.
 const INDEX_KEEP: DimName = DimName::named("IndexKeep");
 const DENSE_LAYERS: DimName = DimName::named("DenseLayers");
@@ -55,6 +57,8 @@ pub struct Index {
     pub keep: u64,
     /// Past the dense layers, every n-th layer indexes.
     pub every: u64,
+    /// Interleaved RoPE pairs when true, split halves otherwise.
+    pub rope_interleave: bool,
 }
 
 impl Config {
@@ -66,6 +70,7 @@ impl Config {
             dim: 128,
             keep: 2048,
             every: 4,
+            rope_interleave: true,
         };
         Self {
             stack: Stack::sized(sizes, max_seqs, max_context),
@@ -130,6 +135,7 @@ impl Config {
             dim: 32,
             keep: 4,
             every: 2,
+            rope_interleave: true,
         };
         // Rotations turn 128 channels at a time.
         Self {
@@ -169,6 +175,9 @@ impl Config {
                 (INDEX_DIM, i.dim),
                 (INDEX_KEEP, i.keep),
             ]);
+            if self.rope > 0 && i.dim > self.rope {
+                own.push((INDEX_NOPE, i.dim - self.rope));
+            }
         }
         self.stack.dims(&own)
     }
@@ -455,26 +464,37 @@ impl Pass<'_> {
         (w.o.apply(&o_in), keys)
     }
 
+    /// Rotates the rotary prefix of an indexer tensor.
+    fn turn_index(&self, t: Tensor, index: &Index) -> Tensor {
+        let c = self.c;
+        if c.rope == 0 || c.rope > index.dim {
+            return t;
+        }
+        let pairs = match index.rope_interleave {
+            true => Pairs::Adjacent,
+            false => Pairs::Halves,
+        };
+        if c.rope == index.dim {
+            return t.rope(self.positions, c.rope_theta, pairs);
+        }
+        let last = t.ty().rank() as u32 - 1;
+        let front = t
+            .slice(last, 0u64, ROPE)
+            .rope(self.positions, c.rope_theta, pairs);
+        let back = t.slice(last, ROPE, INDEX_NOPE);
+        front.concat(&back)
+    }
+
     /// Each query's best `INDEX_KEEP` visible keys.
     fn pick_keys(&self, l: usize, w: &Indexer, qr: &Tensor, h: &Tensor) -> Tensor {
         let c = self.c;
-        let idx = c.index.expect("indexer config");
-        let turn = |t: Tensor| {
-            let last = t.ty().rank() as u32 - 1;
-            let rot = t
-                .slice(last, 0u64, ROPE)
-                .rope(self.positions, c.rope_theta, Pairs::Adjacent);
-            match idx.dim.checked_sub(c.rope) {
-                Some(0) | None => rot,
-                Some(pass) => rot.concat(&t.slice(last, ROPE, pass)),
-            }
-        };
-        let q = turn(
-            qr.matmul(&w.wq)
-                .reshape(self.lead([INDEX_HEADS.into(), INDEX_DIM.into()])),
-        );
+        let ix = c.index.as_ref().expect("an indexer config");
+        let q = qr
+            .matmul(&w.wq)
+            .reshape(self.lead([INDEX_HEADS.into(), INDEX_DIM.into()]));
+        let q = self.turn_index(q, ix);
         let k = h.matmul(&w.wk).center().rms_norm(&w.k_norm, c.eps);
-        let k = turn(k.add_vector(&w.k_bias));
+        let k = self.turn_index(k.add_vector(&w.k_bias), ix);
         // A step reads its slot's kept keys.
         let k = match &self.step {
             None => k,

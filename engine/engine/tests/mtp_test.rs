@@ -29,6 +29,7 @@ fn mla_cfg(indexed: bool, ffn: u64) -> mla::Config {
         dim: 16,
         keep: 8,
         every: 1,
+        rope_interleave: true,
     });
     cfg.stack.taps = vec![mtp::tap_layer(&cfg)];
     cfg
