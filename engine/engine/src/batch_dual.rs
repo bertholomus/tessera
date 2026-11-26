@@ -145,7 +145,7 @@ impl<'a> BatchMtp<'a> {
             push_tail(&mut p.d_buf, &raw, peer.d_width);
         }
         if self.drafter.lanes().is_some() && !m_toks.is_empty() {
-            self.ensure_slot_pages(slot, skip + m_toks.len())?;
+            self.ensure_slot_pages(slot, m_start as usize + m_toks.len())?;
         }
         flush_mtp(
             self.drafter,
