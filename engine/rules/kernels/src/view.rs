@@ -2,7 +2,7 @@
 
 use tessera_codegen::kept::{self, Layout};
 use tessera_codegen::prelude::*;
-use tessera_graph::{Op, View};
+use tessera_graph::{DType, Op, View};
 use tessera_lower::form::{Load as Stored, plain, writable};
 use tessera_lower::kernels::Join;
 use tessera_lower::{Arg, Draft, Extent, Home, Kernel, Launch, Shape, Source, Step, T, Term, Tree};
@@ -36,7 +36,7 @@ fn strided(
         let o = gid() / (inner4 * mid * upper);
         let at = start + o * outer_step + u * upper_step + m * mid_step + i;
         let v = x.load4(at as u64);
-        out.store4((gid() * 4) as u64, v);
+        out.store4((gid() * 4) as u64, F32x4::new(v.x, v.y, v.z, v.w));
     } else {
         if gid() >= len {
             return;
@@ -141,8 +141,14 @@ fn nested(
     else {
         return None;
     };
-    let wide = in_form.name() == "f32"
-        && out_form.name() == "f32"
+    let float_form = |f: &dyn Stored| {
+        matches!(
+            f.dtype(),
+            DType::F32 | DType::Bf16 | DType::F16 | DType::Fp8
+        )
+    };
+    let wide = float_form(in_form)
+        && float_form(out_form)
         && inner_step == 1
         && inner.is_multiple_of(4)
         && start.is_multiple_of(4)
