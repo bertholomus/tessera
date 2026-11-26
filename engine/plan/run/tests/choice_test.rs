@@ -1,13 +1,13 @@
 //! How selection picks among rules: cost, favor and limits.
 
 use tessera_graph::DimName::{self, Hidden, Rows, Seqs};
-use tessera_graph::{Act, DType, Dim, Graph, TensorType};
+use tessera_graph::{Act, DType, Dim, Graph, Stage, TensorType};
 use tessera_lower::kernels::Map;
-use tessera_lower::sites;
 use tessera_lower::{
     Device, Draft, Kernel, Launch, Limits, Needs, Plan, Platform, Propose, Rule, Shape, Step, T,
     Tree, explain, lower, select,
 };
+use tessera_lower::{Term, sites};
 use tessera_run::testing::host;
 use tessera_trace::{EntryKind, Model, Port, Role};
 
@@ -244,4 +244,44 @@ fn grids_bar_kernels() {
         report.contains("grid height 204800 exceeds 65535"),
         "{report}"
     );
+}
+
+/// Matches only the inner add stage of a chain.
+struct Inner;
+
+impl Propose for Inner {
+    fn at(&self, tree: &Tree, at: T) -> Option<Vec<Draft>> {
+        if tree.node(at).term != Term::Stage(Stage::Add) {
+            return None;
+        }
+        let len = tree.elements(at);
+        let reads = tree.node(at).args.clone();
+        Some(vec![Draft::new(Priced { len, guess: 1e-6 }, reads, len)])
+    }
+}
+
+/// Matches only the outer silu stage without swallowing add.
+struct Outer;
+
+impl Propose for Outer {
+    fn at(&self, tree: &Tree, at: T) -> Option<Vec<Draft>> {
+        if tree.node(at).term != Term::Stage(Stage::Act(Act::Silu)) {
+            return None;
+        }
+        let len = tree.elements(at);
+        let reads = tree.node(at).args.clone();
+        Some(vec![Draft::new(Dear { len }, reads, len)])
+    }
+}
+
+#[test]
+fn swallowed_fallback_works() {
+    let inner = Rule::made("inner", module_path!(), Inner);
+    let only_fused = pair().adding(inner).favoring("inner");
+    assert_eq!(names(&plan(&only_fused)), ["cheap"]);
+
+    // When a non-swallowing cover exists, the favored rule still wins.
+    let outer = Rule::made("outer", module_path!(), Outer);
+    let split = pair().adding(inner).adding(outer).favoring("inner");
+    assert_eq!(names(&plan(&split)), ["priced", "dear"]);
 }
