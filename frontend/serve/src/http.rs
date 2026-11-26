@@ -235,6 +235,7 @@ fn read(
         };
         let mut close = parsed.version != Some(1);
         let mut length: Option<usize> = None;
+        let mut chunked = false;
         let mut expect = false;
         let mut headers = Vec::with_capacity(parsed.headers.len());
         for header in parsed.headers.iter() {
@@ -243,7 +244,10 @@ fn read(
             let name = header.name;
             headers.push((name.to_ascii_lowercase(), value.to_string()));
             if name.eq_ignore_ascii_case("transfer-encoding") {
-                return Err(Fail::Status(501));
+                if !value.eq_ignore_ascii_case("chunked") || chunked {
+                    return Err(Fail::Status(501));
+                }
+                chunked = true;
             } else if name.eq_ignore_ascii_case("content-length") {
                 let n: usize = value.parse().map_err(|_| Fail::Status(400))?;
                 if length.is_some_and(|m| m != n) {
@@ -260,6 +264,9 @@ fn read(
                 expect = value.eq_ignore_ascii_case("100-continue");
             }
         }
+        if chunked && length.is_some() {
+            return Err(Fail::Status(400));
+        }
         let length = length.unwrap_or(0);
         if length > limits.max_body {
             return Err(Fail::Status(413));
@@ -274,17 +281,88 @@ fn read(
             body: Vec::new(),
         };
         buffer.drain(..used);
-        if expect && length > buffer.len() {
+        if expect && (chunked || length > buffer.len()) {
             head(stream, 100, "", None, false)?;
         }
         let deadline = Instant::now() + limits.body_timeout;
-        while buffer.len() < length {
+        request.body = match chunked {
+            true => read_chunked(stream, buffer, limits, deadline)?,
+            false => {
+                while buffer.len() < length {
+                    if fill(stream, buffer, deadline)? == 0 {
+                        return Err(Fail::Gone);
+                    }
+                }
+                buffer.drain(..length).collect()
+            }
+        };
+        return Ok(Some((request, close)));
+    }
+}
+
+/// Reads one CRLF-terminated line from `buffer`, filling as needed.
+fn read_line(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+    max: usize,
+    deadline: Instant,
+) -> Result<Vec<u8>, Fail> {
+    loop {
+        if let Some(at) = buffer.windows(2).position(|w| w == b"\r\n") {
+            let line = buffer[..at].to_vec();
+            buffer.drain(..at + 2);
+            return Ok(line);
+        }
+        if buffer.len() >= max {
+            return Err(Fail::Status(400));
+        }
+        if fill(stream, buffer, deadline)? == 0 {
+            return Err(Fail::Gone);
+        }
+    }
+}
+
+/// Decodes an HTTP/1.1 chunked body up to `limits.max_body`.
+fn read_chunked(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+    limits: &Limits,
+    deadline: Instant,
+) -> Result<Vec<u8>, Fail> {
+    let mut body = Vec::new();
+    loop {
+        let line = read_line(stream, buffer, limits.max_head, deadline)?;
+        let line = std::str::from_utf8(&line).map_err(|_| Fail::Status(400))?;
+        let hex = line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(hex, 16).map_err(|_| Fail::Status(400))?;
+        if size == 0 {
+            let mut trailer_bytes = 0usize;
+            loop {
+                let line = read_line(stream, buffer, limits.max_head, deadline)?;
+                if line.is_empty() {
+                    return Ok(body);
+                }
+                trailer_bytes = trailer_bytes.saturating_add(line.len() + 2);
+                if trailer_bytes > limits.max_head {
+                    return Err(Fail::Status(431));
+                }
+            }
+        }
+        let next = body.len().checked_add(size).ok_or(Fail::Status(413))?;
+        if next > limits.max_body {
+            return Err(Fail::Status(413));
+        }
+        let need = size.checked_add(2).ok_or(Fail::Status(413))?;
+        while buffer.len() < need {
             if fill(stream, buffer, deadline)? == 0 {
                 return Err(Fail::Gone);
             }
         }
-        request.body = buffer.drain(..length).collect();
-        return Ok(Some((request, close)));
+        if &buffer[size..size + 2] != b"\r\n" {
+            return Err(Fail::Status(400));
+        }
+        body.extend_from_slice(&buffer[..size]);
+        buffer.drain(..size + 2);
     }
 }
 

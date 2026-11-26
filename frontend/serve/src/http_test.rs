@@ -60,8 +60,12 @@ fn refused_requests() {
             "413",
         ),
         (
-            "POST /tokenize HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "POST /tokenize HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
             "501",
+        ),
+        (
+            "POST /tokenize HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n",
+            "400",
         ),
         ("NOT A REQUEST\r\n\r\n", "400"),
     ];
@@ -69,4 +73,26 @@ fn refused_requests() {
         let out = exchange(request);
         assert!(out.starts_with(&format!("HTTP/1.1 {status} ")), "{out}");
     }
+}
+
+#[test]
+fn chunked_request_body() {
+    let part1 = r#"{"prompt":"#;
+    let part2 = r#""hi"}"#;
+    let first = format!(
+        "POST /tokenize HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n         {:x};ext=1\r\n{part1}\r\n{:x}\r\n{part2}\r\n0\r\nX-End: 1\r\n\r\n",
+        part1.len(),
+        part2.len()
+    );
+    let second = "GET /health HTTP/1.1\r\nConnection: close\r\n\r\n";
+    let out = exchange(&format!("{first}{second}"));
+    assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+    assert!(out.contains(r#""count":2"#), "{out}");
+    assert_eq!(out.matches("HTTP/1.1 200 OK").count(), 2, "{out}");
+    let too_big = format!(
+        "POST /tokenize HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n         {:x}\r\n{}\r\n0\r\n\r\n",
+        65,
+        "a".repeat(65)
+    );
+    assert!(exchange(&too_big).starts_with("HTTP/1.1 413 "));
 }
