@@ -10,8 +10,8 @@ use tessera_checkpoint::File;
 use tessera_interp::{Tensor, run};
 use tessera_lower::{Device, Pins, lower};
 use tessera_models::Stack;
-use tessera_models::qwen35::{Config, Mixing, Recurrent, program};
-use tessera_parity::{Spec, loaded, suite};
+use tessera_models::qwen35::{Config, Mixing, Recurrent, program, stepper};
+use tessera_parity::{DRIFT, Spec, Stepper, loaded, suite};
 use tessera_run::testing::runs;
 use tessera_testkit::max_abs_diff;
 use tessera_trace::Composite::{Layer, Mlp, Model};
@@ -70,13 +70,19 @@ fn release() -> Graph {
     program(&clef(1, 1024))
 }
 
+const STEPPER: Stepper = Stepper {
+    small: || stepper(&tessera_models::qwen35::small()),
+    release: || stepper(&clef(1, 1024)),
+    drift: DRIFT,
+};
+
 const SPEC: Spec = Spec {
     name: "qwen35",
     release,
     parameters: 26_895_998_464,
     regions: &[(Layer, 64), (Mlp, 64), (Model, 1)],
     small: Some(|| program(&tessera_models::qwen35::small())),
-    stepper: None,
+    stepper: Some(STEPPER),
     files: &[(include_str!("manifests/hf.json"), release)],
     golden: None,
 };

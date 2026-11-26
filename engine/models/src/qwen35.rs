@@ -2,15 +2,15 @@
 
 use crate::decoder::{Mlp, Swiglu};
 use crate::keys::{At, Keys};
-use crate::shared::{Attend, NOPE, ROPE, Stack, part, sizes};
+use crate::shared::{Attend, NOPE, ROPE, Stack, Steps, part, rows as kept_rows, sizes};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::hf::*;
-use tessera_trace::tokens;
 use tessera_trace::{
-    Act, Composite, Dim, DimExpr, DimName, Embed, Graph, Linear, Mask, Model, Norm, Pairs, PathSeg,
-    Role, Taps, Tensor, Vector, Weights,
+    Act, Composite, DType, Dim, DimExpr, DimName, Embed, Graph, Kept, Linear, Mask, Model, Norm,
+    Pairs, PathSeg, Role, Size, Taps, Tensor, TensorType, Vector, Weights, pick, step_ports,
+    tokens,
 };
 
 /// A linear-attention layer's query and key heads.
@@ -21,6 +21,8 @@ pub(crate) const KEY_DIM: DimName = DimName::named("KeyDim");
 pub(crate) const VALUE_DIM: DimName = DimName::named("ValueDim");
 /// Rows a causal filter reads, its own included.
 pub(crate) const WINDOW: DimName = DimName::named("Window");
+/// Kept conv history rows per linear layer.
+const GDN_HIST: DimName = DimName::named("GdnHist");
 
 pub struct Config {
     /// `heads` and `head_dim` are the full-attention layers'.
@@ -115,6 +117,7 @@ impl Config {
             (KEY_DIM, l.key_dim),
             (VALUE_DIM, l.value_dim),
             (WINDOW, l.window),
+            (GDN_HIST, l.window.saturating_sub(1)),
         ];
         if self.partial() {
             own.extend([(ROPE, self.rotary), (NOPE, width - self.rotary)]);
@@ -155,7 +158,22 @@ pub struct Full {
 impl Full {
     /// Normed rows `h` `[Seqs, Context, Hidden]`, at `positions`.
     pub fn apply(&self, m: &Model, c: &Config, h: &Tensor, positions: &Tensor) -> Tensor {
-        let lead = vec![Seqs.into(), Context.into()];
+        self.apply_step(m, c, h, positions, None)
+    }
+
+    /// Whole-sequence or ragged-step gated attention.
+    pub fn apply_step(
+        &self,
+        m: &Model,
+        c: &Config,
+        h: &Tensor,
+        positions: &Tensor,
+        step: Option<(&Kept, &Kept, &Tensor)>,
+    ) -> Tensor {
+        let lead: Vec<DimExpr> = match step {
+            Some(_) => vec![Rows.into()],
+            None => vec![Seqs.into(), Context.into()],
+        };
         let shape = [Heads.into(), KvHeads.into(), HeadDim.into()];
         let mut heads =
             Attend::new(&self.o, lead, shape).rotary(positions, c.rope_theta, Pairs::Halves);
@@ -163,8 +181,9 @@ impl Full {
             heads = heads.partial([ROPE.into(), NOPE.into()]);
         }
         let both = heads.split(h.matmul(&self.q), Heads, HeadDim * 2u64);
-        let q = norm(&both.slice(3, 0u64, HeadDim), &self.q_norm, c.eps);
-        let gate = both.slice(3, HeadDim, HeadDim).act(Act::Sigmoid);
+        let last = both.ty().rank() as u32 - 1;
+        let q = norm(&both.slice(last, 0u64, HeadDim), &self.q_norm, c.eps);
+        let gate = both.slice(last, HeadDim, HeadDim).act(Act::Sigmoid);
         let k = norm(
             &heads.split(h.matmul(&self.k), KvHeads, HeadDim),
             &self.k_norm,
@@ -173,7 +192,14 @@ impl Full {
         let v = heads.split(h.matmul(&self.v), KvHeads, HeadDim);
         let (q, k) = (heads.rotate(q), heads.rotate(k));
         let scale = 1.0 / (c.stack.head_dim as f32).sqrt();
-        let out = m.attend(Mask::Causal, scale, [&q, &k, &v], None);
+        let out = match step {
+            Some((k_kept, v_kept, slots)) => {
+                let by = [slots, positions];
+                let (k, v) = (k.append(k_kept, by), v.append(v_kept, by));
+                m.attend_rows(Mask::Causal, scale, [&q, &k, &v], by, None)
+            }
+            None => m.attend(Mask::Causal, scale, [&q, &k, &v], None),
+        };
         heads.merge(out.mul(&gate))
     }
 }
@@ -209,12 +235,35 @@ pub struct DeltaNet {
 impl DeltaNet {
     /// Normed rows `h` `[Seqs, Context, Hidden]`.
     pub fn apply(&self, m: &Model, c: &Config, h: &Tensor) -> Tensor {
-        let rows = |a: DimExpr, b: DimExpr| vec![Seqs.into(), Context.into(), a, b];
+        self.apply_step(m, c, h, None)
+    }
+
+    /// Whole-sequence or ragged-step gated delta rule.
+    pub fn apply_step(
+        &self,
+        m: &Model,
+        c: &Config,
+        h: &Tensor,
+        step: Option<(&Kept, &Kept, [&Tensor; 2])>,
+    ) -> Tensor {
+        let lead: Vec<DimExpr> = match step {
+            Some(_) => vec![Rows.into()],
+            None => vec![Seqs.into(), Context.into()],
+        };
+        let axis = lead.len() as u32;
+        let shape = |rest: &[DimExpr]| -> Vec<DimExpr> {
+            lead.iter().cloned().chain(rest.iter().cloned()).collect()
+        };
         let keys = KEY_HEADS * KEY_DIM;
         let values = VALUE_HEADS * VALUE_DIM;
-        let mixed = h.matmul(&self.qkv).conv(&self.conv).act(Act::Silu);
-        let split = |start: DimExpr, len: DimExpr, [heads, width]: [DimExpr; 2]| {
-            mixed.slice(2, start, len).reshape(rows(heads, width))
+        let raw = h.matmul(&self.qkv);
+        let mixed = match step {
+            Some((conv_st, _, ids)) => raw.conv_rows(&self.conv, 1, conv_st, ids),
+            None => raw.conv(&self.conv),
+        }
+        .act(Act::Silu);
+        let split = |start: DimExpr, len: DimExpr, pair: [DimExpr; 2]| {
+            mixed.slice(axis, start, len).reshape(shape(&pair))
         };
         let key = [KEY_HEADS.into(), KEY_DIM.into()];
         let (q, k) = (
@@ -239,14 +288,17 @@ impl DeltaNet {
         let decay = decay.mul(&self.a_log.stored().act(Act::Exp)).scale(-1.0);
         let rate = h.matmul(&self.b).act(Act::Sigmoid);
         // The query's unit scale and the rule's root fold together.
-        let out = m.delta(width.recip(), [&q, &k, &v], [&decay, &rate]);
+        let out = match step {
+            Some((_, delta_st, ids)) => {
+                m.delta_rows(width.recip(), delta_st, [&q, &k, &v], [&decay, &rate], ids)
+            }
+            None => m.delta(width.recip(), [&q, &k, &v], [&decay, &rate]),
+        };
         let z = h
             .matmul(&self.z)
-            .reshape(rows(VALUE_HEADS.into(), VALUE_DIM.into()));
+            .reshape(shape(&[VALUE_HEADS.into(), VALUE_DIM.into()]));
         let gated = out.rms_norm(&self.norm, c.eps).mul(&z.act(Act::Silu));
-        gated
-            .reshape(vec![Seqs.into(), Context.into(), values])
-            .matmul(&self.out)
+        gated.reshape(shape(&[values])).matmul(&self.out)
     }
 }
 
@@ -353,6 +405,12 @@ impl Qwen35 {
     }
 }
 
+/// One layer's kept state during autoregressive stepping.
+enum LayerCache {
+    Linear { conv: Kept, state: Kept },
+    Full { k: Kept, v: Kept },
+}
+
 /// Each row's logits, from tokens and positions `[Seqs, Context]`.
 pub fn forward(m: &Model, c: &Config, w: &Qwen35, tokens: &Tensor, positions: &Tensor) -> Tensor {
     let [logits] = m.composite(Composite::Model, || {
@@ -364,13 +422,31 @@ pub fn forward(m: &Model, c: &Config, w: &Qwen35, tokens: &Tensor, positions: &T
 
 /// Each row's state after the final norm, before the head.
 pub fn hidden(m: &Model, c: &Config, w: &Qwen35, tokens: &Tensor, positions: &Tensor) -> Tensor {
+    hidden_step(m, c, w, tokens, positions, None)
+}
+
+fn hidden_step(
+    m: &Model,
+    c: &Config,
+    w: &Qwen35,
+    tokens: &Tensor,
+    positions: &Tensor,
+    step: Option<(&Tensor, &[LayerCache])>,
+) -> Tensor {
     let mut x = m.embed(tokens, &w.ends.embed);
-    for l in &w.layers {
+    for (i, l) in w.layers.iter().enumerate() {
         let [out] = m.composite(Composite::Layer, || {
             let h = norm(&x, &l.common.ln1, c.eps);
-            let mixed = match &l.mixer {
-                Mixer::Linear(net) => net.apply(m, c, &h),
-                Mixer::Full(attn) => attn.apply(m, c, &h, positions),
+            let mixed = match (&l.mixer, step.map(|(slots, c)| (slots, &c[i]))) {
+                (Mixer::Linear(net), Some((sl, LayerCache::Linear { conv, state }))) => {
+                    net.apply_step(m, c, &h, Some((conv, state, [sl, positions])))
+                }
+                (Mixer::Linear(net), None) => net.apply(m, c, &h),
+                (Mixer::Full(attn), Some((sl, LayerCache::Full { k, v }))) => {
+                    attn.apply_step(m, c, &h, positions, Some((k, v, sl)))
+                }
+                (Mixer::Full(attn), None) => attn.apply(m, c, &h, positions),
+                _ => unreachable!("layer cache matches mixer"),
             };
             let x = x.add(&mixed);
             let h = norm(&x, &l.common.ln2, c.eps);
@@ -404,7 +480,7 @@ pub fn small() -> Config {
     }
 }
 
-crate::preset::preset!("qwen35", small: || program(&small()));
+crate::preset::preset!("qwen35", small: || stepper(&small()));
 
 /// One forward entry: tokens and positions in, logits out.
 pub fn program(c: &Config) -> Graph {
@@ -413,4 +489,53 @@ pub fn program(c: &Config) -> Graph {
     let [tokens, positions] = tokens(&m);
     let logits = forward(&m, c, &w, &tokens, &positions);
     m.finish([(Role::Logits, &logits)])
+}
+
+/// Step entry with kept GDN and KV states.
+pub fn stepper(c: &Config) -> Graph {
+    let mut dims = c.dims();
+    dims.push(Dim {
+        name: Rows,
+        size: Size::Bounded(c.stack.max_context),
+    });
+    let m = Model::new(dims);
+    let w = Qwen35::declare(&m, c);
+    let masked = c.stack.steps == Steps::Masked;
+    let ([tokens, positions, slots], allowed) = step_ports(&m, masked);
+    let qkv_width = KEY_HEADS * KEY_DIM * 2u64 + VALUE_HEADS * VALUE_DIM;
+    let mut caches = Vec::with_capacity(c.layers.len());
+    for kind in &c.layers {
+        caches.push(match kind {
+            Mixing::Linear => LayerCache::Linear {
+                conv: m.kept(TensorType::new(
+                    vec![Seqs.into(), GDN_HIST.into(), qkv_width.clone()],
+                    DType::F32,
+                )),
+                state: m.kept(TensorType::new(
+                    vec![
+                        Seqs.into(),
+                        VALUE_HEADS.into(),
+                        KEY_DIM.into(),
+                        VALUE_DIM.into(),
+                    ],
+                    DType::F32,
+                )),
+            },
+            Mixing::Full => LayerCache::Full {
+                k: m.kept(TensorType::new(
+                    kept_rows([KvHeads.into(), HeadDim.into()]),
+                    DType::F32,
+                )),
+                v: m.kept(TensorType::new(
+                    kept_rows([KvHeads.into(), HeadDim.into()]),
+                    DType::F32,
+                )),
+            },
+        });
+    }
+    let [logits] = m.composite(Composite::Model, || {
+        let h = hidden_step(&m, c, &w, &tokens, &positions, Some((&slots, &caches)));
+        [h.unembed(w.head.as_ref().unwrap_or(&w.ends.embed))]
+    });
+    pick(&m, &logits, allowed.as_ref(), None)
 }

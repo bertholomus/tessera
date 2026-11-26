@@ -75,8 +75,10 @@ pub fn steps(spec: &Spec) {
             got[(s * LEN + p) * vocab..][..vocab].copy_from_slice(row);
         }
     }
-    for kept in 0..step.kept.len() {
-        assert!(store.len(kept) >= LEN, "kept rows {kept}");
+    for (kept, ty) in step.kept.iter().enumerate() {
+        if ty.shape.0.get(1) == Some(&Context.into()) {
+            assert!(store.len(kept) >= LEN, "kept rows {kept}");
+        }
     }
     let off = max_abs_diff(&got, want);
     assert!(
