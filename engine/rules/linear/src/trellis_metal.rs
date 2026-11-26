@@ -1,10 +1,11 @@
 //! Metal tile-streaming trellis matmul for decode and prefill.
 
-use tessera_graph::{Op, Order, Stage};
+use crate::{Dense, launch_args};
+use tessera_graph::Order;
 use tessera_lower::Backend;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
-    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term, Tree,
+    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree,
 };
 
 const BLOCK: usize = 128;
@@ -15,21 +16,6 @@ const DEC_SMEM: usize = 4 * 128 * 4;
 const PF16_SMEM: usize = (16 * 132 + 8 * 16 * 20) * 4;
 const PF32_SMEM: usize = (32 * 132 + 8 * 16 * 20) * 4;
 const GUESS: f64 = 2.0e-11;
-
-fn parse_form(name: &str) -> Option<(u32, u32)> {
-    match name {
-        "trellis_k2" => Some((2, 0)),
-        "trellis_k3" => Some((3, 0)),
-        "trellis_k4" => Some((4, 0)),
-        "trellis_k2_mul1" => Some((2, 1)),
-        "trellis_k3_mul1" => Some((3, 1)),
-        "trellis_k4_mul1" => Some((4, 1)),
-        "trellis_k2_pmcgx" => Some((2, 2)),
-        "trellis_k3_pmcgx" => Some((3, 2)),
-        "trellis_k4_pmcgx" => Some((4, 2)),
-        _ => None,
-    }
-}
 
 fn split_k(m: usize, n: usize, k: usize) -> usize {
     let ibs = k / BLOCK;
@@ -168,26 +154,7 @@ fn launches(t: &TrellisMetal, step: &Step) -> Vec<Launch> {
         down: m.div_ceil(tile_rows(m)),
         threads: THREADS,
     };
-    let suh = if t.turned { step.read(2) } else { step.read(0) };
-    let svh = if t.turned && t.splits == 1 {
-        step.read(3)
-    } else {
-        step.read(0)
-    };
-    let args = vec![
-        step.read(0),
-        step.read(1),
-        suh,
-        svh,
-        step.out(),
-        Arg::count(m),
-        Arg::count(n),
-        Arg::count(k),
-        Arg::count(t.splits),
-        Arg::value(&t.bits),
-        Arg::value(&t.book),
-        Arg::count(usize::from(t.turned)),
-    ];
+    let args = launch_args(step, [m, n, k, t.splits], t.bits, t.book, t.turned);
     vec![Launch { args, shape }]
 }
 
@@ -263,124 +230,27 @@ fn reduce_launches(r: &MetalReduce, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-fn step_args<'a>(tree: &'a Tree, t: T, term: Term) -> Option<&'a [T]> {
-    let node = tree.node(t);
-    (node.term == term && !tree.root(t)).then_some(&node.args[..])
-}
-
-fn drafts(t: TrellisMetal, x: T, w: T, suh: Option<T>, svh: Option<T>) -> Vec<Draft> {
-    let [m, n, _] = t.shape;
-    let (splits, turned) = (t.splits, t.turned);
-    if splits == 1 {
-        let mut reads = vec![x, w];
-        if let (Some(u), Some(v)) = (suh, svh) {
-            reads.extend([u, v]);
-        }
-        return vec![Draft::new(t, reads, m * n)];
-    }
-    let mut s_reads = vec![Read::Node(x), Read::Node(w)];
-    if let Some(u) = suh {
-        s_reads.push(Read::Node(u));
-    }
-    let mut r_reads = vec![Read::Draft(0)];
-    if let Some(v) = svh {
-        r_reads.push(Read::Node(v));
-    }
-    let red = MetalReduce {
+fn drafts(d: &Dense) -> Vec<Draft> {
+    let [m, n, k] = [d.m, d.n, d.k];
+    let (splits, turned) = (split_k(m, n, k), d.turned());
+    let kernel = TrellisMetal {
+        shape: [m, n, k],
+        splits,
+        bits: d.bits,
+        book: d.book,
+        turned,
+        form: d.form,
+    };
+    let reduce = MetalReduce {
         shape: [m, n],
         splits,
         turned,
     };
-    vec![
-        Draft::new(t, s_reads, splits * m * n),
-        Draft::new(red, r_reads, m * n),
-    ]
-}
-
-fn check(tree: &Tree, x: T, w: T, turned: bool) -> Option<Result<TrellisMetal, String>> {
-    let form = tree.node(w).form;
-    if !form.name().starts_with("trellis") {
-        return None;
-    }
-    let Some((bits, book)) = parse_form(form.name()) else {
-        return Some(Err(format!("unsupported trellis form {}", form.name())));
-    };
-    let [n, k] = tree.node(w).shape[..] else {
-        return Some(Err("trellis weight is not 2D".into()));
-    };
-    if !tree.leaf(w) {
-        return Some(Err("trellis weight is not a direct leaf".into()));
-    }
-    if !n.is_multiple_of(BLOCK) || !k.is_multiple_of(BLOCK) {
-        return Some(Err(format!("shape {n}x{k} must divide by {BLOCK}")));
-    }
-    if tree.node(x).form.name() != "f32" {
-        return Some(Err(format!("input form {}", tree.node(x).form.name())));
-    }
-    let m = tree.elements(x) / k;
-    if m == 0 {
-        return Some(Err("m=0".into()));
-    }
-    Some(Ok(TrellisMetal {
-        shape: [m, n, k],
-        splits: split_k(m, n, k),
-        bits,
-        book,
-        turned,
-        form,
-    }))
+    d.drafts(kernel, splits, reduce)
 }
 
 fn eval_metal(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
-    let turn = Term::Stage(Stage::Hadamard {
-        block: BLOCK as u32,
-    });
-    let mul = Term::Stage(Stage::Mul);
-    let node = tree.node(at);
-    if node.term == mul {
-        let (back, svh) = (node.args[0], *node.args.get(1)?);
-        let &[product] = step_args(tree, back, turn.clone())? else {
-            return None;
-        };
-        let &[turned, w] = step_args(tree, product, Term::Op(Op::Matmul))? else {
-            return None;
-        };
-        let &[scaled] = step_args(tree, turned, turn)? else {
-            return None;
-        };
-        let &[x, suh] = step_args(tree, scaled, mul)? else {
-            return None;
-        };
-        if node.form.name() != "f32" {
-            return Some(Err(format!("output form {}", node.form.name())));
-        }
-        let kernel = match check(tree, x, w, true)? {
-            Ok(k) => k,
-            Err(e) => return Some(Err(e)),
-        };
-        if tree.elements(suh) != kernel.shape[2] || tree.elements(svh) != kernel.shape[1] {
-            return Some(Err("rotation scale length mismatch".into()));
-        }
-        if tree.node(suh).form.name() != "f32" || tree.node(svh).form.name() != "f32" {
-            return Some(Err("rotation scales must be f32".into()));
-        }
-        return Some(Ok(drafts(kernel, x, w, Some(suh), Some(svh))));
-    }
-    if node.term == Term::Op(Op::Matmul) {
-        let (x, w) = (node.args[0], node.args[1]);
-        if !tree.node(w).form.name().starts_with("trellis") {
-            return None;
-        }
-        if node.form.name() != "f32" {
-            return Some(Err(format!("output form {}", node.form.name())));
-        }
-        let kernel = match check(tree, x, w, false)? {
-            Ok(k) => k,
-            Err(e) => return Some(Err(e)),
-        };
-        return Some(Ok(drafts(kernel, x, w, None, None)));
-    }
-    None
+    Some(Dense::find(tree, at, BLOCK)?.map(|d| drafts(&d)))
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {

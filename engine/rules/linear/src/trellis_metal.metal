@@ -137,207 +137,89 @@ static inline void tm_decode_tile(uint raw, TmWordMap wm, thread half4 &wa, thre
     }
 }
 
+// Weight blocks split `p` of `ks` reads for output `ob`.
+struct TmWalk {
+    uint blocks;
+    uint first;
+    ulong stride;
+    device const uchar *at;
+};
+
 template <uint K>
-static inline device const uchar *tm_block_ptr(
-    device const uchar *w, uint n, uint k, uint ib0, uint ob, bool input_side) {
+static inline TmWalk tm_walk(device const uchar *w, uint n, uint k, uint ks, uint ob, uint p) {
+    uint blocks = (k >> 7u) / ks;
+    uint first = p * blocks;
     uint side = *(device const uint *)(w + 8u);
+    bool input_side = (side & TM_SIDE_MASK) == TM_INPUT_SIDE;
     device const uchar *base =
         (side & TM_PAGED) ? (w + *(device const ulong *)(w + TM_TABLE)) : (w + TM_HEAD);
-    ulong local = input_side ? (ulong(ib0) * (n >> 1u) + ulong(ob) * 64u)
-                             : (ulong(ob) * (k >> 1u) + ulong(ib0) * 64u);
-    return base + local * (32u * K);
+    ulong local = input_side ? (ulong(first) * (n >> 1u) + ulong(ob) * 64u)
+                             : (ulong(ob) * (k >> 1u) + ulong(first) * 64u);
+    ulong stride = (input_side ? ulong(n >> 1u) : 64ull) * ulong(32u * K);
+    return {blocks, first, stride, base + local * (32u * K)};
 }
 
-// Single-row tile-streaming decode, staging four input blocks per barrier.
-template <uint K, uint BOOK>
-static inline void tm_dec1_body(
-    device const float *x,
-    device const uchar *w,
-    device const float *suh,
-    device const float *svh,
-    device float *out,
-    uint n,
-    uint k,
-    uint ks,
-    uint turned,
-    uint tg_x,
-    uint tid,
-    threadgroup float xs[4][128]) {
-    constexpr uint tw = 8u * K;
-    constexpr uint tb = 32u * K;
-    uint nblk = n >> 7u;
-    uint ob = tg_x % nblk;
-    uint p = tg_x / nblk;
-    if (ob >= nblk || p >= ks) return;
-    uint simd = tid >> 5u;
-    uint lane = tid & 31u;
-    uint cc = lane >> 2u;
-    uint rr = lane & 3u;
-    uint blk_per = (k >> 7u) / ks;
-    uint ib0 = p * blk_per;
-    uint side = *(device const uint *)(w + 8u);
-    bool input_side = (side & TM_SIDE_MASK) == TM_INPUT_SIDE;
-    ulong sg = (input_side ? ulong(n >> 1u) : 64ull) * ulong(tb);
-    device const uchar *gb = tm_block_ptr<K>(w, n, k, ib0, ob, input_side);
+// Scales four inputs by `sc`, then rotates by Hadamard.
+static inline float4 tm_turn_in(float4 x, float4 sc, uint lane) {
+    float v[4] = {x.x * sc.x, x.y * sc.y, x.z * sc.z, x.w * sc.w};
+    tm_wht128(v, lane, TM_INV_SQRT128);
+    return float4(v[0], v[1], v[2], v[3]);
+}
+
+// Rotates four outputs by Hadamard, then scales by `sc`.
+static inline float4 tm_turn_out(float4 y, float4 sc, uint lane) {
+    float v[4] = {y.x, y.y, y.z, y.w};
+    tm_wht128(v, lane, TM_INV_SQRT128);
+    return float4(v[0] * sc.x, v[1] * sc.y, v[2] * sc.z, v[3] * sc.w);
+}
+
+static inline void tm_put4(threadgroup float *dst, float4 v) {
+    dst[0] = v.x;
+    dst[1] = v.y;
+    dst[2] = v.z;
+    dst[3] = v.w;
+}
+
+static inline float4 tm_get4(threadgroup const float *src) {
+    return float4(src[0], src[1], src[2], src[3]);
+}
+
+// Lane roles and weight walk for a `K`, `BOOK` body.
+#define TM_START(KS, OB, P)                                                                  \
+    constexpr uint tw = 8u * K;                                                              \
+    uint simd = tid >> 5u;                                                                   \
+    uint lane = tid & 31u;                                                                   \
+    uint cc = lane >> 2u;                                                                    \
+    uint rr = lane & 3u;                                                                     \
+    TmWalk walk = tm_walk<K>(w, n, k, KS, OB, P);                                            \
+    device const uchar *gb = walk.at;                                                        \
     TmWordMap wm = tm_word_map<K, BOOK>(lane);
 
-    float acc0 = 0.0f, acc1 = 0.0f;
-    for (uint c0 = 0u; c0 < blk_per; c0 += 4u) {
-        uint nb = min(4u, blk_per - c0);
-        if (c0 > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (simd < nb) {
-            uint col = ((ib0 + c0 + simd) << 7u) + (lane << 2u);
-            float4 xv = *(device const float4 *)(x + col);
-            float v[4] = {xv.x, xv.y, xv.z, xv.w};
-            if (turned) {
-                float4 sc = *(device const float4 *)(suh + col);
-                v[0] *= sc.x;
-                v[1] *= sc.y;
-                v[2] *= sc.z;
-                v[3] *= sc.w;
-                tm_wht128(v, lane, TM_INV_SQRT128);
-            }
-            uint dst = lane << 2u;
-            xs[simd][dst] = v[0];
-            xs[simd][dst + 1u] = v[1];
-            xs[simd][dst + 2u] = v[2];
-            xs[simd][dst + 3u] = v[3];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+// A decode group's output block and split, from `tg_x`.
+#define TM_DEC_START                                                                         \
+    uint nblk = n >> 7u;                                                                     \
+    uint ob = tg_x % nblk;                                                                   \
+    uint p = tg_x / nblk;                                                                    \
+    if (p >= ks) return;                                                                     \
+    TM_START(ks, ob, p)
 
-        for (uint b = 0u; b < nb; b++) {
-            device const uint *tiles = (device const uint *)gb;
-            uint raw = (K == 4u || lane < tw) ? tiles[simd * tw + lane] : 0u;
-            for (uint u = 0u; u < 8u; u++) {
-                uint next = (u + 1u < 8u && (K == 4u || lane < tw))
-                                ? tiles[((u + 1u) * 8u + simd) * tw + lane]
-                                : 0u;
-                half4 wa, wb;
-                tm_decode_tile<K, BOOK>(raw, wm, wa, wb);
-                raw = next;
-                uint xb = u * 16u + (rr << 1u);
-                float4 xv = float4(xs[b][xb], xs[b][xb + 1u], xs[b][xb + 8u], xs[b][xb + 9u]);
-                acc0 += dot(xv, float4(wa));
-                acc1 += dot(xv, float4(wb));
-            }
-            gb += sg;
-        }
-    }
-
-    acc0 += simd_shuffle_xor(acc0, ushort(1u));
-    acc0 += simd_shuffle_xor(acc0, ushort(2u));
-    acc1 += simd_shuffle_xor(acc1, ushort(1u));
-    acc1 += simd_shuffle_xor(acc1, ushort(2u));
-
-    uint lcol = (simd << 4u) + cc;
-    if (ks > 1u) {
-        if (rr == 0u) {
-            device float *pp = out + (ulong(ob) * ks + p) * 128u;
-            pp[lcol] = acc0;
-            pp[lcol + 8u] = acc1;
-        }
-    } else if (!turned) {
-        if (rr == 0u) {
-            uint ob0 = ob << 7u;
-            out[ob0 + lcol] = acc0;
-            out[ob0 + lcol + 8u] = acc1;
-        }
-    } else {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (rr == 0u) {
-            xs[0][lcol] = acc0;
-            xs[0][lcol + 8u] = acc1;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (simd == 0u) {
-            uint base = (ob << 7u) + (lane << 2u);
-            float4 sc = *(device const float4 *)(svh + base);
-            uint src = lane << 2u;
-            float v[4] = {xs[0][src], xs[0][src + 1u], xs[0][src + 2u], xs[0][src + 3u]};
-            tm_wht128(v, lane, TM_INV_SQRT128);
-            *(device float4 *)(out + base) =
-                float4(v[0] * sc.x, v[1] * sc.y, v[2] * sc.z, v[3] * sc.w);
-        }
-    }
-}
-
-// Multi-row tile-streaming decode for 2 to 4 rows.
-template <uint K, uint BOOK>
-static void tm_dec4_body(
-    device const float *x,
-    device const uchar *w,
-    device const float *suh,
-    device const float *svh,
-    device float *out,
+// Sums lane partials of `m` rows and stores each row.
+static inline void tm_dec_finish(
+    thread float *acc0,
+    thread float *acc1,
     uint m,
     uint n,
-    uint k,
     uint ks,
+    uint p,
+    uint ob,
+    uint simd,
+    uint lane,
+    uint cc,
+    uint rr,
     uint turned,
-    uint tg_x,
-    uint tid,
+    device const float *svh,
+    device float *out,
     threadgroup float xs[4][128]) {
-    constexpr uint tw = 8u * K;
-    constexpr uint tb = 32u * K;
-    uint nblk = n >> 7u;
-    uint ob = tg_x % nblk;
-    uint p = tg_x / nblk;
-    if (ob >= nblk || p >= ks) return;
-    uint simd = tid >> 5u;
-    uint lane = tid & 31u;
-    uint cc = lane >> 2u;
-    uint rr = lane & 3u;
-    uint blk_per = (k >> 7u) / ks;
-    uint ib0 = p * blk_per;
-    uint side = *(device const uint *)(w + 8u);
-    bool input_side = (side & TM_SIDE_MASK) == TM_INPUT_SIDE;
-    ulong sg = (input_side ? ulong(n >> 1u) : 64ull) * ulong(tb);
-    device const uchar *gb = tm_block_ptr<K>(w, n, k, ib0, ob, input_side);
-    TmWordMap wm = tm_word_map<K, BOOK>(lane);
-
-    float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-
-    for (uint b = 0u; b < blk_per; b++) {
-        if (b > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (simd < m) {
-            uint col = ((ib0 + b) << 7u) + (lane << 2u);
-            float4 xv = *(device const float4 *)(x + ulong(simd) * k + col);
-            float v[4] = {xv.x, xv.y, xv.z, xv.w};
-            if (turned) {
-                float4 sc = *(device const float4 *)(suh + col);
-                v[0] *= sc.x;
-                v[1] *= sc.y;
-                v[2] *= sc.z;
-                v[3] *= sc.w;
-                tm_wht128(v, lane, TM_INV_SQRT128);
-            }
-            uint dst = lane << 2u;
-            xs[simd][dst] = v[0];
-            xs[simd][dst + 1u] = v[1];
-            xs[simd][dst + 2u] = v[2];
-            xs[simd][dst + 3u] = v[3];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        device const uint *tiles = (device const uint *)gb;
-        for (uint u = 0u; u < 8u; u++) {
-            uint raw = (K == 4u || lane < tw) ? tiles[(u * 8u + simd) * tw + lane] : 0u;
-            half4 wa, wb;
-            tm_decode_tile<K, BOOK>(raw, wm, wa, wb);
-            uint xb = u * 16u + (rr << 1u);
-            for (uint r = 0u; r < m; r++) {
-                float x0 = xs[r][xb];
-                float x1 = xs[r][xb + 1u];
-                float x2 = xs[r][xb + 8u];
-                float x3 = xs[r][xb + 9u];
-                acc0[r] = fma(x0, float(wa.x), fma(x1, float(wa.y), fma(x2, float(wa.z), fma(x3, float(wa.w), acc0[r]))));
-                acc1[r] = fma(x0, float(wb.x), fma(x1, float(wb.y), fma(x2, float(wb.z), fma(x3, float(wb.w), acc1[r]))));
-            }
-        }
-        gb += sg;
-    }
-
     for (uint r = 0u; r < m; r++) {
         acc0[r] += simd_shuffle_xor(acc0[r], ushort(1u));
         acc0[r] += simd_shuffle_xor(acc0[r], ushort(2u));
@@ -374,13 +256,113 @@ static void tm_dec4_body(
         if (simd < m) {
             uint base = (ob << 7u) + (lane << 2u);
             float4 sc = *(device const float4 *)(svh + base);
-            uint src = lane << 2u;
-            float v[4] = {xs[simd][src], xs[simd][src + 1u], xs[simd][src + 2u], xs[simd][src + 3u]};
-            tm_wht128(v, lane, TM_INV_SQRT128);
-            *(device float4 *)(out + ulong(simd) * n + base) =
-                float4(v[0] * sc.x, v[1] * sc.y, v[2] * sc.z, v[3] * sc.w);
+            float4 y = tm_get4(&xs[simd][lane << 2u]);
+            *(device float4 *)(out + ulong(simd) * n + base) = tm_turn_out(y, sc, lane);
         }
     }
+}
+
+// Single-row tile-streaming decode, staging four input blocks per barrier.
+template <uint K, uint BOOK>
+static inline void tm_dec1_body(
+    device const float *x,
+    device const uchar *w,
+    device const float *suh,
+    device const float *svh,
+    device float *out,
+    uint n,
+    uint k,
+    uint ks,
+    uint turned,
+    uint tg_x,
+    uint tid,
+    threadgroup float xs[4][128]) {
+    TM_DEC_START
+
+    float acc0[1] = {0.0f}, acc1[1] = {0.0f};
+    for (uint c0 = 0u; c0 < walk.blocks; c0 += 4u) {
+        uint nb = min(4u, walk.blocks - c0);
+        if (c0 > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd < nb) {
+            uint col = ((walk.first + c0 + simd) << 7u) + (lane << 2u);
+            float4 v = *(device const float4 *)(x + col);
+            if (turned) v = tm_turn_in(v, *(device const float4 *)(suh + col), lane);
+            tm_put4(&xs[simd][lane << 2u], v);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint b = 0u; b < nb; b++) {
+            device const uint *tiles = (device const uint *)gb;
+            uint raw = (K == 4u || lane < tw) ? tiles[simd * tw + lane] : 0u;
+            for (uint u = 0u; u < 8u; u++) {
+                uint next = (u + 1u < 8u && (K == 4u || lane < tw))
+                                ? tiles[((u + 1u) * 8u + simd) * tw + lane]
+                                : 0u;
+                half4 wa, wb;
+                tm_decode_tile<K, BOOK>(raw, wm, wa, wb);
+                raw = next;
+                uint xb = u * 16u + (rr << 1u);
+                float4 xv = float4(xs[b][xb], xs[b][xb + 1u], xs[b][xb + 8u], xs[b][xb + 9u]);
+                acc0[0] += dot(xv, float4(wa));
+                acc1[0] += dot(xv, float4(wb));
+            }
+            gb += walk.stride;
+        }
+    }
+
+    tm_dec_finish(acc0, acc1, 1u, n, ks, p, ob, simd, lane, cc, rr, turned, svh, out, xs);
+}
+
+// Multi-row tile-streaming decode for 2 to 4 rows.
+template <uint K, uint BOOK>
+static void tm_dec4_body(
+    device const float *x,
+    device const uchar *w,
+    device const float *suh,
+    device const float *svh,
+    device float *out,
+    uint m,
+    uint n,
+    uint k,
+    uint ks,
+    uint turned,
+    uint tg_x,
+    uint tid,
+    threadgroup float xs[4][128]) {
+    TM_DEC_START
+
+    float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint b = 0u; b < walk.blocks; b++) {
+        if (b > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd < m) {
+            uint col = ((walk.first + b) << 7u) + (lane << 2u);
+            float4 v = *(device const float4 *)(x + ulong(simd) * k + col);
+            if (turned) v = tm_turn_in(v, *(device const float4 *)(suh + col), lane);
+            tm_put4(&xs[simd][lane << 2u], v);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        device const uint *tiles = (device const uint *)gb;
+        for (uint u = 0u; u < 8u; u++) {
+            uint raw = (K == 4u || lane < tw) ? tiles[(u * 8u + simd) * tw + lane] : 0u;
+            half4 wa, wb;
+            tm_decode_tile<K, BOOK>(raw, wm, wa, wb);
+            uint xb = u * 16u + (rr << 1u);
+            for (uint r = 0u; r < m; r++) {
+                float x0 = xs[r][xb];
+                float x1 = xs[r][xb + 1u];
+                float x2 = xs[r][xb + 8u];
+                float x3 = xs[r][xb + 9u];
+                acc0[r] = fma(x0, float(wa.x), fma(x1, float(wa.y), fma(x2, float(wa.z), fma(x3, float(wa.w), acc0[r]))));
+                acc1[r] = fma(x0, float(wb.x), fma(x1, float(wb.y), fma(x2, float(wb.z), fma(x3, float(wb.w), acc1[r]))));
+            }
+        }
+        gb += walk.stride;
+    }
+
+    tm_dec_finish(acc0, acc1, m, n, ks, p, ob, simd, lane, cc, rr, turned, svh, out, xs);
 }
 
 // Prefill tile-streaming matmul with 8x8 f32 simdgroup MMA.
@@ -401,23 +383,12 @@ static inline void tm_pf_body(
     threadgroup float xs[TM * 8u][TM_XS_STRIDE],
     threadgroup float ws[8][16 * TM_WS_STRIDE]) {
     constexpr uint bm = TM * 8u;
-    constexpr uint tw = 8u * K;
-    constexpr uint tb = 32u * K;
     uint nblk = n >> 7u;
     uint ob = tg_x;
     uint r0 = tg_y * bm;
     if (ob >= nblk || r0 >= m) return;
     uint nr = min(bm, m - r0);
-    uint simd = tid >> 5u;
-    uint lane = tid & 31u;
-    uint cc = lane >> 2u;
-    uint rr = lane & 3u;
-    uint blk_per = k >> 7u;
-    uint side = *(device const uint *)(w + 8u);
-    bool input_side = (side & TM_SIDE_MASK) == TM_INPUT_SIDE;
-    ulong sg = (input_side ? ulong(n >> 1u) : 64ull) * ulong(tb);
-    device const uchar *gb = tm_block_ptr<K>(w, n, k, 0u, ob, input_side);
-    TmWordMap wm = tm_word_map<K, BOOK>(lane);
+    TM_START(1u, ob, 0u)
 
     simdgroup_float8x8 acc[TM][2];
     for (uint tm = 0u; tm < TM; tm++) {
@@ -431,32 +402,17 @@ static inline void tm_pf_body(
     uint wr8 = wr0 + 8u * TM_WS_STRIDE;
     uint wr9 = wr8 + TM_WS_STRIDE;
 
-    for (uint b = 0u; b < blk_per; b++) {
+    for (uint b = 0u; b < walk.blocks; b++) {
         if (b > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
         uint col = (b << 7u) + (lane << 2u);
         float4 sc = turned ? *(device const float4 *)(suh + col) : float4(1.0f);
         for (uint r = simd; r < bm; r += 8u) {
-            uint dst = lane << 2u;
+            float4 v = float4(0.0f);
             if (r < nr) {
-                float4 xv = *(device const float4 *)(x + ulong(r0 + r) * k + col);
-                float v[4] = {xv.x, xv.y, xv.z, xv.w};
-                if (turned) {
-                    v[0] *= sc.x;
-                    v[1] *= sc.y;
-                    v[2] *= sc.z;
-                    v[3] *= sc.w;
-                    tm_wht128(v, lane, TM_INV_SQRT128);
-                }
-                xs[r][dst] = v[0];
-                xs[r][dst + 1u] = v[1];
-                xs[r][dst + 2u] = v[2];
-                xs[r][dst + 3u] = v[3];
-            } else {
-                xs[r][dst] = 0.0f;
-                xs[r][dst + 1u] = 0.0f;
-                xs[r][dst + 2u] = 0.0f;
-                xs[r][dst + 3u] = 0.0f;
+                v = *(device const float4 *)(x + ulong(r0 + r) * k + col);
+                if (turned) v = tm_turn_in(v, sc, lane);
             }
+            tm_put4(&xs[r][lane << 2u], v);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -487,7 +443,7 @@ static inline void tm_pf_body(
                 }
             }
         }
-        gb += sg;
+        gb += walk.stride;
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -500,16 +456,9 @@ static inline void tm_pf_body(
     uint base = (ob << 7u) + (lane << 2u);
     float4 sc = turned ? *(device const float4 *)(svh + base) : float4(1.0f);
     for (uint r = simd; r < nr; r += 8u) {
-        uint src = lane << 2u;
-        float v[4] = {xs[r][src], xs[r][src + 1u], xs[r][src + 2u], xs[r][src + 3u]};
-        if (turned) {
-            tm_wht128(v, lane, TM_INV_SQRT128);
-            v[0] *= sc.x;
-            v[1] *= sc.y;
-            v[2] *= sc.z;
-            v[3] *= sc.w;
-        }
-        *(device float4 *)(out + ulong(r0 + r) * n + base) = float4(v[0], v[1], v[2], v[3]);
+        float4 y = tm_get4(&xs[r][lane << 2u]);
+        if (turned) y = tm_turn_out(y, sc, lane);
+        *(device float4 *)(out + ulong(r0 + r) * n + base) = y;
     }
 }
 
@@ -631,14 +580,7 @@ kernel void tm_reduce(
         for (uint p = 0u; p < ks; p++) {
             sum += *(device const float4 *)(pb + ulong(p) * m * 128u);
         }
-        float v[4] = {sum.x, sum.y, sum.z, sum.w};
-        if (turned) {
-            tm_wht128(v, lane, TM_INV_SQRT128);
-            v[0] *= sc.x;
-            v[1] *= sc.y;
-            v[2] *= sc.z;
-            v[3] *= sc.w;
-        }
-        *(device float4 *)(out + ulong(r) * n + base) = float4(v[0], v[1], v[2], v[3]);
+        if (turned) sum = tm_turn_out(sum, sc, lane);
+        *(device float4 *)(out + ulong(r) * n + base) = sum;
     }
 }

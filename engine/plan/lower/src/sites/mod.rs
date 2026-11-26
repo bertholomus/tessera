@@ -11,7 +11,7 @@ mod top;
 pub use attend::{Attend, Delta};
 pub use chain::Chain;
 pub use gather::Gather;
-pub use matmul::{After, Finished, Matmul, Picked};
+pub use matmul::{After, Finished, Matmul, Picked, Rotated};
 pub use near::Near;
 pub use stage::Stage;
 pub use top::Top;

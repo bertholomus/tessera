@@ -1,13 +1,15 @@
 //! CUDA Tensor-Core picked trellis matmul for MoE experts.
 
 use crate::flatten_cuda;
-use crate::{CUDA_LACKS, cuda_rule, parse_trellis};
+use crate::{CUDA_LACKS, cuda_rule};
 use std::sync::OnceLock;
 use tessera_graph::{Act, Op, Order, Select, Stage};
 use tessera_lower::form::Load as Stored;
+use tessera_lower::sites::Rotated;
 use tessera_lower::{
     Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Term, Tree,
 };
+use tessera_mem::trellis::parse_form;
 
 const KERNEL: &str = include_str!("trellis.cu");
 const BLOCK: usize = 128;
@@ -142,11 +144,6 @@ fn launches(k: &PickedTrellis, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-fn step_args<'a>(tree: &'a Tree, t: T, term: Term) -> Option<&'a [T]> {
-    let node = tree.node(t);
-    (node.term == term && !tree.root(t)).then_some(&node.args[..])
-}
-
 fn gather_of(tree: &Tree, t: T) -> Option<(T, T)> {
     let node = tree.node(t);
     if node.term != Term::Op(Op::Select(Select::Gather)) || tree.root(t) {
@@ -165,7 +162,7 @@ fn match_pick(tree: &Tree, x: T, pick: T, turned: bool) -> Option<(PickedTrellis
         return None;
     };
     let form = tree.node(codes).form;
-    let (bits, book) = parse_trellis(form.name())?;
+    let (bits, book) = parse_form(form.name())?;
     if !n.is_multiple_of(BLOCK) || !k.is_multiple_of(BLOCK) {
         return None;
     }
@@ -195,27 +192,13 @@ fn match_pick(tree: &Tree, x: T, pick: T, turned: bool) -> Option<(PickedTrellis
 }
 
 fn match_turned(tree: &Tree, at: T) -> Option<(PickedTrellis, [T; 5])> {
-    let node = tree.node(at);
-    let turn = Term::Stage(Stage::Hadamard {
-        block: BLOCK as u32,
-    });
-    let mul = Term::Stage(Stage::Mul);
-    if node.term != mul || node.form.name() != "f32" {
+    if tree.node(at).form.name() != "f32" {
         return None;
     }
-    let (back, sv_emb) = (node.args[0], *node.args.get(1)?);
-    let &[product] = step_args(tree, back, turn.clone())? else {
-        return None;
-    };
-    let &[turned, pick] = step_args(tree, product, Term::Op(Op::Matmul))? else {
-        return None;
-    };
-    let &[scaled] = step_args(tree, turned, turn)? else {
-        return None;
-    };
-    let &[x, su_emb] = step_args(tree, scaled, mul)? else {
-        return None;
-    };
+    let r = tree
+        .site::<Rotated>(at)
+        .filter(|r| r.block as usize == BLOCK)?;
+    let (x, pick, su_emb, sv_emb) = (r.x, r.w, r.suh, r.svh);
     let (su, su_ids) = gather_of(tree, su_emb)?;
     let (sv, sv_ids) = gather_of(tree, sv_emb)?;
     let (kernel, codes, ids) = match_pick(tree, x, pick, true)?;
@@ -247,7 +230,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             if cand == other || tree.root(cand) || tree.node(other).form.name() != "f32" {
                 continue;
             }
-            if let Some(&[inner]) = step_args(tree, cand, silu.clone())
+            if let Some(&[inner]) = tree.inner(cand, &silu)
                 && !tree.root(inner)
                 && let Some((mut k, [x, c, ids, su, sv])) = match_turned(tree, inner)
                 && tree.elements(other) == k.rows * k.n

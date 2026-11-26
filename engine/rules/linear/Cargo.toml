@@ -16,6 +16,7 @@ tessera-codegen = { workspace = true }
 tessera-graph = { workspace = true }
 tessera-kernels = { workspace = true }
 tessera-lower = { workspace = true }
+tessera-mem = { workspace = true }
 
 [dev-dependencies]
 tessera-testkit = { workspace = true }

@@ -9,9 +9,9 @@ description = "Device CUDA linear matmul, trellis MMA, and decode GEMV rules"
 [dependencies]
 tessera-device = { workspace = true }
 tessera-graph = { workspace = true }
+tessera-linear = { workspace = true }
 tessera-lower = { workspace = true }
 
 [dev-dependencies]
 tessera-kernels = { workspace = true }
-tessera-linear = { workspace = true }
 tessera-testkit = { workspace = true }
