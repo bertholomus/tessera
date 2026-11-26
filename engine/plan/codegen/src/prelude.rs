@@ -241,6 +241,35 @@ impl<T> IndexMut<u32> for Shared<T> {
     }
 }
 
+/// Atomic `u32` group memory, for the whole group.
+pub struct AtomicShared;
+
+/// `len` atomic `u32` elements of group memory.
+pub fn atomic_shared(_: u32) -> AtomicShared {
+    device()
+}
+
+impl AtomicShared {
+    /// Adds `value` to element `at` atomically.
+    pub fn add(&mut self, _: u32, _: u32) {
+        device()
+    }
+}
+
+impl Index<u32> for AtomicShared {
+    type Output = u32;
+
+    fn index(&self, _: u32) -> &u32 {
+        device()
+    }
+}
+
+impl IndexMut<u32> for AtomicShared {
+    fn index_mut(&mut self, _: u32) -> &mut u32 {
+        device()
+    }
+}
+
 /// A SIMD group's block of sums on the matrix unit.
 pub struct Tiles;
 

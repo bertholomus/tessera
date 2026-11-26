@@ -37,7 +37,7 @@ const RESERVED: &str = "alias break case const const_assert continue continuing 
     trait try type typedef typeid typename typeof union unless unorm unsafe unsized use \
     using varying virtual volatile wgsl where with writeonly yield read write read_write \
     function private workgroup uniform storage f32 u32 i32 bool vec2 vec4 array select \
-    bitcast workgroupBarrier";
+    bitcast workgroupBarrier atomic atomicAdd atomicLoad atomicStore";
 
 /// Whether WGSL text cannot use `name` as it is.
 pub(crate) fn reserved(name: &str) -> bool {

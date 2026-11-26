@@ -86,6 +86,26 @@ const NAMES: &[(&str, &str, &str)] = &[
         "__shared__ __align__(16) ty name[n]",
     ),
     (
+        "f_atomic_group(name, n)",
+        "threadgroup atomic_uint name[n]",
+        "__shared__ __align__(16) u32 name[n]",
+    ),
+    (
+        "f_atomic_add(a, i, v)",
+        "atomic_fetch_add_explicit(&(a)[i], v, memory_order_relaxed)",
+        "atomicAdd(&(a)[i], v)",
+    ),
+    (
+        "f_atomic_load(a, i)",
+        "atomic_load_explicit(&(a)[i], memory_order_relaxed)",
+        "((a)[i])",
+    ),
+    (
+        "f_atomic_store(a, i, v)",
+        "atomic_store_explicit(&(a)[i], v, memory_order_relaxed)",
+        "((a)[i] = (v))",
+    ),
+    (
         "f_u32x2(p)",
         "(*(device const uint2 *)(p))",
         "(*(const uint2 *)(p))",

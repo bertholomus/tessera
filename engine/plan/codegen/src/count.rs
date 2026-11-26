@@ -266,7 +266,17 @@ impl Counter {
                 }
             }
             Stmt::Array { .. } => {}
-            Stmt::Shared { name, .. } => self.shared.push(name.clone()),
+            Stmt::Shared { name, .. } | Stmt::AtomicShared { name, .. } => {
+                self.shared.push(name.clone());
+            }
+            Stmt::AtomicAdd { at, value, .. } => {
+                self.expr(at);
+                self.expr(value);
+                self.add(Ops {
+                    shared: 1.0,
+                    ..Ops::default()
+                });
+            }
             Stmt::TileAcc { name, rows, cols } => {
                 self.tiles.insert(name.clone(), (*rows, *cols));
             }

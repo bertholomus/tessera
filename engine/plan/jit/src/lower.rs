@@ -472,6 +472,18 @@ impl Lowerer<'_, '_> {
                 self.bind(name, Kind::Shared(*ty, slot, *len));
                 Ok(())
             }
+            Stmt::AtomicShared { name, len } => {
+                let slot = self.slot(elem_size(Ty::U32) * len);
+                self.bind(name, Kind::Shared(Ty::U32, slot, *len));
+                Ok(())
+            }
+            Stmt::AtomicAdd { name, at, value } => {
+                let (at, value) = (self.hoist(at)?, self.hoist(value)?);
+                let target = Expr::Index(Box::new(Expr::Var(name.clone())), Box::new(at));
+                self.lanes(Some(mask), |s, t| {
+                    s.store(&target, Some(tessera_codegen::ir::BinOp::Add), &value, t)
+                })
+            }
             Stmt::Assign {
                 target,
                 op,

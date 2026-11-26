@@ -15,6 +15,7 @@ pub(crate) enum Kind {
     Buffer(&'static dyn Load),
     /// Group memory, or a local array, of this element type.
     Array(Ty),
+    Atomic,
     /// Tile sums over this many rows and columns.
     Tiles(usize, usize),
     /// A held slab of A: rows and depth.
@@ -146,6 +147,7 @@ impl<'a> Printer<'a> {
             Expr::Index(base, _) => match &**base {
                 Expr::Var(name) => match self.kind(name) {
                     Kind::Array(ty) => ty,
+                    Kind::Atomic => Ty::U32,
                     Kind::Buffer(form) => element(form),
                     _ => Ty::F32,
                 },
@@ -225,6 +227,8 @@ impl<'a> Printer<'a> {
                 match (self.kind(name), self.wgsl) {
                     (Kind::Buffer(form), true) => form.wgsl_load(&self.c_name(name), &at),
                     (Kind::Buffer(form), false) => form.load(name, &at),
+                    (Kind::Atomic, true) => format!("atomicLoad(&{}[{at}])", self.c_name(name)),
+                    (Kind::Atomic, false) => format!("f_atomic_load({}, {at})", self.c_name(name)),
                     _ => format!("{}[{at}]", self.c_name(name)),
                 }
             }
@@ -366,6 +370,23 @@ impl<'a> Printer<'a> {
                     false => self.line(format!("f_group({ty}, {name}, {len});")),
                 }
             }
+            Stmt::AtomicShared { name, len } => {
+                self.bind(name, Kind::Atomic);
+                let name = self.c_name(name);
+                match self.wgsl {
+                    true => (self.module)
+                        .push(format!("var<workgroup> {name}: array<atomic<u32>, {len}>;")),
+                    false => self.line(format!("f_atomic_group({name}, {len});")),
+                }
+            }
+            Stmt::AtomicAdd { name, at, value } => {
+                let (at, value) = (self.expr(at), self.expr(value));
+                let name = self.c_name(name);
+                match self.wgsl {
+                    true => self.line(format!("_ = atomicAdd(&{name}[{at}], {value});")),
+                    false => self.line(format!("f_atomic_add({name}, {at}, {value});")),
+                }
+            }
             Stmt::Assign {
                 target,
                 op,
@@ -381,6 +402,19 @@ impl<'a> Printer<'a> {
                 }
             }
             Stmt::Assign { target, op, value } => {
+                if let Expr::Index(base, at) = target
+                    && let Expr::Var(name) = &**base
+                    && matches!(self.kind(name), Kind::Atomic)
+                {
+                    assert!(op.is_none(), "atomic shared assign must be plain store");
+                    let (at, value) = (self.expr(at), self.expr(value));
+                    let name = self.c_name(name);
+                    match self.wgsl {
+                        true => self.line(format!("atomicStore(&{name}[{at}], {value});")),
+                        false => self.line(format!("f_atomic_store({name}, {at}, {value});")),
+                    }
+                    return;
+                }
                 if let Expr::Index(base, at) = target
                     && let Expr::Var(name) = &**base
                     && let Kind::Buffer(form) = self.kind(name)

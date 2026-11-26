@@ -144,6 +144,12 @@ fn radix_parity() {
         });
     }
     check_parity(2, 131_072, 2048, big, "radix_top_k");
+    // Low-mantissa values test the third 10-bit pass.
+    let base = 1.0f32.to_bits();
+    let fine: Vec<f32> = (0..4096u32)
+        .map(|i| f32::from_bits(base + ((i.wrapping_mul(2654435761)) & 0x3ff)))
+        .collect();
+    check_parity(1, 4096, 128, fine, "radix_top_k");
     // Uncached key path: k = 4096.
     let wide_k: Vec<f32> = (0..2 * 6000)
         .map(|i| if i % 11 == 0 { f32::NAN } else { noise.draw() })
@@ -174,9 +180,11 @@ fn radix_plan_and_split() {
         let Source::Made(body) = plan.steps[0].kernel.source() else {
             panic!("expected codegen body");
         };
-        assert!(!body.text().render(Dialect::Cuda).is_empty());
-        assert!(!body.text().render(Dialect::Metal).is_empty());
-        body.wgsl().expect("wgsl renders");
+        let cuda = body.text().render(Dialect::Cuda);
+        let metal = body.text().render(Dialect::Metal);
+        let wgsl = body.wgsl().expect("wgsl renders").text;
+        assert!(cuda.contains("atomicAdd") && metal.contains("atomic_fetch_add_explicit"));
+        assert!(wgsl.contains("atomicAdd") && wgsl.contains("atomicLoad"));
     }
     // 32 KB Metal falls back to top_k for k = 8192.
     let metal = Platform::assumed(Limits {

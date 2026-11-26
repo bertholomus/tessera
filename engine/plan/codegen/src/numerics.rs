@@ -301,6 +301,8 @@ impl Walk<'_> {
             Stmt::TileScale { by, .. } => self.expr(by),
             Stmt::Array { .. }
             | Stmt::Shared { .. }
+            | Stmt::AtomicShared { .. }
+            | Stmt::AtomicAdd { .. }
             | Stmt::Return
             | Stmt::Barrier
             | Stmt::TileAcc { .. }
