@@ -152,6 +152,22 @@ plain!(
     row = |s, p, slots| bin(BinOp::Add, bin(BinOp::Mul, p, slots), s)
 );
 
+/// Each slot's rows wrap around a ring of `context` rows.
+pub struct Ring;
+
+plain!(
+    Ring,
+    "ring",
+    "kept_ring",
+    |_, context| context,
+    run = |_| 1,
+    row = |s, p, cap| bin(
+        BinOp::Add,
+        bin(BinOp::Mul, s, cap.clone()),
+        bin(BinOp::Rem, p, cap),
+    )
+);
+
 /// A table names each slot's pages.
 pub struct Paged {
     name: &'static str,
@@ -195,11 +211,13 @@ impl Layout for Paged {
 
 crate::layout!(Dense);
 crate::layout!(Interleaved);
+crate::layout!(Ring);
 crate::layout!(PAGED);
 crate::layout!(PAGED16);
 
 pub const DENSE: &dyn Layout = &Dense;
 pub const INTERLEAVED: &dyn Layout = &Interleaved;
+pub const RING: &dyn Layout = &Ring;
 /// Pages of 64 rows, the default page.
 const PAGED: Paged = Paged {
     name: "paged",

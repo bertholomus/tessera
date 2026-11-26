@@ -155,6 +155,21 @@ impl Policy for Fair {
     }
 }
 
+/// Launch row limit when `graph` uses sliding KV rings.
+pub(crate) fn ring_chunk(graph: &tessera_graph::Graph) -> usize {
+    let any = (0..graph.kept.len() as u32).any(|i| tessera_lower::sliding_ring(graph, i).is_some());
+    if !any {
+        return 0;
+    }
+    graph
+        .dims
+        .iter()
+        .find(|d| d.name == tessera_graph::DimName::Rows)
+        .map_or(tessera_lower::RING_CHUNK, |d| {
+            (d.size.max() as usize).min(tessera_lower::RING_CHUNK)
+        })
+}
+
 impl Engine {
     /// Device bytes the runner holds now.
     pub fn bytes(&self) -> u64 {
@@ -196,7 +211,10 @@ pub struct Batch<'a> {
 impl Engine {
     /// Rows one prefill step feeds: `asked`, else the default.
     pub fn chunk(&self, asked: Option<usize>) -> usize {
-        let rows = asked.unwrap_or(tessera_device::FAST_MAX_ROWS);
+        let mut rows = asked.unwrap_or(tessera_device::FAST_MAX_ROWS);
+        if self.ring_chunk > 0 {
+            rows = rows.min(self.ring_chunk);
+        }
         rows.min(self.context).max(1)
     }
 

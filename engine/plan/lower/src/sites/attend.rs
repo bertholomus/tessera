@@ -41,14 +41,17 @@ impl Pattern for Attend {
             else {
                 return None;
             };
-            // The kept rows keep their axis's bound per slot.
+            // The kept rows keep their layout and slot bound.
             let Term::Op(Op::Append(index)) = tree.node(k).term else {
                 return None;
             };
-            let tessera_graph::DimExpr::Dim(axis) = &tree.g.kept[index as usize].shape.0[1] else {
-                return None;
-            };
-            let context = tree.g.dims.iter().find(|d| d.name == *axis)?.size.max() as usize;
+            let (_, kept, context) = tree.kept_layout(index)?;
+            if let Term::Op(Op::Append(vi)) = tree.node(v).term {
+                let (_, vk, vc) = tree.kept_layout(vi)?;
+                if vk != kept || vc != context {
+                    return None;
+                }
+            }
             // Slots the rows span, if the launch says. Else any.
             let segments = tree.sizes.iter().find(|(n, _)| *n == DimName::Segments);
             let segments = segments.map_or(queries, |(_, n)| *n as usize).min(queries);
@@ -60,7 +63,7 @@ impl Pattern for Attend {
                 kv_heads,
                 width,
                 context,
-                kept: tree.kept,
+                kept,
                 segments,
                 mask: a.mask,
                 k_form: plain(tree.node(k).form),

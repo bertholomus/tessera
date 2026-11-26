@@ -9,11 +9,68 @@ use crate::rule::Rule;
 use crate::select::Home;
 use crate::sites::Pattern;
 use crate::{Error, Size, Unsupported};
-use tessera_codegen::kept::Layout;
+use tessera_codegen::kept::{self, Layout};
 use tessera_graph::{
-    Composite, DType, DimExpr, DimName, Graph, Lower, NodeId, Op, Parts, Pin, Placement, Region,
-    Role, Shape, Stage, View,
+    Composite, DType, DimExpr, DimName, Graph, Lower, Mask, NodeId, Op, Parts, Pin, Placement,
+    Region, Role, Shape, Stage, View,
 };
+
+/// Max rows per launch a sliding ring reserves.
+pub const RING_CHUNK: usize = 2048;
+
+/// Ring capacity for sliding-window kept `index`, if smaller than context.
+pub fn sliding_ring(g: &Graph, index: u32) -> Option<usize> {
+    let k = g.kept.get(index as usize)?;
+    let DimExpr::Dim(axis) = k.shape.0.get(1)? else {
+        return None;
+    };
+    let context = g.dims.iter().find(|d| d.name == *axis)?.size.max() as usize;
+    let appends: Vec<NodeId> = g
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.op == Op::Append(index))
+        .map(|(i, _)| NodeId(i as u32))
+        .collect();
+    if appends.is_empty() {
+        return None;
+    }
+    let mut max_back: Option<usize> = None;
+    for n in &g.nodes {
+        let reads = n
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| appends.contains(a));
+        for (pos, _) in reads {
+            let Op::Attend(a) = &n.op else {
+                return None;
+            };
+            let Mask::Back(back) = a.mask else {
+                return None;
+            };
+            if !a.ragged || a.picked || (pos != 1 && pos != 2) {
+                return None;
+            }
+            let b = back as usize;
+            max_back = Some(max_back.map_or(b, |m| m.max(b)));
+        }
+    }
+    let back = max_back?;
+    let rows_max = g
+        .dims
+        .iter()
+        .find(|d| d.name == DimName::Rows)
+        .map_or(RING_CHUNK, |d| d.size.max() as usize);
+    let chunk = rows_max.min(RING_CHUNK);
+    let raw = back + 1 + chunk;
+    let ring = if rows_max < 64 {
+        raw
+    } else {
+        raw.next_multiple_of(64)
+    };
+    (ring < context).then_some(ring)
+}
 
 /// Entry outputs a launch reads, one bit each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -770,6 +827,15 @@ impl<'a> Tree<'a> {
         // A slot holds the axis's bound, whatever this launch sees.
         let most = self.g.dims.iter().find(|d| d.name == *axis);
         Some((t, most.map_or(0, |d| d.size.max() as usize)))
+    }
+
+    /// Append node, layout, and rows per slot for kept `index`.
+    pub fn kept_layout(&self, index: u32) -> Option<(T, &'static dyn Layout, usize)> {
+        let (t, context) = self.kept_rows(index)?;
+        match sliding_ring(self.g, index) {
+            Some(ring) => Some((t, kept::RING, ring)),
+            None => Some((t, self.kept, context)),
+        }
     }
 
     /// Fixed shape of kept state `index`, split for this rank.

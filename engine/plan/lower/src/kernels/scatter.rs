@@ -54,7 +54,7 @@ pub(crate) struct Scatter {
 impl Scatter {
     /// The scatter that runs append node `t` into kept `index`.
     pub(crate) fn at(tree: &Tree, t: T, index: u32) -> Option<Scatter> {
-        let (_, context) = tree.kept_rows(index)?;
+        let (_, kept, context) = tree.kept_layout(index)?;
         let node = tree.node(t);
         let all = &node.shape;
         let width: usize = all[2..].iter().product();
@@ -64,7 +64,7 @@ impl Scatter {
             width,
             slots: all[0],
             context,
-            kept: tree.kept,
+            kept,
             input: plain(tree.node(src).form),
             output: writable(node.form),
         })

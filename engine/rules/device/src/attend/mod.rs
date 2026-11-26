@@ -305,11 +305,12 @@ fn kept_stride(kept: &'static dyn Layout, context: usize) -> Option<(usize, &'st
 fn kept_context(tree: &Tree, k: T, v: T, most: usize) -> Option<(usize, &'static dyn Layout)> {
     match (&tree.node(k).term, &tree.node(v).term) {
         (Term::Op(Op::Append(ki)), Term::Op(Op::Append(vi))) => {
-            let ctx = tree.kept_rows(*ki)?.1;
-            if tree.kept_rows(*vi)?.1 != ctx {
+            let (_, layout, ctx) = tree.kept_layout(*ki)?;
+            let (_, vlayout, vctx) = tree.kept_layout(*vi)?;
+            if vlayout != layout || vctx != ctx {
                 return None;
             }
-            kept_stride(tree.kept, ctx)
+            kept_stride(layout, ctx)
         }
         (Term::Op(Op::Append(_)), _) | (_, Term::Op(Op::Append(_))) => None,
         _ => Some((most, kept::DENSE)),

@@ -714,11 +714,12 @@ fn site(tree: &Tree, at: T) -> Option<(Sizes, [T; 7])> {
         let (kept, context): (&'static dyn Layout, usize) =
             match (&tree.node(k).term, &tree.node(v).term) {
                 (Term::Op(Op::Append(ki)), Term::Op(Op::Append(vi))) => {
-                    let (_, ctx) = tree.kept_rows(*ki)?;
-                    if tree.kept_rows(*vi)?.1 != ctx {
+                    let (_, layout, ctx) = tree.kept_layout(*ki)?;
+                    let (_, vlayout, vctx) = tree.kept_layout(*vi)?;
+                    if vlayout != layout || vctx != ctx {
                         return None;
                     }
-                    (tree.kept, ctx)
+                    (layout, ctx)
                 }
                 (Term::Op(Op::Append(_)), _) | (_, Term::Op(Op::Append(_))) => return None,
                 _ => (&Dense, most),
