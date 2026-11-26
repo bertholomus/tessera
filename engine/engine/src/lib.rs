@@ -75,6 +75,7 @@ macro_rules! metric {
 }
 pub use tessera_graph::{Bf16, DType, DimExpr, DimName, E4M3, F16, Graph, PathSeg, Shape};
 pub use tessera_interp::{Tensor, bind, fold};
+pub use tessera_kv as kv;
 pub use tessera_lower::{
     Compute, Dtype, Filed, Knobs, Pick, Pins, Recipe, Settings, Site, Weight, form,
 };
