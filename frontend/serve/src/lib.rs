@@ -14,6 +14,7 @@ mod images;
 mod images_test;
 #[cfg(test)]
 mod lib_test;
+mod messages;
 mod metrics;
 #[cfg(test)]
 mod mocks;
@@ -229,6 +230,7 @@ fn embeddings(slot: &Slot, body: &[u8]) -> Response {
 tessera_engine::metric_registry!(API = "api");
 tessera_engine::metric!(COMPLETIONS in API = Counter "tessera:completion_requests_total", "Requests to /v1/completions.");
 tessera_engine::metric!(CHATS in API = Counter "tessera:chat_requests_total", "Requests to /v1/chat/completions.");
+tessera_engine::metric!(MESSAGES in API = Counter "tessera:messages_requests_total", "Requests to /v1/messages.");
 tessera_engine::metric!(EMBEDS in API = Counter "tessera:embedding_requests_total", "Requests to /v1/embeddings.");
 tessera_engine::metric!(DECISIONS in API = Counter "tessera:systemone_requests_total", "Requests to /v1/systemone.");
 tessera_engine::metric!(IMAGES in API = Counter "tessera:image_requests_total", "Requests to /v1/images/generations.");
@@ -258,6 +260,10 @@ pub fn route(slot: &Slot, request: &Request) -> Response {
         ("POST", "/v1/chat/completions") => {
             CHATS.add(1);
             answer::chat_completions(slot, request)
+        }
+        ("POST", "/v1/messages") => {
+            MESSAGES.add(1);
+            messages::messages(slot, request)
         }
         ("POST", "/v1/systemone") => {
             DECISIONS.add(1);
