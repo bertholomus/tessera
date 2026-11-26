@@ -217,3 +217,52 @@ fn stage_rules() {
         }
     }
 }
+
+#[test]
+fn wide_strided_narrow_forms() {
+    use tessera_graph::DimName::Hidden;
+    use tessera_graph::TensorType;
+    use tessera_lower::Pins;
+    use tessera_lower::form::{BF16_FORM, F32_FORM};
+    use tessera_trace::{Act, Port};
+    let m = Model::new(vec![Dim::bounded(Rows, 8), Dim::fixed(Hidden, 16)]);
+    let port = Port {
+        role: Role::Logits,
+        ty: TensorType::new([Rows, Hidden], DType::F32),
+    };
+    let [x] = m.entry(EntryKind::Forward, [port]);
+    let sliced = x.act(Act::Silu).slice(1, 4, 8);
+    let g = m.finish([(Role::Logits, &sliced)]);
+    let dev = Device::default().pinned(
+        Pins::all(BF16_FORM)
+            .activations(BF16_FORM)
+            .outputs(F32_FORM),
+    );
+    let plan = lower(&g, 0, &[(Rows, 4)], &dev).unwrap();
+    let strided = plan.steps.iter().find(|s| s.rule == "view").unwrap();
+    let tessera_lower::Source::Made(body) = strided.kernel.source() else {
+        panic!("expected Made source")
+    };
+    assert_eq!(body.entry, "plan_strided_x4_bf16_f32");
+    // Same-form narrow bf16->bf16 also uses vectorized x4.
+    let dev_same = Device::default().pinned(
+        Pins::all(BF16_FORM)
+            .activations(BF16_FORM)
+            .outputs(BF16_FORM),
+    );
+    let plan_same = lower(&g, 0, &[(Rows, 4)], &dev_same).unwrap();
+    let strided_same = plan_same.steps.iter().find(|s| s.rule == "view").unwrap();
+    let tessera_lower::Source::Made(body_same) = strided_same.kernel.source() else {
+        panic!("expected Made source")
+    };
+    assert_eq!(body_same.entry, "plan_strided_x4_bf16_bf16");
+    let mut noise = Noise(7);
+    let inp = fill(&g, &g.entries[0].inputs[0].ty, &[(Rows, 4)], &mut noise).unwrap();
+    let want = run(&g, &[], 0, std::slice::from_ref(&inp)).unwrap();
+    for settings in runs() {
+        let mut runner = open(plan.clone(), &settings).unwrap();
+        let got = runner.run(&[inp.view()]).unwrap();
+        let diff = max_abs_diff(got[0].floats().unwrap(), want[0].floats().unwrap());
+        assert!(diff < 2e-2, "diff={diff:e}");
+    }
+}
