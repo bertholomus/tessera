@@ -199,6 +199,14 @@ impl<'a, D: Dense> Attend<'a, D> {
         }
     }
 
+    /// Shared key/value projection split into rotated keys and values.
+    pub fn tied_kv(&self, k: &D, h: &Tensor, turn: impl Fn(Tensor, Side) -> Tensor) -> [Tensor; 2] {
+        let raw = self.split(k.apply(h), self.kv_heads.clone(), self.head_dim.clone());
+        let key = self.rotate(turn(raw.clone(), Side::Key));
+        let val = turn(raw, Side::Value);
+        [key, val]
+    }
+
     /// `h` through `[q, k, v]`, each side `turn`ed, then rotated.
     pub fn heads(
         &self,
