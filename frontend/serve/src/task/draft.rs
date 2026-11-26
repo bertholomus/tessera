@@ -18,7 +18,12 @@ use tessera_tasks::{Generate, Steer};
 pub static ENTRY: Entry = Entry {
     task: "generate",
     pick: Pick::Given(&["--draft"]),
-    flags: &[Flag::text("--draft", "<dir>"), ADAPTIVE, SPEC_LEN],
+    flags: &[
+        Flag::text("--draft", "<dir>"),
+        ADAPTIVE,
+        SPEC_LEN,
+        Flag::switch("--reuse-prefix"),
+    ],
     open,
 };
 
@@ -270,6 +275,9 @@ fn serve_batch(
         .with_spec_len(sl);
     if let Some(rows) = load.options.max_batch_rows {
         batch = batch.with_prefill_chunk(rows);
+    }
+    if load.on("--reuse-prefix") {
+        batch.reuse();
     }
     drive_batch(load, &mut batch, generate)?;
     let _ = engine.dismiss();

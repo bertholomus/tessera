@@ -864,3 +864,98 @@ fn batch_dflash_tp() {
     follower.join().unwrap();
     assert_eq!(got, want);
 }
+
+fn run_reuse_seq(
+    batch: &mut BatchDFlash<'_>,
+    prompts: &[(&[u32], usize)],
+) -> (Vec<Vec<u32>>, Vec<usize>) {
+    let (mut ids, mut kept) = (Vec::new(), Vec::new());
+    for &(p, max) in prompts {
+        let evs = Arc::new(Mutex::new(Vec::new()));
+        let s = evs.clone();
+        batch.submit(
+            Request {
+                tokens: p.to_vec(),
+                max_tokens: max,
+                ..Request::default()
+            },
+            Box::new(move |e| {
+                s.lock().unwrap().push(e);
+                true
+            }),
+        );
+        while batch.step().unwrap() {}
+        let evs = evs.lock().unwrap();
+        kept.push(
+            evs.iter()
+                .find_map(|e| match *e {
+                    Event::Kept(n) => Some(n),
+                    _ => None,
+                })
+                .unwrap_or(0),
+        );
+        ids.push(collect_ids(&evs));
+    }
+    (ids, kept)
+}
+
+#[test]
+fn batch_dflash_reuses_prefix() {
+    let (t_graph, d_graph) = toy_pair(48);
+    let tw = weights(&t_graph, &mut Noise(103));
+    let dw = weights(&d_graph, &mut Noise(107));
+    let p1: Vec<u32> = (0..20).map(|i| (i % 7) + 1).collect();
+    let mut p2 = p1.clone();
+    p2.extend_from_slice(&[6, 2, 5, 1]);
+    let prompts: &[(&[u32], usize)] = &[(&p1, 6), (&p2, 6)];
+    let settings = Settings {
+        backend: Pick::Host,
+        ..Settings::default()
+    };
+    let want = run_solo_refs(&t_graph, &d_graph, &tw, &dw, 48, &settings, prompts);
+    for paged in [false, true] {
+        let mut recipe = Recipe::default();
+        if paged {
+            recipe.kept = &tessera_lower::kept::PAGED16;
+        }
+        let mut te = Engine::open(t_graph.clone(), 48, &recipe, &settings).unwrap();
+        let stored: Vec<Weight> = tw.iter().cloned().map(Weight::Floats).collect();
+        te.load(&stored).unwrap();
+        let mut dr = open_drafter(&d_graph, &dw, 48, 4, 0, &settings);
+        let mut batch = BatchDFlash::new(&mut te, &mut dr)
+            .unwrap()
+            .with_prefill_chunk(6);
+        batch.reuse();
+        let (got, kept) = run_reuse_seq(&mut batch, prompts);
+        assert_eq!(got, want, "paged={paged}");
+        assert_eq!(kept, vec![0, if paged { 16 } else { 20 }], "paged={paged}");
+    }
+    let [[s0, s1], [c0, c1]] = loopback_links();
+    let (tg_f, dg_f, s_f) = (t_graph.clone(), d_graph.clone(), settings.clone());
+    let follower = std::thread::spawn(move || {
+        let (mut te, mut dr) = open_tp_dflash(&tg_f, &dg_f, 48, &s_f, Box::new(s1), c1, (103, 107));
+        let mut batch = BatchDFlash::new(&mut te, &mut dr)
+            .unwrap()
+            .with_prefill_chunk(6);
+        batch.reuse();
+        batch.follow().unwrap();
+    });
+    let (mut te, mut dr) = open_tp_dflash(
+        &t_graph,
+        &d_graph,
+        48,
+        &settings,
+        Box::new(s0),
+        c0,
+        (103, 107),
+    );
+    let mut batch = BatchDFlash::new(&mut te, &mut dr)
+        .unwrap()
+        .with_prefill_chunk(6);
+    batch.reuse();
+    let (got, kept) = run_reuse_seq(&mut batch, prompts);
+    te.dismiss().unwrap();
+    follower.join().unwrap();
+    assert_eq!(got, want);
+    assert_eq!(kept, vec![0, 20]);
+}

@@ -11,7 +11,7 @@ use crate::schedule::Sink;
 use crate::spec_len::{CostModel, SpecLen};
 use crate::spec_loop::{TapsBuf, TapsIn, fnv_u32, span};
 use crate::speculate::Drafter;
-use crate::{Engine, Error, Request, Row};
+use crate::{Engine, Error, Event, Request, Row};
 use std::collections::VecDeque;
 
 /// Context rows retained per slot for DFlash tail promotion.
@@ -434,6 +434,7 @@ struct DFlashPrefill {
     request: Request,
     sink: Option<Sink>,
     pos: usize,
+    d_base: usize,
 }
 
 struct DFlashSeq {
@@ -441,13 +442,15 @@ struct DFlashSeq {
     spec: SpecLen,
     last_pred: f64,
     last_lp: Option<Vec<f32>>,
+    d_base: usize,
+    history: Vec<u32>,
 }
 
 struct DFlashJob {
     active_idx: usize,
     slot: u32,
-    old_start: usize,
-    new_start: usize,
+    d_old: usize,
+    d_new: usize,
     anchor: u32,
     tap_row_off: usize,
     commit: usize,
@@ -464,6 +467,8 @@ pub struct BatchDFlash<'a> {
     block: usize,
     tap_width: usize,
     kept: Option<Kept>,
+    reuse: bool,
+    admitted_skips: VecDeque<usize>,
     waiting: VecDeque<(Request, Sink)>,
     prefilling: VecDeque<DFlashPrefill>,
     active: Vec<DFlashSeq>,
@@ -503,12 +508,27 @@ impl<'a> BatchDFlash<'a> {
             block,
             tap_width: width,
             kept,
+            reuse: false,
+            admitted_skips: VecDeque::new(),
             waiting: VecDeque::new(),
             prefilling: VecDeque::new(),
             active: Vec::new(),
             free,
             hash: 2166136261,
         })
+    }
+
+    /// Retains finished slots for prefix reuse.
+    pub fn reuse(&mut self) {
+        if self.target.stateful() {
+            return;
+        }
+        self.reuse = true;
+        if self.kept.is_none() {
+            let slots = self.target.slots().min(self.drafter.slots());
+            self.kept = Some(Kept::new(slots, self.max_ctx));
+            self.free.clear();
+        }
     }
 
     /// Sets the maximum prompt rows per prefill step.
@@ -543,9 +563,13 @@ impl<'a> BatchDFlash<'a> {
         !self.waiting.is_empty() || !self.prefilling.is_empty() || !self.active.is_empty()
     }
 
-    fn free_slot(&mut self, slot: u32) {
+    fn admit_limit(&self, len: usize) -> usize {
+        if self.reuse { len.saturating_sub(1) } else { 0 }
+    }
+
+    fn free_slot(&mut self, slot: u32, history: Vec<u32>) {
         if let Some(kept) = &mut self.kept {
-            kept.finish(slot, Vec::new());
+            kept.finish(slot, if self.reuse { history } else { Vec::new() });
         } else {
             self.free.push(slot);
         }
@@ -559,28 +583,45 @@ impl<'a> BatchDFlash<'a> {
     }
 
     fn exec_round(&mut self, admitted: Vec<Admitted>, follower: bool) -> Result<(), Error> {
-        for item in admitted {
-            if follower && let Some(kept) = &mut self.kept {
-                let Some((slot, _)) = kept.admit(&item.request.tokens, 0) else {
-                    return Err(Error::RowPlace);
-                };
-                debug_assert_eq!(slot, item.slot);
+        for mut item in admitted {
+            let limit = self.admit_limit(item.request.tokens.len());
+            let skip = if follower {
+                if let Some(kept) = &mut self.kept {
+                    let Some((slot, skip)) = kept.admit(&item.request.tokens, limit) else {
+                        return Err(Error::RowPlace);
+                    };
+                    debug_assert_eq!(slot, item.slot);
+                    skip
+                } else {
+                    0
+                }
+            } else {
+                self.admitted_skips.pop_front().unwrap_or(0)
+            };
+            if skip > 0
+                && let Some(cb) = &mut item.sink
+            {
+                let _ = cb(Event::Kept(skip));
             }
             self.prefilling.push_back(DFlashPrefill {
                 slot: item.slot,
                 request: item.request,
                 sink: item.sink,
-                pos: 0,
+                pos: skip,
+                d_base: skip,
             });
         }
         if !self.prefilling.is_empty() {
             self.prefill_step()?;
         }
         self.active.sort_by_key(|s| s.seq.slot);
-        if self.active.is_empty() {
-            return Ok(());
+        if !self.active.is_empty() {
+            self.verify_and_draft()?;
         }
-        self.verify_and_draft()
+        if let Some(kept) = &self.kept {
+            kept.publish();
+        }
+        Ok(())
     }
 
     fn prefill_step(&mut self) -> Result<(), Error> {
@@ -599,13 +640,14 @@ impl<'a> BatchDFlash<'a> {
         self.ensure_pages(&rows)?;
         let (ids, taps) = self.target.step_taps_local(&rows)?;
         let wants = self.drafter.draft_wants();
+        let d_pos0 = pos0 - seq.d_base;
         if end < n {
-            if n + self.block <= self.max_ctx {
+            if n - seq.d_base + self.block <= self.max_ctx {
                 self.drafter.run_taps(
                     seq.slot,
                     seq.request.tokens[end],
-                    end,
-                    pos0,
+                    end - seq.d_base,
+                    d_pos0,
                     taps.as_in(),
                     wants,
                 )?;
@@ -616,6 +658,7 @@ impl<'a> BatchDFlash<'a> {
         }
         let anchor = *ids.last().expect("non-empty chunk");
         fnv_u32(&mut self.hash, anchor);
+        let history = seq.request.tokens.clone();
         let mut act = ActiveSeq {
             slot: seq.slot,
             request: seq.request,
@@ -632,17 +675,18 @@ impl<'a> BatchDFlash<'a> {
         };
         let done = act.commit(&[anchor], self.max_ctx);
         if done.is_some() || (self.target.control.is_none() && act.cancelled) {
-            self.free_slot(act.slot);
+            self.free_slot(act.slot, history);
             return Ok(());
         }
         let spec = self.spec_len.fresh();
         let mut last_pred = 1.0;
         let mut last_lp = None;
         let room = act.room(self.max_ctx);
-        if n + self.block <= self.max_ctx && room > 0 {
-            let outs = self
-                .drafter
-                .run_taps(act.slot, anchor, n, pos0, taps.as_in(), wants)?;
+        let d_start = n - seq.d_base;
+        if d_start + self.block <= self.max_ctx && room > 0 {
+            let outs =
+                self.drafter
+                    .run_taps(act.slot, anchor, d_start, d_pos0, taps.as_in(), wants)?;
             let (mut drafts, lp) = self.drafter.read_draft(&outs)?;
             let avail = drafts.len().min(room);
             let (k, pred) = spec.choose(lp.as_deref(), avail, drafts.len());
@@ -656,6 +700,8 @@ impl<'a> BatchDFlash<'a> {
             spec,
             last_pred,
             last_lp,
+            d_base: seq.d_base,
+            history,
         });
         Ok(())
     }
@@ -676,13 +722,16 @@ impl<'a> BatchDFlash<'a> {
         let mut finished: Vec<bool> = vec![false; s_count];
         for (i, &(off, k)) in spans.iter().enumerate() {
             let old_start = self.active[i].seq.start;
-            let (accepted, _, done) = self.active[i].seq.apply_verify(
+            let old_anchor = self.active[i].seq.anchor;
+            let (accepted, committed, done) = self.active[i].seq.apply_verify(
                 k,
                 &ids[off..off + 1 + k],
                 self.max_ctx,
                 &mut self.hash,
             );
             let item = &mut self.active[i];
+            item.history.push(old_anchor);
+            item.history.extend_from_slice(&committed[..accepted]);
             if k > 0 {
                 item.spec
                     .observe(k, accepted, item.last_lp.as_deref(), item.last_pred);
@@ -692,12 +741,14 @@ impl<'a> BatchDFlash<'a> {
                 continue;
             }
             let avail = item.seq.room(self.max_ctx);
-            if item.seq.start + self.block <= self.max_ctx && avail > 0 {
+            let d_old = old_start - item.d_base;
+            let d_new = item.seq.start - item.d_base;
+            if d_new + self.block <= self.max_ctx && avail > 0 {
                 jobs.push(DFlashJob {
                     active_idx: i,
                     slot: item.seq.slot,
-                    old_start,
-                    new_start: item.seq.start,
+                    d_old,
+                    d_new,
                     anchor: item.seq.anchor,
                     tap_row_off: off,
                     commit: 1 + accepted,
@@ -719,14 +770,9 @@ impl<'a> BatchDFlash<'a> {
                     TapsIn::Host(&v[lo..hi])
                 }
             };
-            let outs = self.drafter.run_taps(
-                job.slot,
-                job.anchor,
-                job.new_start,
-                job.old_start,
-                taps_in,
-                wants,
-            )?;
+            let outs = self
+                .drafter
+                .run_taps(job.slot, job.anchor, job.d_new, job.d_old, taps_in, wants)?;
             let (mut drafts, lp) = self.drafter.read_draft(&outs)?;
             let avail = drafts.len().min(job.avail);
             let item = &mut self.active[job.active_idx];
@@ -741,7 +787,7 @@ impl<'a> BatchDFlash<'a> {
         while idx < self.active.len() {
             if finished[orig] {
                 let item = self.active.remove(idx);
-                self.free_slot(item.seq.slot);
+                self.free_slot(item.seq.slot, item.history);
             } else {
                 idx += 1;
             }
@@ -769,26 +815,34 @@ impl RoundHost for BatchDFlash<'_> {
             .collect()
     }
     fn admit_local(&mut self) -> Vec<Admitted> {
+        // Retire cancelled slots before admitting so ranks match.
+        if self.active.iter().any(|s| s.seq.cancelled) {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         while let Some((req, _)) = self.waiting.front() {
-            let slot = if let Some(kept) = &mut self.kept {
-                let busy =
-                    !self.active.is_empty() || !self.prefilling.is_empty() || !out.is_empty();
-                let pool = kept.totals().pool;
-                let free_rows = pool.size.saturating_sub(pool.active);
-                if busy && free_rows < req.tokens.len() + PAGE_HEADROOM {
-                    break;
+            let limit = self.admit_limit(req.tokens.len());
+            let (slot, skip) = if let Some(kept) = &mut self.kept {
+                if self.target.lanes.is_some() {
+                    let busy =
+                        !self.active.is_empty() || !self.prefilling.is_empty() || !out.is_empty();
+                    let pool = kept.totals().pool;
+                    let free_rows = pool.size.saturating_sub(pool.active);
+                    if busy && free_rows < req.tokens.len() + PAGE_HEADROOM {
+                        break;
+                    }
                 }
-                let Some((slot, _)) = kept.admit(&req.tokens, 0) else {
+                let Some((slot, skip)) = kept.admit(&req.tokens, limit) else {
                     break;
                 };
-                slot
+                (slot, skip)
             } else {
                 let Some(slot) = self.free.pop() else {
                     break;
                 };
-                slot
+                (slot, 0)
             };
+            self.admitted_skips.push_back(skip);
             let (request, sink) = self.waiting.pop_front().expect("waiting request");
             out.push(Admitted {
                 slot,
@@ -800,13 +854,13 @@ impl RoundHost for BatchDFlash<'_> {
         out
     }
     fn retire_slots(&mut self, slots: &[u32]) {
-        let (kept, free) = (&mut self.kept, &mut self.free);
+        let (kept, free, reuse) = (&mut self.kept, &mut self.free, self.reuse);
         retire_from(
             &mut self.active,
             slots,
             |s| s.seq.slot,
             |s| match kept {
-                Some(k) => k.finish(s.seq.slot, Vec::new()),
+                Some(k) => k.finish(s.seq.slot, if reuse { s.history } else { Vec::new() }),
                 None => free.push(s.seq.slot),
             },
         );
