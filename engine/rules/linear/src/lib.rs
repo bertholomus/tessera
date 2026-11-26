@@ -6,6 +6,7 @@ mod product;
 mod stacked;
 mod thin;
 mod tiled;
+mod trellis_metal;
 mod turned;
 
 pub use product::Product;
