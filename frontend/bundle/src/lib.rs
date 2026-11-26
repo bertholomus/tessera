@@ -13,6 +13,7 @@ mod gemma4;
 mod gguf;
 #[cfg(test)]
 mod gguf_test;
+pub mod hy4;
 pub mod mla;
 pub mod mtp;
 #[cfg(test)]

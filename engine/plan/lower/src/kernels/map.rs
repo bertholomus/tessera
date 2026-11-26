@@ -56,6 +56,9 @@ pub enum MapStage {
     /// Multiplies by the next operand.
     Mul,
     Scale(f32),
+    Shift(f32),
+    Min(f32),
+    Max(f32),
     Act(Act),
 }
 
@@ -85,6 +88,9 @@ impl MapStage {
             MapStage::Add => (Row::Add, 0.0),
             MapStage::Mul => (Row::Mul, 0.0),
             MapStage::Scale(by) => (Row::Scale, *by),
+            MapStage::Shift(by) => (Row::Shift, *by),
+            MapStage::Min(hi) => (Row::Min, *hi),
+            MapStage::Max(lo) => (Row::Max, *lo),
             MapStage::Act(Act::GeluTanh) => (Row::GeluTanh, 0.0),
             MapStage::Act(Act::Silu) => (Row::Silu, 0.0),
             MapStage::Act(Act::Sigmoid) => (Row::Sigmoid, 0.0),
@@ -198,6 +204,20 @@ fn stage_stmts(stages: &[MapStage], operand: &dyn Fn(usize) -> Expr) -> Vec<Stmt
                 BinOp::Mul,
                 Expr::var("v"),
                 Expr::Float(f64::from(*by)),
+            )),
+            MapStage::Shift(by) => assign(Expr::bin(
+                BinOp::Add,
+                Expr::var("v"),
+                Expr::Float(f64::from(*by)),
+            )),
+            MapStage::Min(hi) => {
+                let neg_v = Expr::Neg(Box::new(Expr::var("v")));
+                let m = Expr::Call(Intrinsic::Max, vec![neg_v, Expr::Float(f64::from(-*hi))]);
+                assign(Expr::Neg(Box::new(m)))
+            }
+            MapStage::Max(lo) => assign(Expr::Call(
+                Intrinsic::Max,
+                vec![Expr::var("v"), Expr::Float(f64::from(*lo))],
             )),
             MapStage::Act(a) => assign(act_expr(*a)),
         })

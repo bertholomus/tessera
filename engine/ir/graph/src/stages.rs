@@ -114,6 +114,21 @@ macro_rules! stages {
             Add as add => Map { operand: Broadcast, place: Sum, pin: Residual }
             Mul as mul => Map { operand: Broadcast, place: Product }
             Scale(by: f32 = 0.5) as scale => Map { check: Finite(by, "scale") }
+            /// Adds constant `by` to every element.
+            Shift(by: f32 = 0.5) as shift => Map {
+                check: Finite(by, "shift"),
+                place: Nonlinear(by == 0.0),
+            }
+            /// Clamps each element to at most `hi`.
+            Min(hi: f32 = 1.0) as min => Map {
+                check: Finite(hi, "min bound"),
+                place: Nonlinear(hi >= 0.0),
+            }
+            /// Clamps each element to at least `lo`.
+            Max(lo: f32 = -1.0) as max => Map {
+                check: Finite(lo, "max bound"),
+                place: Nonlinear(lo <= 0.0),
+            }
             RmsNorm { eps: f32 = 1e-6 } as rms_norm => "rms_norm" {
                 operand: RowWeight,
                 whole: true,
