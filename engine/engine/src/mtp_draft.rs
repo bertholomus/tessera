@@ -126,6 +126,14 @@ impl MtpDrafter {
         self.hidden
     }
 
+    pub(crate) fn lanes(&self) -> Option<&crate::lanes::Lanes> {
+        self.core.lanes.as_ref()
+    }
+
+    pub(crate) fn lanes_mut(&mut self) -> Option<&mut crate::lanes::Lanes> {
+        self.core.lanes.as_mut()
+    }
+
     /// Number of cached plan hits in the MTP drafter.
     pub fn plan_hits(&self) -> usize {
         self.core.plans.hits

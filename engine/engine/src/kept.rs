@@ -70,10 +70,26 @@ impl Kept {
 
     /// A slot for `prompt`, and at most `limit` kept rows.
     pub fn admit(&mut self, prompt: &[u32], limit: usize) -> Option<(u32, usize)> {
+        self.admit_drop(prompt, limit, 0)
+    }
+
+    /// As `admit`, dropping trailing rows for shifted MTP KV.
+    pub fn admit_shifted(
+        &mut self,
+        prompt: &[u32],
+        limit: usize,
+        page: usize,
+    ) -> Option<(u32, usize)> {
+        let drop = if self.laned.is_some() { page } else { 1 };
+        self.admit_drop(prompt, limit, drop)
+    }
+
+    fn admit_drop(&mut self, prompt: &[u32], limit: usize, drop: usize) -> Option<(u32, usize)> {
         let hit = self.index.find(&self.pool, TAG, prompt, limit);
         let worst = self.context;
         let Some(laned) = &mut self.laned else {
-            let adopted = hit.and_then(|(run, skip)| {
+            let adopted = hit.and_then(|(run, found)| {
+                let skip = found.saturating_sub(drop);
                 let run = self.pool.adopt(run, skip, worst).ok()?;
                 Some((run, skip))
             });
@@ -91,9 +107,9 @@ impl Kept {
             true => prompt.len().max(1).min(worst),
             false => worst,
         };
-        let forked = hit.and_then(|(run, skip)| {
-            let run = self.pool.fork(run, skip, need).ok()?;
-            Some((run, skip))
+        let forked = hit.and_then(|(run, found)| {
+            let skip = found.saturating_sub(drop);
+            (skip > 0).then(|| self.pool.fork(run, skip, need).ok().map(|r| (r, skip)))?
         });
         let (run, skip) = match forked {
             Some(found) => found,
@@ -137,6 +153,15 @@ impl Kept {
         rows: &[crate::Row],
         lanes: &mut crate::lanes::Lanes,
     ) -> Result<(), Error> {
+        self.grow_rows_with(rows, |slot, pages| lanes.set(slot, pages))
+    }
+
+    /// Paged: grows each slot in `rows` and calls `on_set`.
+    pub fn grow_rows_with(
+        &mut self,
+        rows: &[crate::Row],
+        mut on_set: impl FnMut(u32, &[u32]),
+    ) -> Result<(), Error> {
         let mut peaks: Vec<(u32, usize)> = Vec::new();
         for r in rows {
             let need = r.position as usize + 1;
@@ -150,7 +175,7 @@ impl Kept {
         }
         for (slot, need) in peaks {
             if let Some(pages) = self.grow(slot, need)? {
-                lanes.set(slot, pages);
+                on_set(slot, pages);
             }
         }
         Ok(())

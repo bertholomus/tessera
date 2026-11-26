@@ -3,13 +3,13 @@
 mod common;
 
 use common::{
-    check_sharded_head, check_spec, collect_ids, dim_max, gen_events, gen_ids, host_settings,
-    kept_count, loopback_links, open_mtp, open_target, open_tp_mtp, plan_gathers, req, spec_events,
-    zero_last,
+    check_sharded_head, check_spec, collect_ids, dim_max, float_weights, gen_events, gen_ids,
+    host_settings, kept_count, loopback_links, open_mtp, open_target, open_tp_mtp, plan_gathers,
+    req, spec_events, two_place, zero_last,
 };
 use tessera_engine::{
-    Allowed, BatchMtp, Event, Fault, Guide, MtpSpeculate, Penalties, Prefix, Program, Reason,
-    Request, Scoped, SpecStats, Stacked, Steps, Term,
+    Allowed, BatchMtp, Drafter, Engine, Event, Fault, Guide, MtpDrafter, MtpSpeculate, Penalties,
+    Prefix, Program, Reason, Recipe, Request, Scoped, SpecStats, Stacked, Steps, Term,
 };
 use tessera_graph::DimName::{Hidden, Vocab};
 use tessera_graph::{Graph, Parts, PathSeg, Role};
@@ -490,4 +490,135 @@ fn penalties_guide(prompt: &[u32]) -> Option<Box<dyn Guide>> {
         ..Penalties::default()
     };
     penalties.guide(prompt)
+}
+
+fn greedy_answers(base: &mut Engine, prompts: &[(Vec<u32>, usize)]) -> Vec<Vec<u32>> {
+    prompts
+        .iter()
+        .map(|(toks, max_tokens)| gen_ids(base, req(toks, *max_tokens)))
+        .collect()
+}
+
+fn run_batch_seq(
+    batch: &mut BatchMtp<'_>,
+    prompts: &[(Vec<u32>, usize)],
+    want: &[Vec<u32>],
+) -> bool {
+    let mut kept_hit = false;
+    for ((toks, max_tokens), expected) in prompts.iter().zip(want) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        batch.submit(
+            req(toks, *max_tokens),
+            Box::new(move |e| tx.send(e).is_ok()),
+        );
+        while batch.step().unwrap() {}
+        let evs: Vec<_> = rx.try_iter().collect();
+        kept_hit |= kept_count(&evs) > 0;
+        assert_eq!(&collect_ids(&evs), expected);
+    }
+    kept_hit
+}
+
+#[test]
+fn batch_mtp_paged() {
+    let mut paged = Recipe::default();
+    paged.share_kept(1);
+    let page = paged.kept.page().expect("paged layout");
+    let ctx = page * 3;
+    paged.share_kept(page * 4);
+    let mut t_cfg = mla_cfg(true, 16);
+    t_cfg.stack.max_seqs = 3;
+    t_cfg.stack.max_context = ctx as u64;
+    let t_graph = mla::stepper::<mla::Moe>(&t_cfg);
+    let m_graph = mtp::stepper::<mla::Moe>(&mtp::config(&t_cfg, true));
+    let t_weights = weights(&t_graph, &mut Noise(131));
+    let (t_stored, m_stored) = (float_weights(&t_graph, 131), float_weights(&m_graph, 137));
+    let settings = host_settings();
+    let mut baseline = open_target(&t_graph, &t_weights, ctx, &settings);
+    let base: Vec<u32> = (0..(page * 2 + 5) as u32)
+        .map(|i| (i * 7 + 3) % 16)
+        .collect();
+    let mut p1 = base.clone();
+    *p1.last_mut().unwrap() = (base[base.len() - 1] + 1) % 16;
+    let prompts = [(base, 8usize), (vec![7u32, 1, 5, 2, 4], 7), (p1, 8)];
+    let expected = greedy_answers(&mut baseline, &prompts);
+    for reuse in [false, true] {
+        let mut target = Engine::open(t_graph.clone(), ctx, &paged, &settings).unwrap();
+        target.load(&t_stored).unwrap();
+        let mut drafter = MtpDrafter::open(m_graph.clone(), ctx, &paged, &settings).unwrap();
+        drafter.load(&m_stored).unwrap();
+        let mut batch = BatchMtp::new(&mut target, &mut drafter, 2)
+            .unwrap()
+            .with_prefill_chunk(page + 3);
+        if reuse {
+            batch.reuse();
+        }
+        assert_eq!(run_batch_seq(&mut batch, &prompts, &expected), reuse);
+    }
+}
+
+#[test]
+fn batch_mtp_paged_ranked() {
+    let mut paged = Recipe::default();
+    paged.share_kept(1);
+    let page = paged.kept.page().expect("paged layout");
+    let ctx = page * 3;
+    paged.share_kept(page * 3);
+    let mut t_cfg = mla_cfg(true, 512);
+    t_cfg.stack.vocab = 128;
+    t_cfg.stack.max_seqs = 2;
+    t_cfg.stack.max_context = ctx as u64;
+    let t_graph = mla::stepper::<mla::Moe>(&t_cfg);
+    let m_graph = mtp::stepper::<mla::Moe>(&mtp::config(&t_cfg, true));
+    let settings = host_settings();
+    let [[s0, s1], [c0, c1]] = loopback_links();
+    let (tg_f, mg_f, s_f, r_f) = (
+        t_graph.clone(),
+        m_graph.clone(),
+        settings.clone(),
+        paged.clone(),
+    );
+    let open_pair =
+        move |tg: Graph, mg: Graph, r: &Recipe, s: &tessera_lower::Settings, sum, ctl| {
+            let [ts, ms] = Drafter::share_transport(sum);
+            let (tw, mw) = (float_weights(&tg, 149), float_weights(&mg, 151));
+            let mut te = Engine::open_ranked(tg, ctx, (r, s), two_place(true), ts, ctl).unwrap();
+            te.load(&tw).unwrap();
+            let mut dr = MtpDrafter::open_ranked(mg, ctx, (r, s), two_place(true), ms).unwrap();
+            dr.load(&mw).unwrap();
+            (te, dr)
+        };
+    let follower = std::thread::spawn(move || {
+        let (mut te, mut dr) = open_pair(tg_f, mg_f, &r_f, &s_f, Box::new(s1), Box::new(c1));
+        let mut batch = BatchMtp::new(&mut te, &mut dr, 2)
+            .unwrap()
+            .with_prefill_chunk(page + 3);
+        batch.reuse();
+        batch.follow().unwrap();
+    });
+    let (mut target, mut drafter) = open_pair(
+        t_graph.clone(),
+        m_graph,
+        &paged,
+        &settings,
+        Box::new(s0),
+        Box::new(c0),
+    );
+    let t_weights = weights(&t_graph, &mut Noise(149));
+    let mut baseline = open_target(&t_graph, &t_weights, ctx, &settings);
+    let base: Vec<u32> = (0..(page * 2 + 5) as u32)
+        .map(|i| (i * 5 + 2) % 16)
+        .collect();
+    let mut p1 = base.clone();
+    *p1.last_mut().unwrap() = (base[base.len() - 1] + 1) % 16;
+    let prompts = [(base, 7usize), (p1, 7)];
+    let expected = greedy_answers(&mut baseline, &prompts);
+    let mut batch = BatchMtp::new(&mut target, &mut drafter, 2)
+        .unwrap()
+        .with_prefill_chunk(page + 3);
+    batch.reuse();
+    assert!(run_batch_seq(&mut batch, &prompts, &expected));
+    drop(batch);
+    target.dismiss().unwrap();
+    follower.join().unwrap();
 }

@@ -432,6 +432,7 @@ pub struct BatchMtp<'a> {
     pub(crate) depth: usize,
     pub(crate) prefilling: VecDeque<PrefillSeq>,
     pub(crate) active: Vec<ActiveSeq>,
+    pub(crate) reuse: bool,
 }
 
 impl<'a> BatchMtp<'a> {
@@ -441,16 +442,25 @@ impl<'a> BatchMtp<'a> {
         dual: Option<DualPeer<'a>>,
         depth: usize,
         max_ctx: usize,
-    ) -> Self {
+    ) -> Result<Self, Error> {
+        if let Some(lanes) = drafter.lanes_mut() {
+            lanes.reset();
+        }
+        if let (Some(tl), Some(dl)) = (target.lanes.as_ref(), drafter.lanes())
+            && (tl.page != dl.page || tl.pages() != dl.pages())
+        {
+            return Err(Error::Rows);
+        }
         let slots = target.slots().min(drafter.slots());
-        Self {
-            core: BatchCore::new(target, slots, max_ctx, false),
+        Ok(Self {
+            core: BatchCore::new(target, slots, max_ctx, true),
             drafter,
             dual,
             depth,
             prefilling: VecDeque::new(),
             active: Vec::new(),
-        }
+            reuse: false,
+        })
     }
 
     /// Pairs a multi-slot tapped target engine with its MTP drafter.
@@ -467,7 +477,7 @@ impl<'a> BatchMtp<'a> {
             return Err(Error::Rows);
         }
         let max_ctx = target.context().min(drafter.context());
-        Ok(Self::init(target, drafter, None, depth, max_ctx))
+        Self::init(target, drafter, None, depth, max_ctx)
     }
 }
 
@@ -512,7 +522,7 @@ macro_rules! batch_methods {
 }
 pub(crate) use batch_methods;
 
-batch_methods!(BatchMtp);
+batch_methods!(BatchMtp, reuse);
 
 impl<'a> RoundHost<'a> for BatchMtp<'a> {
     fn core(&mut self) -> &mut BatchCore<'a> {
@@ -529,16 +539,29 @@ impl<'a> RoundHost<'a> for BatchMtp<'a> {
             .collect()
     }
     fn admit_local(&mut self) -> Vec<Admitted> {
+        if self.active.iter().any(|s| s.cancelled) {
+            return Vec::new();
+        }
         let mut out = Vec::new();
+        let can_reuse = self.can_reuse();
+        let page = self.core.target.lanes.as_ref().map_or(0, |l| l.page);
         while let Some((front, _)) = self.core.waiting.front() {
             let (slot, skip) = match &mut self.core.kept {
                 Some(kept) => {
-                    let limit = front.tokens.len().saturating_sub(1);
-                    let Some((slot, hit)) = kept.admit(&front.tokens, limit) else {
+                    let busy =
+                        !self.active.is_empty() || !self.prefilling.is_empty() || !out.is_empty();
+                    let pool = kept.totals().pool;
+                    let free_rows = pool.size.saturating_sub(pool.active);
+                    let extra = if can_reuse { 0 } else { front.tokens.len() };
+                    if page > 0 && busy && free_rows < extra + crate::batch_dual::PAGE_HEADROOM {
+                        break;
+                    }
+                    let Some(pair) =
+                        crate::batch_dual::admit_one(kept, &front.tokens, can_reuse, page)
+                    else {
                         break;
                     };
-                    // MTP shifts by one token, so drop one row.
-                    (slot, hit.saturating_sub(1))
+                    pair
                 }
                 None => {
                     let Some(slot) = self.core.free.pop() else {
@@ -556,18 +579,26 @@ impl<'a> RoundHost<'a> for BatchMtp<'a> {
             self.retire_slot(s.slot, s.history, s.mtp_valid);
         }
     }
-    fn run_round(&mut self, admitted: Vec<Admitted>, _follower: bool) -> Result<(), Error> {
-        self.exec_round(admitted)
+    fn run_round(&mut self, admitted: Vec<Admitted>, follower: bool) -> Result<(), Error> {
+        self.exec_round(admitted, follower)
     }
 }
 
 impl BatchMtp<'_> {
-    pub(crate) fn retire_slot(&mut self, slot: u32, mut history: Vec<u32>, mtp_valid: usize) {
-        history.truncate(mtp_valid.min(self.core.max_ctx));
-        self.core.retire(slot, history);
+    pub(crate) fn can_reuse(&self) -> bool {
+        self.reuse && (self.core.target.lanes.is_none() || self.drafter.lanes().is_some())
     }
 
-    fn exec_round(&mut self, admitted: Vec<Admitted>) -> Result<(), Error> {
+    pub(crate) fn retire_slot(&mut self, slot: u32, mut history: Vec<u32>, mtp_valid: usize) {
+        if self.can_reuse() {
+            history.truncate(mtp_valid.min(self.core.max_ctx));
+            self.core.retire(slot, history);
+        } else {
+            self.core.retire(slot, Vec::new());
+        }
+    }
+
+    fn exec_round(&mut self, admitted: Vec<Admitted>, follower: bool) -> Result<(), Error> {
         if !admitted.is_empty() {
             if self.active.len() == 1 && self.active[0].solo.is_some() {
                 self.demote_solo()?;
@@ -579,7 +610,17 @@ impl BatchMtp<'_> {
                 && self.active.is_empty()
                 && self.prefilling.is_empty()
                 && admitted.len() == 1;
+            let can_reuse = self.can_reuse();
+            let page = self.core.target.lanes.as_ref().map_or(0, |l| l.page);
             for mut item in admitted {
+                if follower && let Some(kept) = &mut self.core.kept {
+                    let Some((slot, _)) =
+                        crate::batch_dual::admit_one(kept, &item.request.tokens, can_reuse, page)
+                    else {
+                        return Err(Error::RowPlace);
+                    };
+                    debug_assert_eq!(slot, item.slot);
+                }
                 notify_kept(&mut item.sink, item.skip);
                 let n = item.request.tokens.len();
                 let win = solo_admit
@@ -630,6 +671,7 @@ impl BatchMtp<'_> {
         let mut rows = Vec::with_capacity(len);
         let chunk = &seq.request.tokens[pos0..pos0 + len];
         span(&mut rows, seq.slot, pos0, chunk.iter().copied());
+        self.ensure_pages(&rows)?;
         if pos0 + len < n {
             let (_, taps) = self.core.target.step_taps_local(&rows)?;
             let shifted = &seq.request.tokens[pos0 + 1..pos0 + len + 1];
@@ -703,6 +745,9 @@ impl BatchMtp<'_> {
             push_tail(&mut seq.d_buf, &dt, d_w);
         }
         let avail = self.depth.min(act.room(self.core.max_ctx));
+        if avail >= 2 && self.drafter.lanes().is_some() {
+            self.ensure_slot_pages(act.slot, n + avail - 1)?;
+        }
         act.drafts = if avail > 0 {
             let dual_stride = dual_widths.map(|(d_w, m_w)| (d_w, d_w + m_w));
             let job = MtpJob {
@@ -735,6 +780,7 @@ impl BatchMtp<'_> {
     fn verify_and_draft(&mut self) -> Result<(), Error> {
         let s_count = self.active.len();
         let (rows, spans, sampling) = verify_rows(&self.active, self.core.max_ctx, |s| s);
+        self.ensure_pages(&rows)?;
         let (mut out, raw_taps) = self.core.target.step_verify_local(&rows, sampling)?;
         let dual_info = self.dual.as_ref().map(|p| (p.d_width, p.block));
         let ranked = self.core.target.control.is_some();
@@ -811,6 +857,11 @@ impl BatchMtp<'_> {
                     tap_row_off: j.tap_row_off,
                 })
                 .collect();
+            if chain_n >= 2 && self.drafter.lanes().is_some() {
+                for j in &jobs {
+                    self.ensure_slot_pages(j.slot, j.new_start + chain_n - 1)?;
+                }
+            }
             let drafts_all = draft_mtp_batch(
                 self.core.target,
                 self.drafter,

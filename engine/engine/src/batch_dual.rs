@@ -5,6 +5,7 @@ use crate::batch_spec::{
     drive_step, notify_kept, prefill_len, queue_request, retire_finished, retire_from, verify_rows,
 };
 use crate::dual::{DualSelector, DualState, DualStep, split_taps};
+use crate::kept::Kept;
 use crate::mtp_draft::{MtpDrafter, flush_mtp, take_cols};
 use crate::schedule::Sink;
 use crate::spec_len::{CostModel, SpecLen};
@@ -47,6 +48,32 @@ pub(crate) fn push_tail(buf: &mut Vec<f32>, src: &[f32], width: usize) {
 }
 
 impl<'a> BatchMtp<'a> {
+    pub(crate) fn ensure_pages(&mut self, rows: &[Row]) -> Result<(), Error> {
+        let (Some(kept), Some(t_lanes)) = (&mut self.core.kept, &mut self.core.target.lanes) else {
+            return Ok(());
+        };
+        let mut d_lanes = self.drafter.lanes_mut();
+        kept.grow_rows_with(rows, |slot, pages| {
+            t_lanes.set(slot, pages);
+            if let Some(dl) = d_lanes.as_deref_mut() {
+                dl.set(slot, pages);
+            }
+        })
+    }
+
+    pub(crate) fn ensure_slot_pages(&mut self, slot: u32, need: usize) -> Result<(), Error> {
+        let (Some(kept), Some(t_lanes)) = (&mut self.core.kept, &mut self.core.target.lanes) else {
+            return Ok(());
+        };
+        if let Some(pages) = kept.grow(slot, need)? {
+            t_lanes.set(slot, pages);
+            if let Some(dl) = self.drafter.lanes_mut() {
+                dl.set(slot, pages);
+            }
+        }
+        Ok(())
+    }
+
     /// Pairs a dual-tapped target with DFlash and MTP drafters.
     pub fn new_dual(
         target: &'a mut Engine,
@@ -73,7 +100,7 @@ impl<'a> BatchMtp<'a> {
             m_width,
             block,
         };
-        Ok(Self::init(target, drafter, Some(peer), depth, max_ctx))
+        Self::init(target, drafter, Some(peer), depth, max_ctx)
     }
 
     /// Flushes deferred MTP rows and switches to shared MTP.
@@ -82,6 +109,9 @@ impl<'a> BatchMtp<'a> {
             return Ok(());
         };
         let slot = self.active[0].slot;
+        if self.drafter.lanes().is_some() && !solo.m_tokens.is_empty() {
+            self.ensure_slot_pages(slot, solo.m_start as usize + solo.m_tokens.len())?;
+        }
         flush_mtp(
             self.drafter,
             slot,
@@ -113,6 +143,9 @@ impl<'a> BatchMtp<'a> {
         if let Some(peer) = &self.dual {
             let raw = std::mem::take(&mut p.d_buf);
             push_tail(&mut p.d_buf, &raw, peer.d_width);
+        }
+        if self.drafter.lanes().is_some() && !m_toks.is_empty() {
+            self.ensure_slot_pages(slot, skip + m_toks.len())?;
         }
         flush_mtp(
             self.drafter,
@@ -181,6 +214,7 @@ impl<'a> BatchMtp<'a> {
         let k = seq.drafts.len().min(seq.room(self.core.max_ctx));
         let mut rows = Vec::with_capacity(1 + k);
         seq.verify(&mut rows, k);
+        self.ensure_pages(&rows)?;
         let sampling = !self.active[0].sampler.greedy();
         let (mut out, taps) = self.core.target.step_verify_local(&rows, sampling)?;
         let (d_all, m_all) = self.split_dual_taps(taps, rows.len())?;
@@ -229,6 +263,10 @@ impl<'a> BatchMtp<'a> {
             self.active[idx].drafts.clear();
             return Ok(());
         }
+        if self.drafter.lanes().is_some() {
+            let (slot, need) = (self.active[idx].slot, self.active[idx].start + self.depth);
+            self.ensure_slot_pages(slot, need)?;
+        }
         let seq = &mut self.active[idx];
         let solo = seq.solo.as_mut().expect("solo");
         let peer = self.dual.as_mut().expect("dual peer");
@@ -251,7 +289,7 @@ impl<'a> BatchMtp<'a> {
 }
 
 /// Headroom rows reserved before admitting another paged request.
-const PAGE_HEADROOM: usize = 2048;
+pub(crate) const PAGE_HEADROOM: usize = 2048;
 
 struct DFlashPrefill {
     slot: u32,
@@ -609,5 +647,20 @@ impl<'a> RoundHost<'a> for BatchDFlash<'a> {
     }
     fn run_round(&mut self, admitted: Vec<Admitted>, follower: bool) -> Result<(), Error> {
         self.exec_round(admitted, follower)
+    }
+}
+
+/// Admits `tokens` into `kept`, shifting when `can_reuse` is set.
+pub(crate) fn admit_one(
+    kept: &mut Kept,
+    tokens: &[u32],
+    can_reuse: bool,
+    page: usize,
+) -> Option<(u32, usize)> {
+    if can_reuse {
+        let limit = tokens.len().saturating_sub(1);
+        kept.admit_shifted(tokens, limit, page)
+    } else {
+        kept.admit(tokens, 0)
     }
 }
