@@ -7,7 +7,7 @@ use crate::{Overrides, Stream, Weights, numbered, pins, pull};
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::Shards;
-use tessera_engine::qwen35::{Config, program};
+use tessera_engine::qwen35::{Config, program, stepper};
 use tessera_engine::{Graph, Pins, Weight};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -19,8 +19,22 @@ fn rules() -> Vec<Rule> {
     repo("qwen35").expect("the repository has Qwen3.5 rules")
 }
 
-fn step(_: &Arch, _: &Ask) -> Result<Built> {
-    Err(format!("{CLASS} has no step graph yet. tessera-eval --forward runs it").into())
+fn step(_: &Arch, ask: &Ask) -> Result<Built> {
+    if !ask.taps.is_empty() {
+        return Err("qwen35 does not support step taps yet".into());
+    }
+    let mut c = config(ask.dir, ask.sizes, ask.overrides)?;
+    c.stack.steps = ask.steps;
+    let graph = stepper(&c);
+    let (shards, rules) = (Shards::open(ask.dir)?, rules());
+    let pins = pins(&graph, &shards, c.stack.layers, &[&rules])?;
+    let text = Text {
+        graph: graph.clone(),
+        pins: pins.clone(),
+        shards,
+        rules,
+    };
+    Ok((graph, Weights::Streamed(Box::new(text)), pins))
 }
 
 fn forward(_: &Arch, ask: &Ask) -> Result<Built> {
@@ -37,7 +51,7 @@ fn part(_: &Arch, cut: &Cut) -> Result<Part> {
 
 arch!(
     "qwen35",
-    [Spot::Class(CLASS), Spot::Type("qwen3_5")],
+    [Spot::Class(CLASS), Spot::Type("qwen3_5"), Spot::Type("qwen3_5_text")],
     rules: include_str!("../names/qwen35.json"),
     step: step,
     forward: forward,
