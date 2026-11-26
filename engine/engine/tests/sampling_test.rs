@@ -379,3 +379,52 @@ fn prefill_report_fits_context() {
     assert!(r.label.starts_with("prefill rows="), "{}", r.label);
     assert!(r.total_ops > 0);
 }
+
+#[test]
+fn min_tokens_holds() {
+    for steps in [tessera_models::Steps::Plain, tessera_models::Steps::Masked] {
+        let mut cfg = tessera_models::decoder::Config::toy(1, 16);
+        cfg.stack.steps = steps;
+        let g = tessera_models::decoder::stepper::<
+            tessera_trace::Norm,
+            tessera_models::decoder::Swiglu,
+        >(&cfg);
+        let mut w = tessera_testkit::weights(&g, &mut tessera_testkit::Noise(19));
+        let last = w.len() - 1;
+        // Zero output head so greedy argmax picks stop token 0.
+        w[last] = tessera_interp::Tensor::f32(w[last].shape.clone(), vec![0.0; w[last].len()]);
+        let stored: Vec<tessera_lower::Weight> =
+            w.into_iter().map(tessera_lower::Weight::Floats).collect();
+        let settings = tessera_engine::Settings {
+            backend: tessera_engine::Pick::Host,
+            ..tessera_engine::Settings::default()
+        };
+        let mut engine =
+            tessera_engine::Engine::open(g, 16, &tessera_engine::Recipe::default(), &settings)
+                .unwrap();
+        engine.load(&stored).unwrap();
+
+        let mut run = |min_tokens| {
+            let mut ids = Vec::new();
+            let req = tessera_engine::Request {
+                tokens: vec![2, 3],
+                max_tokens: 4,
+                min_tokens,
+                stop: vec![0],
+                ..tessera_engine::Request::default()
+            };
+            engine
+                .generate(req, &mut |e| {
+                    if let tessera_engine::Event::Token(id) = e {
+                        ids.push(id);
+                    }
+                })
+                .unwrap();
+            ids
+        };
+        assert!(run(0).is_empty(), "steps={steps:?}");
+        let held = run(3);
+        assert_eq!(held.len(), 3, "steps={steps:?}");
+        assert!(held.iter().all(|&id| id != 0), "steps={steps:?}");
+    }
+}

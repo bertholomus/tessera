@@ -55,6 +55,7 @@ pub trait Chat: Send + Sync {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Params {
     pub max_tokens: usize,
+    pub min_tokens: usize,
     /// Strings that end the answer, excluded from its text.
     pub stop: Vec<String>,
     /// The answer's required shape. `None` allows any text.

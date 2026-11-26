@@ -59,6 +59,14 @@ fn speculative_engine_gate() {
             "presence_penalty",
         ),
         (
+            &batched,
+            Params {
+                min_tokens: 4,
+                ..Params::default()
+            },
+            "min_tokens",
+        ),
+        (
             &solo,
             Params {
                 sampling,

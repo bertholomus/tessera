@@ -211,6 +211,7 @@ pub(crate) struct JsonSchema {
 #[derive(Deserialize)]
 pub(crate) struct Common {
     pub(crate) max_tokens: Option<usize>,
+    pub(crate) min_tokens: Option<usize>,
     #[serde(default)]
     pub(crate) stream: bool,
     pub(crate) stream_options: Option<StreamOptions>,

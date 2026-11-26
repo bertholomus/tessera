@@ -136,8 +136,14 @@ fn start(
     let penalties = common.penalties()?;
     let thinking = common.thinking()?;
     let sequence = common.sequence()?;
+    let max_tokens = budget(model, prompt.len(), asked)?;
+    let min_tokens = common.min_tokens.unwrap_or(0);
+    if min_tokens > max_tokens {
+        return Err(bad("min_tokens must not exceed max_tokens", "min_tokens"));
+    }
     let params = Params {
-        max_tokens: budget(model, prompt.len(), asked)?,
+        max_tokens,
+        min_tokens,
         stop: common.stop.map(wire::Strings::list).unwrap_or_default(),
         format: common.response_format.and_then(ResponseFormat::format),
         raw: parsing.parser.is_some(),

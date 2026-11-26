@@ -192,7 +192,7 @@ pub(crate) fn take(
     id: u32,
     send: impl FnOnce() -> bool,
 ) -> Option<Reason> {
-    if request.stop.contains(&id) {
+    if *made >= request.min_tokens && request.stop.contains(&id) {
         return Some(Reason::Stop);
     }
     *made += 1;
