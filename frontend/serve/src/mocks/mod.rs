@@ -59,7 +59,13 @@ pub fn call(slot: &Slot, path: &str, body: Option<Value>) -> (u16, String) {
     let response = route(slot, &request);
     let text = match response.body {
         Body::Full { bytes, .. } => String::from_utf8(bytes).unwrap(),
-        Body::Events(events) => events.iter().map(|e| format!("data: {e}\n\n")).collect(),
+        Body::Events(events) => events
+            .iter()
+            .map(|e| match e.starts_with("event: ") {
+                true => format!("{e}\n\n"),
+                false => format!("data: {e}\n\n"),
+            })
+            .collect(),
     };
     (response.status, text)
 }

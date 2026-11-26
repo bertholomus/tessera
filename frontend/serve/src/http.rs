@@ -486,7 +486,13 @@ fn answer(
     )?;
     loop {
         match events.recv_timeout(limits.keep_alive) {
-            Ok(data) => chunk(stream, format!("data: {data}\n\n").as_bytes())?,
+            Ok(data) => {
+                let frame = match data.starts_with("event: ") {
+                    true => format!("{data}\n\n"),
+                    false => format!("data: {data}\n\n"),
+                };
+                chunk(stream, frame.as_bytes())?;
+            }
             Err(RecvTimeoutError::Timeout) => chunk(stream, b": keep-alive\n\n")?,
             Err(RecvTimeoutError::Disconnected) => return stream.write_all(b"0\r\n\r\n"),
         }
