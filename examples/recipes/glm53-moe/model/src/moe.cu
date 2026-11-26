@@ -869,7 +869,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_fc1_pf(const float* x
 // Prefill down projection across all ffn chunks per ob.
 template <u32 K, u32 BOOK, u32 NT>
 static __device__ __forceinline__ void fc2_pf_body(
-    const Plan* plan, const u32* act_slot, bytes dbytes, u16* z, Pf2Smem& sm,
+    const Plan* plan, const u32* act_slot, bytes dbytes, u16* z, Pf2OutSmem& sm,
     bool is_sh, u32 r0_sh, u32 rs, u32 m, u32 ob, u32 upto, u32 hidden, u32 picks, u32 n) {
   constexpr u32 TB = 32u * K;
   u32 tid = threadIdx.x, j = tid >> 5u, lane = tid & 31u;
@@ -883,34 +883,30 @@ static __device__ __forceinline__ void fc2_pf_body(
   float acc[NT][4];
 #pragma unroll
   for (u32 ti = 0u; ti < NT; ti++) acc[ti][0] = acc[ti][1] = acc[ti][2] = acc[ti][3] = 0.f;
-  uint4* bdst4 = reinterpret_cast<uint4*>(sm.btab);
+  uint4* bdst4 = reinterpret_cast<uint4*>(sm.k.btab);
   for (u32 c = 0u; c < upto; c++) {
     if (c > 0u) prim::block_sync();
     const uint4* bsrc4 = reinterpret_cast<const uint4*>(act_slot + (u64)c * 4096u);
     for (u32 i = tid; i < NT * (MX8_TILE >> 2u); i += 256u) bdst4[i] = bsrc4[i];
-    trellis::blk_store<K>(nw, tid, sm.wtiles);
+    trellis::blk_store<K>(nw, tid, sm.k.wtiles);
     prim::block_sync();
     if (c + 1u < upto) { gb += sG; trellis::blk_load<K>(gb, tid, aligned, nw); }
-    pf_blk_mma<K, BOOK, NT>(sm.wtiles, sm.btab, j, lane, wm, acc);
+    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles, sm.k.btab, j, lane, wm, acc);
   }
-  u32 col = (ob << 7u) + (j << 4u) + (lane >> 2u), rc = (lane & 3u) << 1u;
+  fc2_pf_stage_f16<NT>(acc, sm.out, j, lane, n);
+  u32 gcol = (ob << 7u) + (lane << 2u);
 #pragma unroll
   for (u32 ti = 0u; ti < NT; ti++) {
-    u32 r0 = (ti << 3u) + rc;
-    for (u32 dr = 0u; dr < 2u; dr++) {
-      if (r0 + dr < n) {
-        u32 tok = slot_tok_at(plan, is_sh, r0_sh, rs, r0 + dr);
-        u32 pk = is_sh ? picks : (u32)plan->slot_pick[rs][r0 + dr];
-        u16* dst = z + ((u64)tok * (picks + 1u) + pk) * hidden + col;
-        dst[0] = f32_to_f16(acc[ti][dr]); dst[8] = f32_to_f16(acc[ti][dr + 2u]);
-      }
-    }
+    u32 r = (ti << 3u) + j;
+    if (r >= n) continue;
+    u32 tok = slot_tok_at(plan, is_sh, r0_sh, rs, r), pk = is_sh ? picks : (u32)plan->slot_pick[rs][r];
+    *reinterpret_cast<uint2*>(z + ((u64)tok * (picks + 1u) + pk) * hidden + gcol) = *reinterpret_cast<const uint2*>(&sm.out[r][lane << 2u]);
   }
 }
 
 template <u32 K, u32 BOOK>
 static __device__ __noinline__ void fc2_pf_hot(
-    const Plan* plan, const u32* act_slot, bytes dbytes, u16* z, Pf2Smem& sm, bool is_sh,
+    const Plan* plan, const u32* act_slot, bytes dbytes, u16* z, Pf2OutSmem& sm, bool is_sh,
     u32 r0_sh, u32 rs, u32 m, u32 ob, u32 upto, u32 hidden, u32 picks, u32 n) {
   if (n <= 8u) fc2_pf_body<K, BOOK, 1u>(plan, act_slot, dbytes, z, sm, is_sh, r0_sh, rs, m, ob, upto, hidden, picks, n);
   else if (n <= 16u) fc2_pf_body<K, BOOK, 2u>(plan, act_slot, dbytes, z, sm, is_sh, r0_sh, rs, m, ob, upto, hidden, picks, n);
@@ -920,7 +916,7 @@ static __device__ __noinline__ void fc2_pf_hot(
 
 template <u32 K, u32 BOOK>
 static __device__ __noinline__ void fc2_pf_cold(
-    const Plan* plan, const u32* act_slot, bytes dbytes, u16* z, Pf2Smem& sm, bool is_sh,
+    const Plan* plan, const u32* act_slot, bytes dbytes, u16* z, Pf2OutSmem& sm, bool is_sh,
     u32 r0_sh, u32 rs, u32 m, u32 ob, u32 upto, u32 hidden, u32 picks, u32 n) {
   fc2_pf_body<K, BOOK, 8u>(plan, act_slot, dbytes, z, sm, is_sh, r0_sh, rs, m, ob, upto, hidden, picks, n);
 }
@@ -934,7 +930,7 @@ extern "C" __global__ __launch_bounds__(256, 3) void glm53_fc2_pf(
   u32 n_sh = (rows + 63u) >> 6u, slot = blockIdx.y, ob = blockIdx.x, chunks = ffn >> 7u;
   bool is_sh = slot < n_sh;
   if (!is_sh && slot - n_sh >= plan->n_slots) return;
-  __shared__ Pf2Smem sm;
+  __shared__ Pf2OutSmem sm;
   u32 r0_sh = slot * 64u, rs = is_sh ? 0u : (slot - n_sh), n, m, upto;
   bytes dbytes;
   if (is_sh) { n = min(rows - r0_sh, 64u); m = 0u; upto = shared_ffn >> 7u; dbytes = shared_down; k = shared_k; book = shared_book; }
