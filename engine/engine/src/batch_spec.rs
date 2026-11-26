@@ -1,6 +1,7 @@
 //! Generic continuous-batching MTP and dual speculative decoding.
 
 use crate::batch_dual::{DualPeer, PROMOTE_MIN_REM, SoloState, push_tail};
+use crate::kept::Kept;
 use crate::mtp_draft::{MtpDrafter, MtpSpan};
 use crate::sample::{Target, accept, take};
 use crate::schedule::Sink;
@@ -73,17 +74,15 @@ pub(crate) fn retire_from<T>(
     active: &mut Vec<T>,
     slots: &[u32],
     slot_of: impl Fn(&T) -> u32,
-    mut on_free: impl FnMut(u32),
+    mut on_free: impl FnMut(T),
 ) {
     if slots.is_empty() {
         return;
     }
     let mut i = 0;
     while i < active.len() {
-        let slot = slot_of(&active[i]);
-        if slots.contains(&slot) {
-            active.remove(i);
-            on_free(slot);
+        if slots.contains(&slot_of(&active[i])) {
+            on_free(active.remove(i));
         } else {
             i += 1;
         }
@@ -126,6 +125,10 @@ pub(crate) struct ActiveSeq {
     pub(crate) solo: Option<SoloState>,
     /// Rolling recent DFlash taps for tail promotion.
     pub(crate) d_tail: Vec<f32>,
+    /// Prompt plus emitted tokens for prefix reuse.
+    pub(crate) history: Vec<u32>,
+    /// Rows written into the MTP drafter KV cache.
+    pub(crate) mtp_valid: usize,
 }
 
 impl ActiveSeq {
@@ -214,6 +217,7 @@ pub(crate) struct DraftJob {
 /// Newly admitted session synchronized across ranks.
 pub(crate) struct Admitted {
     pub(crate) slot: u32,
+    pub(crate) skip: usize,
     pub(crate) request: Request,
     pub(crate) sink: Option<Sink>,
 }
@@ -221,9 +225,11 @@ pub(crate) struct Admitted {
 /// Admitted sequence advancing through chunked prompt prefill.
 pub(crate) struct PrefillSeq {
     pub(crate) slot: u32,
+    pub(crate) skip: usize,
     pub(crate) request: Request,
     pub(crate) sink: Option<Sink>,
     pub(crate) pos: usize,
+    pub(crate) mtp_valid: usize,
     pub(crate) solo_mode: bool,
     pub(crate) d_buf: Vec<f32>,
     pub(crate) m_tok_buf: Vec<u32>,
@@ -242,6 +248,7 @@ pub struct BatchMtp<'a> {
     pub(crate) prefilling: VecDeque<PrefillSeq>,
     pub(crate) active: Vec<ActiveSeq>,
     pub(crate) free: Vec<u32>,
+    pub(crate) kept: Option<Kept>,
     pub(crate) hash: u32,
 }
 
@@ -273,6 +280,7 @@ impl<'a> BatchMtp<'a> {
             prefilling: VecDeque::new(),
             active: Vec::new(),
             free,
+            kept: None,
             hash: 2166136261,
         })
     }
@@ -281,6 +289,15 @@ impl<'a> BatchMtp<'a> {
     pub fn with_prefill_chunk(mut self, rows: usize) -> Self {
         self.prefill_chunk = rows.max(1);
         self
+    }
+
+    /// Retains finished slots for prefix reuse.
+    pub fn reuse(&mut self) {
+        if self.target.stateful() {
+            return;
+        }
+        let slots = self.target.slots().min(self.drafter.slots());
+        self.kept = Some(Kept::new(slots, self.max_ctx));
     }
 
     /// Queues an answer. Unfit requests finish at once.
@@ -323,11 +340,27 @@ impl RoundHost for BatchMtp<'_> {
     }
     fn admit_local(&mut self) -> Vec<Admitted> {
         let mut out = Vec::new();
-        while !self.waiting.is_empty() && !self.free.is_empty() {
-            let slot = self.free.pop().expect("free slot");
+        while let Some((front, _)) = self.waiting.front() {
+            let (slot, skip) = match &mut self.kept {
+                Some(kept) => {
+                    let limit = front.tokens.len().saturating_sub(1);
+                    let Some((slot, hit)) = kept.admit(&front.tokens, limit) else {
+                        break;
+                    };
+                    // MTP shifts by one token, so drop one row.
+                    (slot, hit.saturating_sub(1))
+                }
+                None => {
+                    let Some(slot) = self.free.pop() else {
+                        break;
+                    };
+                    (slot, 0)
+                }
+            };
             let (request, sink) = self.waiting.pop_front().expect("waiting request");
             out.push(Admitted {
                 slot,
+                skip,
                 request,
                 sink: Some(sink),
             });
@@ -335,7 +368,11 @@ impl RoundHost for BatchMtp<'_> {
         out
     }
     fn retire_slots(&mut self, slots: &[u32]) {
-        retire_from(&mut self.active, slots, |s| s.slot, |s| self.free.push(s));
+        let mut gone = Vec::new();
+        retire_from(&mut self.active, slots, |s| s.slot, |s| gone.push(s));
+        for s in gone {
+            self.retire_slot(s.slot, s.history, s.mtp_valid);
+        }
     }
     fn run_round(&mut self, admitted: Vec<Admitted>, _follower: bool) -> Result<(), Error> {
         self.exec_round(admitted)
@@ -343,6 +380,16 @@ impl RoundHost for BatchMtp<'_> {
 }
 
 impl BatchMtp<'_> {
+    pub(crate) fn retire_slot(&mut self, slot: u32, mut history: Vec<u32>, mtp_valid: usize) {
+        match &mut self.kept {
+            Some(kept) => {
+                history.truncate(mtp_valid.min(self.max_ctx));
+                kept.finish(slot, history);
+            }
+            None => self.free.push(slot),
+        }
+    }
+
     fn exec_round(&mut self, admitted: Vec<Admitted>) -> Result<(), Error> {
         if !admitted.is_empty() {
             if self.active.len() == 1 && self.active[0].solo.is_some() {
@@ -355,12 +402,19 @@ impl BatchMtp<'_> {
                 && self.active.is_empty()
                 && self.prefilling.is_empty()
                 && admitted.len() == 1;
-            for item in admitted {
+            for mut item in admitted {
+                if item.skip > 0
+                    && let Some(cb) = &mut item.sink
+                {
+                    let _ = cb(Event::Kept(item.skip));
+                }
                 self.prefilling.push_back(PrefillSeq {
                     slot: item.slot,
+                    skip: item.skip,
                     request: item.request,
                     sink: item.sink,
-                    pos: 0,
+                    pos: item.skip,
+                    mtp_valid: item.skip,
                     solo_mode: solo_admit,
                     d_buf: Vec::new(),
                     m_tok_buf: Vec::new(),
@@ -407,10 +461,12 @@ impl BatchMtp<'_> {
                         push_tail(&mut seq.d_buf, &dt, d_w);
                     }
                     self.run_mtp_prefill_chunk(seq.slot, pos0 as u32, shifted, &taps, d_w, m_w)?;
+                    seq.mtp_valid = pos0 + len;
                 }
             } else {
                 self.drafter
                     .run_taps(seq.slot, pos0 as u32, shifted, taps.as_in(), wants, true)?;
+                seq.mtp_valid = pos0 + len;
             }
             seq.pos = pos0 + len;
             self.prefilling.push_front(seq);
@@ -418,6 +474,9 @@ impl BatchMtp<'_> {
         }
         let anchor = *ids.last().expect("non-empty chunk");
         fnv_u32(&mut self.hash, anchor);
+        let mut history = Vec::with_capacity(n + 1);
+        history.extend_from_slice(&seq.request.tokens);
+        history.push(anchor);
         let mut shifted = Vec::with_capacity(len);
         shifted.extend_from_slice(&seq.request.tokens[pos0 + 1..]);
         shifted.push(anchor);
@@ -432,10 +491,12 @@ impl BatchMtp<'_> {
             cancelled: false,
             solo: None,
             d_tail: Vec::new(),
+            history,
+            mtp_valid: seq.mtp_valid,
         };
         let done = act.commit(&[anchor], self.max_ctx);
         if done.is_some() || (self.target.control.is_none() && act.cancelled) {
-            self.free.push(act.slot);
+            self.retire_slot(act.slot, act.history, act.mtp_valid);
             return Ok(());
         }
         if seq.solo_mode {
@@ -446,10 +507,10 @@ impl BatchMtp<'_> {
             let selector = self.dual.as_ref().expect("dual peer").selector.fresh();
             act.solo = Some(SoloState {
                 selector,
-                d_base: 0,
+                d_base: seq.skip,
                 d_ctx_pos: 0,
                 d_pending: seq.d_buf,
-                m_start: 0,
+                m_start: seq.skip as u32,
                 m_tokens: seq.m_tok_buf,
                 m_taps: seq.m_tap_buf,
                 round_mtp: false,
@@ -479,9 +540,12 @@ impl BatchMtp<'_> {
                 tap_row_off: 0,
                 avail,
             };
-            self.draft_batch(&[job], &taps, dual_widths.is_some())?
+            let got = self
+                .draft_batch(&[job], &taps, dual_widths.is_some())?
                 .pop()
-                .unwrap_or_default()
+                .unwrap_or_default();
+            act.mtp_valid = n;
+            got
         } else {
             Vec::new()
         };
@@ -513,6 +577,7 @@ impl BatchMtp<'_> {
                 &mut self.hash,
             );
             let seq = &mut self.active[i];
+            seq.history.extend_from_slice(&committed);
             if done.is_some() || (!ranked && seq.cancelled) {
                 finished[i] = true;
                 continue;
@@ -560,7 +625,9 @@ impl BatchMtp<'_> {
             }
             let drafts_all = self.draft_batch(&jobs, &raw_taps, dual_info.is_some())?;
             for (job, drafts) in jobs.into_iter().zip(drafts_all) {
-                self.active[job.active_idx].drafts = drafts;
+                let seq = &mut self.active[job.active_idx];
+                seq.drafts = drafts;
+                seq.mtp_valid = job.new_start;
             }
         }
         let mut idx = 0usize;
@@ -568,7 +635,7 @@ impl BatchMtp<'_> {
         while idx < self.active.len() {
             if finished[orig] {
                 let seq = self.active.remove(idx);
-                self.free.push(seq.slot);
+                self.retire_slot(seq.slot, seq.history, seq.mtp_valid);
             } else {
                 idx += 1;
             }
@@ -796,6 +863,7 @@ pub(crate) fn encode_round(hash: u32, cancelled: &[u32], admitted: &[Admitted]) 
         .u32(admitted.len() as u32);
     for a in admitted {
         w.u32(a.slot)
+            .u32(a.skip as u32)
             .u32(a.request.max_tokens as u32)
             .u32s(&a.request.tokens)
             .u32s(&a.request.stop);
@@ -814,11 +882,13 @@ pub(crate) fn decode_round(bytes: &[u8]) -> Option<(u32, Vec<u32>, Vec<Admitted>
     let mut admitted = Vec::with_capacity(n);
     for _ in 0..n {
         let slot = r.u32()?;
+        let skip = r.u32()? as usize;
         let max_tokens = r.u32()? as usize;
         let tokens = r.u32s()?;
         let stop = r.u32s()?;
         admitted.push(Admitted {
             slot,
+            skip,
             request: Request {
                 tokens,
                 max_tokens,

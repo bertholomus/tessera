@@ -499,6 +499,7 @@ fn chunked_prefill_interleaves() {
     let mut batch = BatchMtp::new(&mut target, &mut drafter, 2)
         .unwrap()
         .with_prefill_chunk(3);
+    batch.reuse();
     let (tx0, rx0) = std::sync::mpsc::channel();
     batch.submit(
         Request {
@@ -532,6 +533,32 @@ fn chunked_prefill_interleaves() {
     let all1: Vec<_> = rx1.try_iter().collect();
     assert_eq!(collect_ids(&all0), collect_ids(&want_short));
     assert_eq!(collect_ids(&all1), collect_ids(&want_long));
+
+    // Follow-up prompts reuse full and partial prefixes identically to baseline.
+    for (prompt, min_kept) in [
+        (vec![1u32, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13], 8usize),
+        (vec![1u32, 3, 4, 6, 14, 15], 3usize),
+    ] {
+        let mut want = Vec::new();
+        let req = |tokens: Vec<u32>| Request {
+            tokens,
+            max_tokens: 5,
+            ..Request::default()
+        };
+        baseline
+            .generate(req(prompt.clone()), &mut |e| want.push(e))
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        batch.submit(req(prompt), Box::new(move |e| tx.send(e).is_ok()));
+        while batch.step().unwrap() {}
+        let got: Vec<_> = rx.try_iter().collect();
+        let kept = got.iter().find_map(|e| match *e {
+            Event::Kept(k) => Some(k),
+            _ => None,
+        });
+        assert!(kept.is_some_and(|k| k >= min_kept), "got={got:?}");
+        assert_eq!(collect_ids(&got), collect_ids(&want));
+    }
 }
 
 /// A guide for a prompt, or none.
