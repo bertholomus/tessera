@@ -1,6 +1,6 @@
 //! Generation through the engine thread's queue.
 
-use crate::api::{Chat, Finish, Generator, Params, Refused, Score, Sink, Step, Tokens};
+use crate::api::{Chat, Finish, Generator, Params, Refused, Score, Sink, Step, Tokens, ToolChoice};
 use crate::guided::Guides;
 use crate::scopes;
 use crate::{Error, Spool, Stops};
@@ -122,6 +122,7 @@ impl Generator for Queued {
                     .map(|_| "response_format")
                     .or(key)
                     .or((params.min_tokens > 0).then_some("min_tokens"))
+                    .or((params.tool_choice != ToolChoice::Auto).then_some("tool_choice"))
                 {
                     Some(field) => {
                         let why = format!("{mode} does not support formats or penalties");
@@ -151,6 +152,13 @@ impl Generator for Queued {
                 &params,
                 &prompt,
             )?);
+        }
+        if let Some(guide) = scopes::tool_guide(
+            self.generate.response.as_ref(),
+            &self.generate.tokenizer,
+            &params,
+        )? {
+            guides.push(guide);
         }
         let request = Request {
             tokens: prompt,

@@ -72,6 +72,17 @@ pub struct Params {
     pub sequence: Sequence,
     /// Whether the prompt leaves a think block open.
     pub starts_thinking: bool,
+    /// Tool-calling requirement for this answer.
+    pub tool_choice: ToolChoice,
+}
+
+/// Tool-calling policy for one chat answer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ToolChoice {
+    #[default]
+    Auto,
+    Required,
+    Function(String),
 }
 
 /// A required shape for an answer.

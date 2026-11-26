@@ -1,6 +1,6 @@
 //! Built-in `response_template`s, and the block markers of any.
 
-use super::{BlockSpec, ResponseParser};
+use super::{BlockSpec, Body, Opener, ResponseParser};
 use crate::template::Template;
 use std::error::Error;
 
@@ -74,6 +74,32 @@ impl ResponseParser {
             think_close: close(&self.thinking),
             call_open: open(&self.tool_calls),
             call_close: close(&self.tool_calls),
+        }
+    }
+
+    /// Prefix text that opens a tool call, optionally naming `name`.
+    pub fn call_prefix(&self, name: Option<&str>) -> Option<String> {
+        let block = self.tool_calls.as_ref()?;
+        let outer = block.outer.as_ref().map_or("", |[o, _]| o.as_str());
+        let Some(name) = name else {
+            let trigger = block.open.triggers().into_iter().next()?;
+            return Some(format!("{outer}{trigger}"));
+        };
+        if let Some(tmpl) = &block.call_prefix {
+            return Some(format!("{outer}{}", tmpl.replace("{name}", name)));
+        }
+        match &block.open {
+            Opener::Pattern { prefix, .. } if !prefix.is_empty() => {
+                Some(format!("{outer}{prefix}{name}"))
+            }
+            Opener::Literal(opens) if matches!(block.body, Body::Json(_)) => {
+                let open = opens.first()?;
+                let quoted = serde_json::to_string(name).ok()?;
+                Some(format!(
+                    "{outer}{open}{{\"name\": {quoted}, \"arguments\": "
+                ))
+            }
+            _ => None,
         }
     }
 }

@@ -67,6 +67,8 @@ struct FieldSpec {
     transform: Option<Value>,
     /// Wraps a run of calls. Text between calls is dropped.
     outer: Option<[String; 2]>,
+    /// Template with `{name}` for forced calls.
+    call_prefix: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -205,6 +207,7 @@ struct BlockSpec {
     body: Body,
     transform: Option<Value>,
     outer: Option<[String; 2]>,
+    call_prefix: Option<String>,
 }
 
 /// Compiled `response_template` from `tokenizer_config.json`.
@@ -270,6 +273,7 @@ impl ResponseParser {
                 body: Body::compile(spec.content.as_deref(), spec.content_args)?,
                 transform: spec.transform,
                 outer: spec.outer.filter(|[o, c]| !o.is_empty() && !c.is_empty()),
+                call_prefix: spec.call_prefix.filter(|s| !s.is_empty()),
             };
             match name.as_str() {
                 "thinking" => thinking = Some(block),

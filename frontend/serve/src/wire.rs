@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tessera_bundle::{FunctionCall, Message, ToolCall};
 use tessera_engine::{Penalties, Sampling};
-use tessera_tasks::api::Format;
+use tessera_tasks::api::{Format, ToolChoice as TaskToolChoice};
 use tessera_tasks::scopes::{Boost, Sequence, Thinking};
 
 /// Why a request was refused, in OpenAI's error format.
@@ -529,16 +529,48 @@ impl Tool {
 pub(crate) struct ToolChoice(Value);
 
 impl ToolChoice {
-    /// Returns whether tools stay enabled for this request.
-    pub(crate) fn allow(&self) -> Result<bool, Refusal> {
-        match self.0.as_str() {
-            Some("auto") => Ok(true),
-            Some("none") => Ok(false),
-            _ => Err(bad(
-                "`tool_choice` must be \"auto\" or \"none\"",
-                "tool_choice",
-            )),
+    /// Resolves whether tools stay enabled and any forced choice.
+    pub(crate) fn resolve(&self, tools: &[Tool]) -> Result<(bool, TaskToolChoice), Refusal> {
+        if let Some(mode) = self.0.as_str() {
+            return match mode {
+                "auto" => Ok((true, TaskToolChoice::Auto)),
+                "none" => Ok((false, TaskToolChoice::Auto)),
+                "required" if tools.is_empty() => Err(bad(
+                    "`tool_choice` \"required\" needs at least one tool",
+                    "tool_choice",
+                )),
+                "required" => Ok((true, TaskToolChoice::Required)),
+                _ => Err(bad(
+                    "`tool_choice` must be \"auto\", \"none\", \"required\", or a function object",
+                    "tool_choice",
+                )),
+            };
         }
+        let Some(obj) = self.0.as_object() else {
+            return Err(bad(
+                "`tool_choice` must be a string or function object",
+                "tool_choice",
+            ));
+        };
+        let kind = obj.get("type").and_then(Value::as_str);
+        let func = obj.get("function").and_then(Value::as_object);
+        let name = func.and_then(|f| f.get("name")).and_then(Value::as_str);
+        let extra = obj.keys().any(|k| k != "type" && k != "function")
+            || func.is_some_and(|f| f.keys().any(|k| k != "name"));
+        if kind != Some("function") || name.is_none_or(|n| n.trim().is_empty()) || extra {
+            return Err(bad(
+                "`tool_choice` object must be `{\"type\": \"function\", \"function\": {\"name\": ...}}`",
+                "tool_choice",
+            ));
+        }
+        let name = name.unwrap();
+        if !tools.iter().any(|t| t.function.name == name) {
+            return Err(bad(
+                format!("tool `{name}` is not in `tools`"),
+                "tool_choice",
+            ));
+        }
+        Ok((true, TaskToolChoice::Function(name.to_string())))
     }
 }
 

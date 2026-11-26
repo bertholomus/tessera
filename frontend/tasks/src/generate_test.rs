@@ -1,5 +1,5 @@
 use crate::Error;
-use crate::api::{Format, Generator, Params, Refused};
+use crate::api::{Format, Generator, Params, Refused, ToolChoice};
 use crate::generate::{Generate, Queued, Steer};
 use crate::guided::Guides;
 use std::sync::{Arc, Mutex, mpsc};
@@ -65,6 +65,14 @@ fn speculative_engine_gate() {
                 ..Params::default()
             },
             "min_tokens",
+        ),
+        (
+            &batched,
+            Params {
+                tool_choice: ToolChoice::Required,
+                ..Params::default()
+            },
+            "tool_choice",
         ),
         (
             &solo,
