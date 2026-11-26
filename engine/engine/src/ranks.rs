@@ -156,6 +156,14 @@ impl Engine {
         Ok(engine)
     }
 
+    /// Waits for every rank to finish loading.
+    pub fn ready(&mut self) -> Result<(), Error> {
+        if let Some(control) = self.control.as_mut() {
+            control.exchange(&[1]).map_err(tessera_run::Error::from)?;
+        }
+        Ok(())
+    }
+
     /// Runs rank 0's launches until it dismisses the ranks.
     pub fn follow(&mut self) -> Result<(), Error> {
         loop {

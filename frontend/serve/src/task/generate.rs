@@ -246,6 +246,7 @@ impl Source<'_> {
         let take = |at, w: &_| engine.load_weight(at, w);
         let loading = (self.weights).each_counted(progress, count, shares, take);
         loading.map_err(|e| e.to_string())?;
+        engine.ready().map_err(|e| e.to_string())?;
         Ok(engine)
     }
 

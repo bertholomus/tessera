@@ -248,3 +248,35 @@ fn split_batch_overlaps_glm53() {
         comm_steps.len()
     );
 }
+
+#[test]
+fn ready_waits_for_ranks() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let recipe = Recipe::default();
+    let graph = || stepper::<Norm, Swiglu>(&Config::toy(2, 16));
+    let [[sums, others], [control, told]] = loopback_links();
+    let done = Arc::new(AtomicBool::new(false));
+    let theirs = Arc::clone(&done);
+    let r = recipe.clone();
+    let follower = std::thread::spawn(move || {
+        let mut eng = opened(graph, Some([others, told]), &r, 16, false);
+        std::thread::sleep(Duration::from_millis(80));
+        theirs.store(true, Ordering::Release);
+        eng.ready().unwrap();
+        eng.follow().unwrap();
+    });
+    let mut lead = opened(graph, Some([sums, control]), &recipe, 16, false);
+    lead.ready().unwrap();
+    assert!(done.load(Ordering::Acquire));
+    lead.dismiss().unwrap();
+    follower.join().unwrap();
+
+    // Follower drop fails the ready barrier instead of hanging.
+    let [[s2, _], [c2, t2]] = loopback_links();
+    drop(t2);
+    let mut lead = opened(graph, Some([s2, c2]), &recipe, 16, false);
+    assert!(lead.ready().is_err());
+}

@@ -79,6 +79,7 @@ pub(super) fn open_target(
     (target.weights)
         .each_counted(&o.progress, count, shares, |at, w| engine.load_weight(at, w))
         .map_err(|e| e.to_string())?;
+    engine.ready().map_err(|e| e.to_string())?;
     Ok((engine, target))
 }
 
