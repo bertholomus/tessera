@@ -32,6 +32,12 @@ or "too small to be worth it". The project lives on improvements as small as 0.5
 and human must always judge whether to drop an experiment that has a likelihood
 of success.
 
+No arbitrary limits. A size limit must come from a real constraint: an index
+width, a hardware limit, or a fixed device structure. Do not use "maximum size
+tested" as a limit. Compute a limit that depends on the machine or the model
+from the plan and the device. Crashing beyond a memory limit is not a reason
+to add a hardcoded limit - fix the memory allocation strategy instead.
+
 ## Pull Requests
 
 Pull request titles must follow Conventional Commits (`feat:`, `fix:`, `perf:`,
