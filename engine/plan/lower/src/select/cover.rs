@@ -180,10 +180,10 @@ impl Cover<'_> {
         // The winning cover gets a grid check. Tall ones retry.
         let mut skip = Vec::new();
         let (best, offered, runnable, proposed) = loop {
-            let (mut best, mut offered): (Option<Choice>, _) = (None, Vec::new());
-            let mut runnable = Vec::new();
+            let (mut best, mut fallback): (Option<Choice>, Option<Choice>) = (None, None);
+            let (mut offered, mut runnable) = (Vec::new(), Vec::new());
             let mut proposed = false;
-            let mut won: Option<usize> = None;
+            let (mut won, mut fall_won): (Option<usize>, Option<usize>) = (None, None);
             let mut seen = 0;
             // Default scatter cover for kept appends, competing with fused rules.
             if let Some(index) = append {
@@ -241,10 +241,11 @@ impl Cover<'_> {
                     if drafts.iter().any(|d| !d.kernel.needs().fits(platform)) {
                         continue;
                     }
-                    if self.swallows(rule, t, &drafts, kind) {
-                        continue;
+                    let swallowed = self.swallows(rule, t, &drafts, kind);
+                    if !swallowed {
+                        runnable
+                            .push((rule.name, drafts.iter().map(|d| d.kernel.name()).collect()));
                     }
-                    runnable.push((rule.name, drafts.iter().map(|d| d.kernel.name()).collect()));
                     let Some(mut cost) = drafts.iter().map(|d| self.seconds(zone, d)).sum() else {
                         continue;
                     };
@@ -276,9 +277,14 @@ impl Cover<'_> {
                             (false, true) => false,
                             (false, false) => favored || cost < b.cost,
                         };
-                    if best.as_ref().is_none_or(beaten) {
-                        won = Some(seen);
-                        best = Some(Choice {
+                    let (slot, tag) = if swallowed {
+                        (&mut fallback, &mut fall_won)
+                    } else {
+                        (&mut best, &mut won)
+                    };
+                    if slot.as_ref().is_none_or(beaten) {
+                        *tag = Some(seen);
+                        *slot = Some(Choice {
                             rule: rule.name,
                             drafts,
                             cost,
@@ -288,10 +294,14 @@ impl Cover<'_> {
                     }
                 }
             }
+            let (picked, picked_won) = match best {
+                Some(b) => (Some(b), won),
+                None => (fallback, fall_won),
+            };
             let tall = |c: &Choice| c.drafts.iter().any(|d| grid_mismatch(d, kind).is_some());
-            match won {
-                Some(at) if best.as_ref().is_some_and(tall) => skip.push(at),
-                _ => break (best, offered, runnable, proposed),
+            match picked_won {
+                Some(at) if picked.as_ref().is_some_and(tall) => skip.push(at),
+                _ => break (picked, offered, runnable, proposed),
             }
         };
         if !proposed && !self.bare.contains(&t) {
