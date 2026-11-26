@@ -3,6 +3,7 @@
 use super::{Entry, Flag, Load, Pick};
 use crate::ranks::Links;
 use crate::start::Options;
+use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 use tessera_bundle::Weights;
@@ -21,6 +22,12 @@ pub static ENTRY: Entry = Entry {
         Flag::switch("--guided"),
         Flag::switch("--reuse-prefix"),
         Flag::text("--manifest", "<name>"),
+        Flag::text("--kv-cache-dir", "<dir>"),
+        Flag {
+            name: "--kv-cache-disk-gb",
+            value: "<gb>",
+            check: |v| v.parse::<u64>().is_ok_and(|n| n > 0),
+        },
     ],
     open,
 };
@@ -254,6 +261,10 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     reading.finish();
     let scores = loaded.graph.entries.len() > 1;
     let mut recipe = lowering(o, loaded.pins);
+    let kv_dir = load.given("--kv-cache-dir");
+    if kv_dir.is_some() && recipe.kept.page().is_none() {
+        recipe.kept = Engine::paged_layout();
+    }
     if recipe.config.is_none() {
         recipe.config = loaded.config;
     }
@@ -268,6 +279,18 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     let seat = load.seat();
     let mut engine = source.enter(&seat, links, &o.progress)?;
     check_lowering(o, &mut engine, (o.slots > 1).then(|| o.slots.min(4)));
+    let attach_kv = |eng: &mut Engine| -> Result<(), String> {
+        let Some(dir) = kv_dir else {
+            return Ok(());
+        };
+        let gb = load
+            .given("--kv-cache-disk-gb")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(64);
+        eng.set_kv_store(Path::new(dir), gb.saturating_mul(1 << 30))
+            .map_err(|e| format!("kv store: {e}"))
+    };
+    attach_kv(&mut engine)?;
     if o.ranks.follows() {
         return engine.follow().map_err(|e| e.to_string());
     }
@@ -286,12 +309,13 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         if let Some(rows) = o.max_batch_rows {
             batch.budget(rows);
         }
-        if load.on("--reuse-prefix") {
+        if load.on("--reuse-prefix") || kv_dir.is_some() {
             batch.reuse();
         }
         parked = serve(batch, &jobs, &seat)?;
         drop(engine);
         seat.left();
         engine = source.enter(&seat, None, &Progress::default())?;
+        attach_kv(&mut engine)?;
     }
 }
