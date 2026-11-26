@@ -2,7 +2,9 @@
 
 use crate::keys::{At, Keys};
 pub use crate::shared::Swiglu;
-use crate::shared::{Attend, Dense, Side, Stack, Steps, TapSink, with_head};
+use crate::shared::{
+    Attend, Dense, ExpertSet, PlainExperts, Side, Stack, Steps, TapSink, with_head,
+};
 use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::hf::*;
@@ -92,6 +94,25 @@ impl Mlp for Moe {
     }
 }
 
+/// Each row's `TopK` of `Experts` SwiGLU MLPs with separate matrices.
+#[derive(Weights)]
+pub struct SparseMoe {
+    #[shape(Hidden, Experts)]
+    pub router: Linear,
+    pub experts: PlainExperts,
+}
+
+impl Mlp for SparseMoe {
+    const KIND: Composite = Composite::Moe;
+
+    fn apply(&self, m: &Model, h: &Tensor) -> Tensor {
+        let probs = h.matmul(&self.router).softmax();
+        let ids = probs.top_k(TopK);
+        let gates = probs.take(&ids).unit_sum();
+        self.experts.apply(m, h, [&ids, &gates])
+    }
+}
+
 /// Multipliers on the stream. One is a no-op.
 #[derive(Clone, Copy, Debug)]
 pub struct Scales {
@@ -149,8 +170,24 @@ impl Config {
                 "the graph attends to every row in each layer",
             );
         }
+        let mlp_only: Vec<u64> = k.or(&["mlp_only_layers"], Vec::new());
+        if !mlp_only.is_empty() {
+            k.misfit("mlp_only_layers", "every layer must be routed");
+        }
+        let sparse_step: u64 = k.or(&["decoder_sparse_step"], 1);
+        if sparse_step != 1 {
+            k.misfit("decoder_sparse_step", "every layer must be routed");
+        }
+        if let Some(false) = k.or::<Option<bool>>(&["norm_topk_prob"], None) {
+            k.misfit("norm_topk_prob", "sparse MoE requires normalized top-k");
+        }
         let [vocab, hidden, layers, heads, ffn] =
             [VOCAB, HIDDEN, LAYERS, HEADS, FFN].map(|key| k.read(&top, key));
+        let experts = k.or(&["num_local_experts", "num_experts"], 0);
+        let ffn = match experts > 0 {
+            true => k.or(&["moe_intermediate_size"], ffn),
+            false => ffn,
+        };
         let head_dim = k.read_or(&top, HEAD_DIM, hidden.checked_div(heads).unwrap_or(0));
         let sizes = [vocab, hidden, layers, heads, head_dim, ffn];
         Self {
@@ -158,7 +195,7 @@ impl Config {
             kv_heads: k.read(&top, KV_HEADS),
             rope_theta: rope_theta(k),
             eps: k.read(&top, EPS),
-            experts: k.or(&["num_local_experts"], 0),
+            experts,
             top_k: k.read_or(&top, TOP_K, 0),
             scales: Scales {
                 embed: k.or(&["embedding_multiplier"], 1.0),
@@ -205,10 +242,7 @@ impl Config {
             kv_heads: 5,
             rope_theta: 1e5,
             eps: 1e-5,
-            experts: 0,
-            top_k: 0,
-            scales: Scales::default(),
-            tied: true,
+            ..Self::qwen3(max_seqs, max_context)
         }
     }
 
@@ -260,6 +294,17 @@ impl Config {
         }
     }
 
+    /// Four experts, two per row, normalized top-k weights.
+    pub fn qwen3_moe_small() -> Self {
+        Self {
+            kv_heads: 2,
+            experts: 4,
+            top_k: 2,
+            tied: false,
+            ..Self::qwen3_small()
+        }
+    }
+
     pub fn smollm2_small() -> Self {
         Self {
             eps: 1e-5,
@@ -288,12 +333,7 @@ impl Config {
         Self {
             stack: Stack::sized([32, 16, 2, 4, 8, 32], max_seqs, max_context),
             kv_heads: 2,
-            rope_theta: 1e4,
-            eps: 1e-6,
-            experts: 0,
-            top_k: 0,
-            scales: Scales::default(),
-            tied: true,
+            ..Self::qwen3_small()
         }
     }
 

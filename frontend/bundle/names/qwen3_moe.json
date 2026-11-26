@@ -1,0 +1,6 @@
+{
+  "layers.*.mlp.router": "model.layers.*.mlp.gate",
+  "layers.*.mlp.experts.gate": "model.layers.*.mlp.experts.{}.gate_proj",
+  "layers.*.mlp.experts.up": "model.layers.*.mlp.experts.{}.up_proj",
+  "layers.*.mlp.experts.down": "model.layers.*.mlp.experts.{}.down_proj"
+}

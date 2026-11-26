@@ -5,7 +5,7 @@ use crate::parts::{Cut, Part};
 use crate::{Overrides, config, held, pull};
 use std::error::Error;
 use tessera_checkpoint::Shards;
-use tessera_engine::decoder::{Config, Moe, Swiglu, stepper_with, taps_with};
+use tessera_engine::decoder::{Config, Moe, SparseMoe, Swiglu, stepper_with, taps_with};
 use tessera_engine::{Graph, Norm, Vector};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -32,15 +32,15 @@ fn step(arch: &Arch, ask: &Ask) -> Result<Built> {
     c.stack.steps = ask.steps;
     c.stack.taps = ask.taps.to_vec();
     let graph = (family(arch.name)?.step)(&c);
-    held(ask, graph, c.stack.layers, &[])
+    held(ask, graph, c.stack.layers, &arch.rules())
 }
 
 /// A part's step graph, its weights from shards.
 fn part(arch: &Arch, cut: &Cut) -> Result<Part> {
     let (_, c) = config(&cut.dir, cut.sized(256), &Overrides::default())?;
-    let (dir, layers) = (cut.dir.clone(), c.stack.layers);
+    let (dir, layers, rules) = (cut.dir.clone(), c.stack.layers, arch.rules());
     Ok(Part::new((family(arch.name)?.step)(&c), move |g| {
-        pull(g, &Shards::open(&dir)?, layers, &[])
+        pull(g, &Shards::open(&dir)?, layers, &[&rules])
     }))
 }
 
@@ -60,6 +60,7 @@ macro_rules! decoders {
 decoders! {
     "qwen2": (), Swiglu, Vector;
     "qwen3": Norm, Swiglu, ();
+    "qwen3_moe": Norm, SparseMoe, (), rules: include_str!("../names/qwen3_moe.json");
     "llama": (), Swiglu, ();
     "granitemoe": (), Moe, ();
 }
