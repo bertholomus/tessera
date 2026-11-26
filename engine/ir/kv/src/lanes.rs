@@ -65,6 +65,15 @@ impl Lanes {
         }
     }
 
+    /// Maps slot zero linearly across the pool. Returns usable rows.
+    pub fn map_solo(&mut self) -> usize {
+        self.reset();
+        let count = self.pool.min(self.width);
+        let pages: Vec<u32> = (0..count as u32).collect();
+        self.set(0, &pages);
+        count * self.page
+    }
+
     /// Writes a slot's first pages.
     pub fn set(&mut self, slot: u32, pages: &[u32]) {
         let s = slot as usize;
