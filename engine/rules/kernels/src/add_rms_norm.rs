@@ -1,28 +1,14 @@
 //! Fused residual add and RMS norm, per warp or block.
 
-use crate::lane_norm::{BLOCK_THREADS, WARPS, row_needs, row_shape, use_block};
+use crate::lane_norm::{
+    BLOCK_THREADS, CACHE_SLOTS, CACHE_TRIPS, block_sum, block_sum_inline, cache_trips, row_needs,
+    row_shape, use_block,
+};
 use crate::{AHEAD, WIDE};
 use tessera_codegen::prelude::*;
 use tessera_graph::{Order, Stage};
 use tessera_lower::form::{F32_FORM, Load as Stored, plain, writable};
 use tessera_lower::{Draft, Kernel, Launch, Load, Source, Step, T, Term, ToArg, Tree, sites};
-
-/// Maximum wide trips held in registers across passes.
-const CACHE_TRIPS: u32 = 8;
-
-/// Per-thread register slots for cached pass-1 sums.
-const CACHE_SLOTS: usize = (CACHE_TRIPS * WIDE) as usize;
-
-/// Trip count cached in registers, or zero when too wide.
-fn cache_trips(width: usize, block: bool) -> u32 {
-    let stride = if block { BLOCK_THREADS as usize } else { LANES } * WIDE as usize;
-    let trips = width.div_ceil(stride);
-    if trips <= CACHE_TRIPS as usize {
-        trips as u32
-    } else {
-        0
-    }
-}
 
 /// Sums two or three rows, optionally saves sum, norms sum.
 #[kernel]
@@ -118,18 +104,7 @@ fn add_norm_lanes<const WIDE: u32, const AHEAD: u32>(
         }
     }
     acc = sum32(acc);
-    let mut tot = acc;
-    if block {
-        let mut red = shared::<f32>(WARPS);
-        if lane() == 0 {
-            red[lid() / LANES as u32] = acc;
-        }
-        barrier();
-        tot = 0.0;
-        for w_i in 0..WARPS {
-            tot += red[w_i];
-        }
-    }
+    let tot = if block { block_sum(acc) } else { acc };
     let inv = rsqrt(tot / width as f32 + eps);
     if use_cache {
         for t in (0..cached).unroll(CACHE_TRIPS) {
