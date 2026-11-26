@@ -132,7 +132,10 @@ fn collect_width(val: &serde_json::Value, seen: &mut Option<u32>) -> Result<(), 
         if let Some(prev) = *seen
             && prev != k
         {
-            return Err(format!("mixed widths {prev} and {k} in one tensor"));
+            return Err(format!(
+                "mixed widths {prev} and {k} in one tensor. \
+                 Pick a manifest with one width for each matrix"
+            ));
         }
         *seen = Some(k);
         return Ok(());
