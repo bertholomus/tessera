@@ -8,7 +8,7 @@ use crate::metal::pipeline_cache::Pipelines;
 use crate::platform::{Asked, Platform};
 use crate::{Error, Limits};
 use objc2::msg_send;
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
@@ -66,14 +66,16 @@ struct Pending {
 impl Pending {
     /// Commits and waits. Returns the GPU's own seconds.
     fn finish(self) -> f64 {
-        self.enc.endEncoding();
-        self.cmd.commit();
-        self.cmd.waitUntilCompleted();
-        // The GPU's own clock leaves out the scheduling wait.
-        let cmd = &*self.cmd;
-        let (start, end): (f64, f64) =
-            unsafe { (msg_send![cmd, GPUStartTime], msg_send![cmd, GPUEndTime]) };
-        end - start
+        autoreleasepool(|_| {
+            self.enc.endEncoding();
+            self.cmd.commit();
+            self.cmd.waitUntilCompleted();
+            // The GPU's own clock leaves out the scheduling wait.
+            let cmd = &*self.cmd;
+            let (start, end): (f64, f64) =
+                unsafe { (msg_send![cmd, GPUStartTime], msg_send![cmd, GPUEndTime]) };
+            end - start
+        })
     }
 }
 
@@ -213,10 +215,15 @@ impl Context {
             Some(_) => drop(pending.take().map(Pending::finish)),
             None => {}
         }
-        let cmd = self.0.queue.commandBuffer();
-        let cmd = cmd.ok_or(Error::Gpu("command buffer"))?;
-        let enc = cmd.computeCommandEncoder();
-        let enc = enc.ok_or(Error::Gpu("encoder"))?;
+        let (cmd, enc) = autoreleasepool(|_| {
+            let cmd = self
+                .0
+                .queue
+                .commandBuffer()
+                .ok_or(Error::Gpu("command buffer"))?;
+            let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("encoder"))?;
+            Ok::<_, Error>((cmd, enc))
+        })?;
         let owner = self.id();
         let made = pending.insert(Pending { owner, cmd, enc });
         Ok(made.enc.clone())
