@@ -1,8 +1,8 @@
 //! Multi-slot DFlash decoding and solo DFlash/MTP promotion.
 
 use crate::batch_spec::{
-    ActiveSeq, Admitted, BatchMtp, DEFAULT_CHUNK, DraftJob, RoundHost, drive_follow, drive_step,
-    queue_request, retire_from,
+    ActiveSeq, Admitted, BatchMtp, DEFAULT_CHUNK, DraftJob, RoundHost, batch_methods, drive_follow,
+    drive_step, keep_slots, queue_request, retire_from,
 };
 use crate::dual::{DualSelector, run_dflash, split_taps};
 use crate::kept::Kept;
@@ -518,49 +518,10 @@ impl<'a> BatchDFlash<'a> {
         })
     }
 
-    /// Retains finished slots for prefix reuse.
-    pub fn reuse(&mut self) {
-        if self.target.stateful() {
-            return;
-        }
-        self.reuse = true;
-        if self.kept.is_none() {
-            let slots = self.target.slots().min(self.drafter.slots());
-            self.kept = Some(Kept::new(slots, self.max_ctx));
-            self.free.clear();
-        }
-    }
-
-    /// Sets the maximum prompt rows per prefill step.
-    pub fn with_prefill_chunk(mut self, rows: usize) -> Self {
-        self.prefill_chunk = rows.max(1);
-        self
-    }
-
-    /// Runs one round of admit, prefill, verify, and draft.
-    pub fn step(&mut self) -> Result<bool, Error> {
-        drive_step(self)
-    }
-
-    /// Follower rank loop executing rank 0's batched rounds.
-    pub fn follow(&mut self) -> Result<(), Error> {
-        drive_follow(self)
-    }
-
     /// Configures adaptive or truncated draft length selection.
     pub fn with_spec_len(mut self, spec_len: SpecLen) -> Self {
         self.spec_len = spec_len;
         self
-    }
-
-    /// Queues an answer. Unfit requests finish at once.
-    pub fn submit(&mut self, request: Request, sink: Sink) {
-        queue_request(&mut self.waiting, self.max_ctx, request, sink);
-    }
-
-    /// Whether any answer is waiting, prefilling, or decoding.
-    pub fn busy(&self) -> bool {
-        !self.waiting.is_empty() || !self.prefilling.is_empty() || !self.active.is_empty()
     }
 
     fn admit_limit(&self, len: usize) -> usize {
@@ -796,6 +757,8 @@ impl<'a> BatchDFlash<'a> {
         Ok(())
     }
 }
+
+batch_methods!(BatchDFlash, reuse);
 
 impl RoundHost for BatchDFlash<'_> {
     fn target(&mut self) -> &mut Engine {
