@@ -180,14 +180,6 @@ impl Held {
         Ok(backing.download(start, dst)?)
     }
 
-    /// Writes `bytes` into `slot` starting `offset` bytes in.
-    pub fn upload_at(&mut self, slot: Slot, offset: usize, bytes: &[u8]) -> Result<(), Error> {
-        let at = self.bound[slot.buffer as usize];
-        Ok(self.all[at]
-            .backing_mut()
-            .upload(slot.start() + offset, bytes)?)
-    }
-
     /// Paged kept-slot metadata `(index, width, bytes, form)` for `plan`.
     pub fn kept_page_meta(
         plan: &Plan,
