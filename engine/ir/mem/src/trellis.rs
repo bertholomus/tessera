@@ -519,15 +519,16 @@ impl<const K: u32> Form for Trellis<K> {
             // Inputs of output entries: 8 tiles per 16 inputs.
             (false, false) => (shape.out / ENTRY, shape.inp / 2, first / 2, count / 2),
         };
-        let mut codes = Vec::with_capacity(matrices * entries * take * Self::TILE);
+        let mut out = Vec::with_capacity(HEAD + matrices * entries * take * Self::TILE);
+        out.extend_from_slice(&part.write());
         for m in 0..matrices {
             let base = HEAD + m * matrix;
             for g in 0..entries {
                 let from = base + (g * per + at) * Self::TILE;
-                codes.extend_from_slice(&bytes[from..from + take * Self::TILE]);
+                out.extend_from_slice(&bytes[from..from + take * Self::TILE]);
             }
         }
-        Some(packed(part.inp, part.out, part.side, &codes))
+        Some(out)
     }
 }
 
@@ -537,6 +538,13 @@ pub fn packed(inp: usize, out: usize, side: u32, entries: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(HEAD + entries.len());
     bytes.extend_from_slice(&shape.write());
     bytes.extend_from_slice(entries);
+    bytes
+}
+
+/// Allocates a trellis buffer with its header already written.
+pub fn alloc_packed(inp: usize, out: usize, side: u32, body: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; HEAD + body];
+    bytes[..HEAD].copy_from_slice(&Shape { inp, out, side }.write());
     bytes
 }
 

@@ -202,6 +202,37 @@ impl File {
         self.bytes_at(name, 0, None)
     }
 
+    /// Byte length of tensor `name`.
+    pub fn byte_len(&self, name: &str) -> Result<u64, Error> {
+        let e = self
+            .entries
+            .get(name)
+            .ok_or_else(|| Error::Missing(name.into()))?;
+        Ok(e.data_offsets[1] - e.data_offsets[0])
+    }
+
+    /// Reads `dst.len()` bytes of `name` from `from` into `dst`.
+    pub fn read_into(&self, name: &str, from: u64, dst: &mut [u8]) -> Result<(), Error> {
+        let e = self
+            .entries
+            .get(name)
+            .ok_or_else(|| Error::Missing(name.into()))?;
+        let [start, end] = e.data_offsets;
+        let at = start + from;
+        let to = at + dst.len() as u64;
+        if to > end {
+            return Err(format(format_args!("{name}: bytes {from}.. past its end")));
+        }
+        match &self.backing {
+            Backing::Disk(disk) => disk.read(self.data + at, dst, Reads::Cached)?,
+            Backing::Web(url) => {
+                let bytes = fetch(url, self.data + at, dst.len() as u64, true)?;
+                dst.copy_from_slice(&bytes);
+            }
+        }
+        Ok(())
+    }
+
     /// `len` bytes of a tensor from `from`, or the rest.
     pub fn bytes_at(&self, name: &str, from: u64, len: Option<u64>) -> Result<Vec<u8>, Error> {
         let e = self
