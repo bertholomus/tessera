@@ -38,6 +38,7 @@ fn grid_reaches_rules() {
         "trellis_metal",
         "fast_gemv",
         "fast_mm",
+        "fast_mm_mx8",
         "fast_stacked",
         "fast_mla_attend",
         "fast_gqa_attend",
