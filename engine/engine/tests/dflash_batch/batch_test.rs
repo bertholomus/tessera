@@ -214,3 +214,24 @@ fn dflash_sampling_seeded() {
     let got_tp = collect_ids(&rx.try_iter().collect::<Vec<_>>());
     assert_eq!(got_tp, a);
 }
+
+#[test]
+fn batch_dflash_rolls_window() {
+    let (t_graph, _) = toy_pair(48);
+    let (_, d_graph) = toy_pair(16);
+    let tw = weights(&t_graph, &mut Noise(109));
+    let dw = weights(&d_graph, &mut Noise(113));
+    let p1: Vec<u32> = (0..22).map(|i| (i % 7) + 1).collect();
+    let p2: Vec<u32> = (0..18).map(|i| ((i * 3) % 7) + 1).collect();
+    let prompts: &[(&[u32], usize)] = &[(&p1, 14), (&p2, 12)];
+    let settings = Settings {
+        backend: Pick::Host,
+        ..Settings::default()
+    };
+    let (_, d_full) = toy_pair(48);
+    let want = run_solo_refs(&t_graph, &d_full, &tw, &dw, 48, &settings, prompts);
+    let mut te = open_target(&t_graph, &tw, 48, &settings);
+    let mut dr = open_drafter(&d_graph, &dw, 16, 4, 0, &settings);
+    let got = run_batch_reqs(&mut te, &mut dr, prompts);
+    assert_eq!(got, want);
+}
