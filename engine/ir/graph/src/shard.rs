@@ -315,21 +315,22 @@ fn route(g: &Graph) -> Graph {
     if !changed {
         return out;
     }
-    let mut at = 0;
-    while at < out.nodes.len() {
-        let id = NodeId(at as u32);
-        at += 1;
-        if matches!(out.node(id).op, Op::Mix(_)) && out.node(id).ty.placement != Placement::Partial
-        {
-            let sum = Node {
-                op: Op::Row(Row(vec![Stage::AllReduce])),
-                args: vec![id],
-                ty: out.node(id).ty.clone(),
-                numerics: Some(Numerics::default()),
-            };
-            insert(&mut out, id, sum);
-            at += 1;
-        }
+    let mixes: Vec<NodeId> = (0..g.nodes.len())
+        .map(|i| NodeId(i as u32))
+        .filter(|&id| {
+            matches!(g.node(id).op, Op::Mix(_))
+                && g.node(id).ty.placement != Placement::Partial
+                && down_matmul(g, g.node(id).args[0]).is_some()
+        })
+        .collect();
+    for id in mixes.into_iter().rev() {
+        let sum = Node {
+            op: Op::Row(Row(vec![Stage::AllReduce])),
+            args: vec![id],
+            ty: out.node(id).ty.clone(),
+            numerics: Some(Numerics::default()),
+        };
+        insert(&mut out, id, sum);
     }
     out
 }

@@ -3,9 +3,11 @@
 use crate::encoder::Embeds;
 use crate::names::Rule;
 use crate::parts::{Cut, Part};
-use crate::{Overrides, Weights};
+use crate::{Overrides, Stream, Weights, numbered, pins};
 use std::error::Error;
 use std::path::Path;
+use tessera_checkpoint::Offer;
+use tessera_engine::Weight;
 use tessera_engine::hf::MODEL_TYPE;
 use tessera_engine::{Graph, Pins, PleConfig, Steps};
 
@@ -176,4 +178,108 @@ pub(crate) fn read(dir: &Path, overrides: &Overrides) -> Result<(String, &'stati
     let json = overrides.merged("config.json", &dir.join("config.json"))?;
     let arch = spot(&json)?;
     Ok((json, arch))
+}
+
+/// Streamed checkpoint release backed by an `Offer` and weight rules.
+pub(crate) struct Streamed {
+    pub graph: Graph,
+    offer: Box<dyn Offer>,
+    rules: Vec<Rule>,
+}
+
+impl Stream for Streamed {
+    fn stream(
+        &self,
+        shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
+        take: &mut dyn FnMut(u32, Weight) -> Result<()>,
+    ) -> Result<()> {
+        numbered(&self.graph, &*self.offer, &[&self.rules], shares, take)
+    }
+
+    fn i64s(&self, name: &str) -> Result<Vec<i64>> {
+        Ok(self.offer.i64s(name)?)
+    }
+}
+
+/// Parses `config.json` through `Keys` and checks reads.
+pub(crate) fn parse_keys<C>(
+    json: &str,
+    read: impl FnOnce(&mut tessera_engine::keys::Keys) -> C,
+) -> Result<C> {
+    let offered = [tessera_engine::keys::Offered::parse("config.json", json)?];
+    let mut keys = tessera_engine::keys::Keys::new(&offered);
+    let cfg = read(&mut keys);
+    keys.finish()?;
+    Ok(cfg)
+}
+
+/// Opens a streamed release with optional rotated-expert dispatch.
+pub(crate) fn open_streamed<C>(
+    ask: &Ask,
+    is_step: bool,
+    mut cfg: C,
+    stack: impl FnOnce(&mut C) -> &mut tessera_engine::Stack,
+    make_rules: impl FnOnce(&C, bool) -> Vec<Rule>,
+    traces: [fn(&C) -> Graph; 4],
+) -> Result<Built> {
+    let offer = crate::offer(ask.dir, ask.manifest)?;
+    let rotated = crate::mla::has_rotated_experts(&offer.slices());
+    let mut rules = make_rules(&cfg, rotated);
+    let st = stack(&mut cfg);
+    let layers = st.layers;
+    if is_step {
+        st.steps = ask.steps;
+        st.taps = ask.taps.to_vec();
+        rules.extend(ask.user.iter().cloned());
+    }
+    let pick = usize::from(rotated) * 2 + usize::from(is_step);
+    let graph = traces[pick](&cfg);
+    let pins = pins(&graph, &*offer, layers, &[&rules])?;
+    let r = Streamed {
+        graph: graph.clone(),
+        offer,
+        rules,
+    };
+    Ok((graph, Weights::Streamed(Box::new(r)), pins))
+}
+
+/// Shared and routed SwiGLU expert rules for one layer.
+pub(crate) fn push_routed_mlp(
+    rules: &mut Vec<(String, String)>,
+    shared: (&str, &str),
+    routed: (&str, &str, &str),
+    rotated: bool,
+) {
+    let (shared_dst, shared_src) = shared;
+    let (routed_dst, routed_pfx, experts_src) = routed;
+    if rotated {
+        for side in ["signs_in", "signs_out"] {
+            rules.push((
+                format!("{routed_dst}.{side}"),
+                format!("{experts_src}.{side}"),
+            ));
+        }
+    }
+    for (f, s) in [
+        ("gate", "gate_proj"),
+        ("up", "up_proj"),
+        ("down", "down_proj"),
+    ] {
+        rules.push((format!("{shared_dst}.{f}"), format!("{shared_src}.{s}")));
+        if rotated {
+            let set = format!("{experts_src}.{f}");
+            for end in ["su", "sv"] {
+                rules.push((
+                    format!("{routed_dst}.{routed_pfx}{f}_{end}"),
+                    format!("{set}.{end}"),
+                ));
+            }
+            rules.push((format!("{routed_dst}.{routed_pfx}{f}"), set));
+        } else {
+            rules.push((
+                format!("{routed_dst}.{routed_pfx}{f}"),
+                format!("{experts_src}.{{}}.{s}"),
+            ));
+        }
+    }
 }

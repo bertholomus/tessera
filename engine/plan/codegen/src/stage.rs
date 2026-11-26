@@ -8,6 +8,9 @@ pub enum Row {
     /// Multiplies by the operand row.
     Mul,
     Scale,
+    Shift,
+    Min,
+    Max,
     GeluTanh,
     Silu,
     Sigmoid,
@@ -19,10 +22,13 @@ pub enum Row {
 }
 
 impl Row {
-    const ALL: [Row; 11] = [
+    const ALL: [Row; 14] = [
         Row::Add,
         Row::Mul,
         Row::Scale,
+        Row::Shift,
+        Row::Min,
+        Row::Max,
         Row::GeluTanh,
         Row::Silu,
         Row::Sigmoid,
@@ -89,6 +95,9 @@ pub fn apply(stage: Row, out: &mut [f32], b: &[f32], s: f32) {
         Row::Add => out.iter_mut().zip(b).for_each(|(o, x)| *o += x),
         Row::Mul => out.iter_mut().zip(b).for_each(|(o, x)| *o *= x),
         Row::Scale => out.iter_mut().for_each(|o| *o *= s),
+        Row::Shift => out.iter_mut().for_each(|o| *o += s),
+        Row::Min => out.iter_mut().for_each(|o| *o = o.min(s)),
+        Row::Max => out.iter_mut().for_each(|o| *o = o.max(s)),
         Row::GeluTanh => each(out, gelu),
         Row::Silu => each(out, |v| v / (1.0 + (-v).exp())),
         Row::Sigmoid => each(out, |v| 1.0 / (1.0 + (-v).exp())),

@@ -512,6 +512,9 @@ pub(crate) fn stage(
             }
         }
         Stage::Scale(by) => out.iter_mut().for_each(|v| *v *= by),
+        Stage::Shift(by) => out.iter_mut().for_each(|v| *v += by),
+        Stage::Min(hi) => out.iter_mut().for_each(|v| *v = v.min(*hi)),
+        Stage::Max(lo) => out.iter_mut().for_each(|v| *v = v.max(*lo)),
         Stage::RmsNorm { eps } => {
             let w = operand()?.floats()?;
             for row in out.chunks_mut(width) {
