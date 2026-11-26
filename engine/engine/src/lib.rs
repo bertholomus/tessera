@@ -52,7 +52,7 @@ pub use mtp_draft::{MtpDrafter, MtpSpeculate};
 pub use ple::{PleConfig, PleStore};
 pub use ranks::Place;
 pub use sample::{Sampling, Target, Weights, accept};
-pub use schedule::{Batch, Fair, Policy, Seq, Sink};
+pub use schedule::{Batch, Fair, Parked, Policy, Seq, Sink};
 pub use spec_len::{CostModel, SpecLen};
 pub use speculate::{Drafter, SpecStats, Speculate};
 
@@ -72,6 +72,7 @@ pub use tessera_models::mtp as mtp_model;
 pub use tessera_models::*;
 pub use tessera_run::{Grid, gpu, pinning, select, sizer};
 pub use tessera_trace::{Linear, Norm};
+pub use tessera_turns as turns;
 pub use tessera_wasm as wasm;
 
 /// Tokens to continue, and when to stop.

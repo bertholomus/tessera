@@ -70,6 +70,11 @@ impl Held {
         &self.all[self.bound[slot.buffer as usize]]
     }
 
+    /// Bytes of every live buffer.
+    pub fn total(&self) -> u64 {
+        self.all.iter().map(|b| b.bytes() as u64).sum()
+    }
+
     /// Buffers bound for the active plan, in plan order.
     pub(crate) fn bound(&self) -> impl Iterator<Item = &Buffer> + '_ {
         self.bound.iter().map(|&at| &self.all[at])

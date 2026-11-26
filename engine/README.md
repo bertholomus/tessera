@@ -20,6 +20,7 @@ and tokens.
 <tr><td>&emsp;<a href="ir/testkit">testkit/</a></td><td>tessera-testkit</td><td>Helpers that tests share: noise, comparisons and scratch files</td></tr>
 <tr><td>&emsp;<a href="ir/trace">trace/</a></td><td>tessera-trace</td><td>Builds graphs by running model descriptions</td></tr>
 <tr><td>&emsp;<a href="ir/trace-derive">trace-derive/</a></td><td>tessera-trace-derive</td><td>#[derive(Weights)] for model descriptions</td></tr>
+<tr><td>&emsp;<a href="ir/turns">turns/</a></td><td>tessera-turns</td><td>Turns between models on one device, by load cost</td></tr>
 <tr><td><a href="models">models/</a></td><td>tessera-models</td><td>Model descriptions, traced into graphs</td></tr>
 <tr><td colspan="3"><a href="plan"><b>plan/</b></a></td></tr>
 <tr><td>&emsp;<a href="plan/codegen">codegen/</a></td><td>tessera-codegen</td><td>Generates kernel text for every dialect, and counts what it costs</td></tr>

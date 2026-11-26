@@ -5,6 +5,7 @@ use crate::{Model, Slot};
 use std::sync::{Arc, Mutex};
 use tessera_engine::Settings;
 use tessera_engine::progress::Step;
+use tessera_engine::turns::{Seated, Turns};
 use tessera_tasks::api::{GenerateImage, Info, Tokens};
 
 /// Declares each entry's module and lists its `ENTRY`.
@@ -87,6 +88,8 @@ pub struct Load<'a> {
     pub step: Mutex<Option<Step>>,
     /// Counts requests that ask for a profile, under `TESSERA_PROFILE=dynamic`.
     pub asks: Option<tessera_engine::Asks>,
+    /// Where models take turns on the device.
+    pub turns: &'a Arc<Turns>,
 }
 
 impl Load<'_> {
@@ -104,6 +107,14 @@ impl Load<'_> {
     pub fn count(&self, flag: &str, default: usize) -> usize {
         let value = self.given(flag).and_then(|v| v.parse().ok());
         value.unwrap_or(default)
+    }
+
+    /// A seat for this model, sized by its files.
+    pub fn seat(&self) -> Seated {
+        let files = std::fs::read_dir(&self.options.model).into_iter().flatten();
+        let sizes = files.filter_map(|f| f.ok()?.metadata().ok());
+        let bytes = sizes.filter(|m| m.is_file()).map(|m| m.len()).sum();
+        (self.turns).seat(&self.info.name, self.options.priority, bytes)
     }
 
     /// Fills the slot. Traits `with` leaves empty answer 404.

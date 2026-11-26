@@ -1,0 +1,7 @@
+[package]
+name = "tessera-turns"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Turns between models on one device, by load cost"

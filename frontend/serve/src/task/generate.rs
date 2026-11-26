@@ -1,11 +1,15 @@
 //! Text generation, batched over slots and ranks.
 
 use super::{Entry, Flag, Load, Pick};
+use crate::ranks::Links;
 use crate::start::Options;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
-use tessera_engine::progress::Unit;
-use tessera_engine::{Batch, Engine, Fair, Pins, PleStore, Recipe, Settings, Steps};
+use tessera_bundle::Weights;
+use tessera_engine::progress::{Progress, Unit};
+use tessera_engine::turns::{Asker, Seated, Turn};
+use tessera_engine::{Batch, Engine, Fair, Graph, Parked, Pins, PleConfig, PleStore};
+use tessera_engine::{Recipe, Settings, Steps};
 use tessera_tasks::api::Score;
 use tessera_bundle::tokenize::hf::Hf;
 use tessera_tasks::{Generate, Guides, Job, Queued, Steer};
@@ -126,11 +130,23 @@ pub(super) fn guides(
 
 /// Fills the slot with `generate`. Returns the job queue.
 pub(super) fn queue(load: &Load, generate: Generate, score: bool) -> mpsc::Receiver<Job> {
+    seated(load, generate, score, None)
+}
+
+/// As `queue`. Each job that enters the queue tells `seat`.
+fn seated(
+    load: &Load,
+    generate: Generate,
+    score: bool,
+    seat: Option<Asker>,
+) -> mpsc::Receiver<Job> {
     let generate = Arc::new(generate);
     let (queue, jobs) = mpsc::channel::<Job>();
+    let sent = seat.map(|s| Box::new(move || s.asked()) as Box<dyn Fn() + Send + Sync>);
     let queued = Arc::new(Queued {
         generate: generate.clone(),
         jobs: Mutex::new(queue),
+        sent,
     });
     load.fill(generate.clone(), |m| {
         m.chat = Some(generate);
@@ -140,11 +156,71 @@ pub(super) fn queue(load: &Load, generate: Generate, score: bool) -> mpsc::Recei
     jobs
 }
 
+/// A model's graph and weights, kept for each reload.
+struct Source<'a> {
+    o: &'a Options,
+    graph: Graph,
+    weights: Weights,
+    recipe: Recipe,
+    settings: Settings,
+    ple: Option<PleConfig>,
+}
+
+impl Source<'_> {
+    /// Opens the engine and loads every weight.
+    fn engine(&self, links: Option<Links>, progress: &Progress) -> Result<Engine, String> {
+        let o = self.o;
+        let at = (&self.recipe, &self.settings);
+        let count = self.graph.weights.len() as u32;
+        let compiling = progress.step("compile", Unit::Items, None);
+        let mut engine = o.ranks.open(links, self.graph.clone(), o.max_model_len, at)?;
+        compiling.finish();
+        if let Some(ple) = self.ple.clone() {
+            let store = PleStore::open(ple).map_err(|e| format!("ple store: {e}"))?;
+            engine.set_ple(store);
+        }
+        let shares: Vec<_> = (0..count).map(|at| engine.share(at)).collect();
+        let shares = |at: u32| shares[at as usize];
+        let take = |at, w: &_| engine.load_weight(at, w);
+        let loading = (self.weights).each_counted(progress, count, shares, take);
+        loading.map_err(|e| e.to_string())?;
+        Ok(engine)
+    }
+
+    /// Waits for room, loads, and tells the seat the cost.
+    fn enter(&self, seat: &Seated, links: Option<Links>, p: &Progress) -> Result<Engine, String> {
+        while seat.next() != Turn::Load {}
+        let start = Instant::now();
+        let engine = self.engine(links, p)?;
+        let seconds = start.elapsed().as_secs_f64();
+        seat.loaded(engine.bytes(), seconds, engine.memory());
+        let name = self.o.name.as_deref().unwrap_or("model");
+        eprintln!("{name} on {}: loaded in {seconds:.1} s", engine.device());
+        Ok(engine)
+    }
+}
+
+/// Steps `batch` on its turns until the model must leave.
+fn serve(mut batch: Batch, jobs: &mpsc::Receiver<Job>, seat: &Seated) -> Result<Parked, String> {
+    loop {
+        match seat.next() {
+            Turn::Step { admit } => batch.admitting(admit),
+            Turn::Leave => return Ok(batch.park()),
+            Turn::Load => continue,
+        }
+        // Takes every job that has arrived.
+        for (request, sink) in jobs.try_iter() {
+            batch.submit(request, sink);
+        }
+        batch.step().map_err(|e| e.to_string())?;
+        seat.stepped((batch.busy(), batch.running()), batch.bytes());
+    }
+}
+
 /// Loads the generator, fills the slot, then steps jobs.
 fn open(load: &Load, settings: Settings) -> Result<(), String> {
     let o = load.options;
     let guided = load.on("--guided");
-    let start = Instant::now();
     let links = o.ranks.join(&settings, &o.knobs())?;
     let rules = user_rules(&settings)?;
     let (slots, context) = (o.slots as u64, o.max_model_len as u64);
@@ -170,22 +246,16 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     if recipe.config.is_none() {
         recipe.config = loaded.config;
     }
-    let at = (&recipe, &settings);
-    let count = loaded.graph.weights.len() as u32;
-    let compiling = o.progress.step("compile", Unit::Items, None);
-    let mut engine = o.ranks.open(links, loaded.graph, o.max_model_len, at)?;
-    compiling.finish();
-    if let Some(ple) = loaded.ple {
-        let store = PleStore::open(ple).map_err(|e| format!("ple store: {e}"))?;
-        engine.set_ple(store);
-    }
-    let shares: Vec<_> = (0..count).map(|at| engine.share(at)).collect();
-    let shares = |at: u32| shares[at as usize];
-    let take = |at, w: &_| engine.load_weight(at, w);
-    let loading = (loaded.weights).each_counted(&o.progress, count, shares, take);
-    loading.map_err(|e| e.to_string())?;
-    let seconds = start.elapsed().as_secs_f64();
-    eprintln!("{}: loaded in {seconds:.1} s", engine.device());
+    let source = Source {
+        o,
+        graph: loaded.graph,
+        weights: loaded.weights,
+        recipe,
+        settings,
+        ple: loaded.ple,
+    };
+    let seat = load.seat();
+    let mut engine = source.enter(&seat, links, &o.progress)?;
     check_lowering(o, &mut engine, (o.slots > 1).then(|| o.slots.min(4)));
     if o.ranks.follows() {
         return engine.follow().map_err(|e| e.to_string());
@@ -198,27 +268,19 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         stop: loaded.stop,
         sampling: true,
     };
-    let jobs = queue(load, generate, scores);
-    let mut batch = Batch::new(&mut engine, Box::new(Fair));
-    if let Some(rows) = o.max_batch_rows {
-        batch.budget(rows);
-    }
-    if load.on("--reuse-prefix") {
-        batch.reuse();
-    }
+    let jobs = seated(load, generate, scores, Some(seat.asker()));
+    let mut parked = Parked::default();
     loop {
-        // Takes every job that has arrived. Waits only when idle.
-        let job = match batch.busy() {
-            true => jobs.try_recv().ok(),
-            false => match jobs.recv() {
-                Ok(job) => Some(job),
-                Err(_) => return Ok(()),
-            },
-        };
-        if let Some((request, sink)) = job {
-            batch.submit(request, sink);
-            continue;
+        let mut batch = Batch::resumed(&mut engine, Box::new(Fair), parked);
+        if let Some(rows) = o.max_batch_rows {
+            batch.budget(rows);
         }
-        batch.step().map_err(|e| e.to_string())?;
+        if load.on("--reuse-prefix") {
+            batch.reuse();
+        }
+        parked = serve(batch, &jobs, &seat)?;
+        drop(engine);
+        seat.left();
+        engine = source.enter(&seat, None, &Progress::default())?;
     }
 }

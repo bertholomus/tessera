@@ -151,6 +151,25 @@ impl Policy for Fair {
     }
 }
 
+impl Engine {
+    /// Device bytes the runner holds now.
+    pub fn bytes(&self) -> u64 {
+        self.runner.held().total()
+    }
+
+    /// Bytes the device reports. Zero when it reports none.
+    pub fn memory(&self) -> u64 {
+        self.runner.platform().memory
+    }
+}
+
+/// Answers a batch gave up when its engine closed.
+#[derive(Default)]
+pub struct Parked {
+    waiting: VecDeque<(Request, Sink)>,
+    paused: VecDeque<Seq>,
+}
+
 /// Many answers over one engine, a step at a time.
 pub struct Batch<'a> {
     engine: &'a mut Engine,
@@ -166,6 +185,8 @@ pub struct Batch<'a> {
     kept: Option<Kept>,
     /// The most rows one step feeds.
     budget: usize,
+    /// Waiting answers stay waiting.
+    closed: bool,
 }
 
 impl<'a> Batch<'a> {
@@ -186,11 +207,46 @@ impl<'a> Batch<'a> {
             free,
             kept: None,
             budget,
+            closed: false,
         };
         if shared {
             batch.reuse();
         }
         batch
+    }
+
+    /// As `new`, with the answers another batch parked.
+    pub fn resumed(engine: &'a mut Engine, policy: Box<dyn Policy>, parked: Parked) -> Self {
+        let mut batch = Self::new(engine, policy);
+        batch.waiting = parked.waiting;
+        batch.paused = parked.paused;
+        batch
+    }
+
+    /// Pauses every answer. Gives them up with the queue.
+    pub fn park(mut self) -> Parked {
+        while let Some(seq) = self.active.pop() {
+            self.pause(seq);
+        }
+        Parked {
+            waiting: self.waiting,
+            paused: self.paused,
+        }
+    }
+
+    /// Whether waiting answers may start.
+    pub fn admitting(&mut self, on: bool) {
+        self.closed = !on;
+    }
+
+    /// Answers that hold a slot or lost one.
+    pub fn running(&self) -> usize {
+        self.active.len() + self.paused.len()
+    }
+
+    /// Device bytes the engine holds now.
+    pub fn bytes(&self) -> u64 {
+        self.engine.bytes()
     }
 
     /// Finished answers keep rows. Set it before any step.
@@ -266,6 +322,9 @@ impl<'a> Batch<'a> {
             seq.pending = tokens[skip..].iter().copied().collect();
             seq.fed = skip;
             self.active.push(seq);
+        }
+        if self.closed {
+            return;
         }
         while let Some((slot, skip)) = self.place() {
             let (request, sink) = self.waiting.pop_front().expect("a waiting answer");
@@ -370,7 +429,13 @@ impl<'a> Batch<'a> {
         if self.active.len() <= 1 {
             return false;
         }
-        let mut seq = self.active.pop().expect("an active answer");
+        let seq = self.active.pop().expect("an active answer");
+        self.pause(seq);
+        true
+    }
+
+    /// Queues an answer to feed again from its first token.
+    fn pause(&mut self, mut seq: Seq) {
         let mut all = std::mem::take(&mut seq.history);
         let kept_tokens = all.clone();
         all.extend(seq.pending.drain(..));
@@ -381,7 +446,6 @@ impl<'a> Batch<'a> {
         seq.pending = all.into();
         seq.fed = 0;
         self.paused.push_front(seq);
-        true
     }
 
     /// Frees an answer's slot, or keeps its rows.

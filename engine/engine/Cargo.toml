@@ -19,6 +19,7 @@ tessera-gpukit = { workspace = true }
 tessera-graph = { workspace = true }
 tessera-interp = { workspace = true }
 tessera-kv = { workspace = true }
+tessera-turns = { workspace = true }
 tessera-rules = { workspace = true }
 tessera-wasm = { workspace = true }
 tessera-lower = { workspace = true }

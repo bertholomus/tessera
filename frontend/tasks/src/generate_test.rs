@@ -28,6 +28,7 @@ fn speculative_engine_gate() {
             sampling: false,
         }),
         jobs: Mutex::new(jobs.clone()),
+        sent: None,
     };
     let solo = queued(Steer::Guided(Some(Arc::new(Open))));
     let batched = queued(Steer::Unguided("batched speculative decoding"));

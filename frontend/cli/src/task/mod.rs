@@ -158,7 +158,8 @@ struct OnSource;
 
 impl<T: Task + Run<Source>> Target<T> for OnSource {
     fn takes(flag: &str) -> Option<bool> {
-        Some(!Options::default().switch(flag))
+        // `--also` starts the next model's flags.
+        Some(flag != "--also" && !Options::default().switch(flag))
     }
 
     fn extra() -> String {

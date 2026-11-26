@@ -90,6 +90,20 @@ impl Chat for Generate {
 pub struct Queued {
     pub generate: Arc<Generate>,
     pub jobs: Mutex<mpsc::Sender<Job>>,
+    /// Called after each job enters the queue.
+    pub sent: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl Queued {
+    fn send(&self, job: Job) -> Result<(), Error> {
+        let jobs = self.jobs.lock().map_err(|_| "the engine stopped")?;
+        jobs.send(job).map_err(|_| "the engine stopped")?;
+        drop(jobs);
+        if let Some(sent) = &self.sent {
+            sent();
+        }
+        Ok(())
+    }
 }
 
 impl Generator for Queued {
@@ -185,10 +199,7 @@ impl Generator for Queued {
             ended = matches!(step, Step::Done { .. });
             sink(step) && !ended
         };
-        let jobs = self.jobs.lock().map_err(|_| "the engine stopped")?;
-        jobs.send((request, Box::new(each)))
-            .map_err(|_| "the engine stopped")?;
-        Ok(())
+        self.send((request, Box::new(each)))
     }
 }
 
@@ -200,10 +211,7 @@ impl Score for Queued {
             ..Request::default()
         };
         let (sink, taken) = mpsc::channel();
-        let jobs = self.jobs.lock().map_err(|_| "the engine stopped")?;
-        jobs.send((request, Box::new(move |e| sink.send(e).is_ok())))
-            .map_err(|_| "the engine stopped")?;
-        drop(jobs);
+        self.send((request, Box::new(move |e| sink.send(e).is_ok())))?;
         for event in taken {
             match event {
                 Event::Scores(scores) => return Ok(scores),

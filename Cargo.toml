@@ -69,6 +69,7 @@ tessera-task-derive = { path = "frontend/task-derive" }
 tessera-testkit = { path = "engine/ir/testkit" }
 tessera-trace = { path = "engine/ir/trace" }
 tessera-trace-derive = { path = "engine/ir/trace-derive" }
+tessera-turns = { path = "engine/ir/turns" }
 tessera-wasm = { path = "engine/rules/wasm" }
 tessera-publish = { path = "tools/publish" }
 

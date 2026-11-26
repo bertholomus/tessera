@@ -1,23 +1,25 @@
-//! Loads one model on a thread and serves HTTP.
+//! Loads each model on a thread and serves HTTP.
 
-use crate::Slot;
 use crate::task::{self, Load};
+use crate::{Models, Slot};
 use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use tessera_bundle::Overrides;
-use tessera_engine::Recipe;
 use tessera_engine::hf::LAYERS;
 use tessera_engine::progress::{Open, Progress, Unit};
+use tessera_engine::turns::{Rules, Turns};
 use tessera_engine::wasm::Module;
+use tessera_engine::{Memory, Recipe};
 use tessera_tasks::api::Info;
 
 /// The flags for `Options::flag` and `Options::switch`.
 pub fn flags() -> String {
     let head = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
 [--max-batch-rows <n>] [--layers <n>] [--kv-dtype <f32|bf16|fp8>] [--dtype <spot>=<dtype>]... [--shape <kernel>:<knob>=<n>]... [--kv-cache-tokens <tokens>] [--served-model-name <name>]";
-    let tail = "[--max-connections <n>] [--reject-unknown-fields] [--require-favored] [--explain-lowering]";
+    let tail = "[--max-connections <n>] [--reject-unknown-fields] [--require-favored] [--explain-lowering] \
+[--priority <n>] [--swap-quantum <x>] [--also <model and its flags>]...";
     format!("{head} {} {tail}", task::usage())
 }
 
@@ -63,6 +65,12 @@ pub struct Options {
     pub config: Overrides,
     /// Where the load reports its steps.
     pub progress: Progress,
+    /// A higher number steps first and takes memory first.
+    pub priority: u32,
+    /// Resident seconds a busy model keeps per load second.
+    pub quantum: f64,
+    /// More models to serve beside this one.
+    pub also: Vec<Options>,
 }
 
 impl Default for Options {
@@ -91,6 +99,9 @@ impl Default for Options {
             ranks: Default::default(),
             config: Overrides::default(),
             progress: Progress::default(),
+            priority: 0,
+            quantum: 4.0,
+            also: Vec::new(),
         }
     }
 }
@@ -155,6 +166,8 @@ impl Options {
                 self.config.set("config.json", LAYERS.name, n.into());
             }
             "--served-model-name" => self.name = Some(value),
+            "--priority" => self.priority = value.parse().ok()?,
+            "--swap-quantum" => self.quantum = value.parse().ok().filter(|q| *q >= 0.0)?,
             "--task" => self.task = task::names().into_iter().find(|t| *t == value)?,
             _ => match task::owned(flag) {
                 Some(owned) if !owned.value.is_empty() && (owned.check)(&value) => {
@@ -168,45 +181,82 @@ impl Options {
     }
 }
 
-/// Loads the model on a thread. The slot fills after.
-pub fn spawn(options: Options) -> Slot {
-    let slot: Slot = Arc::new(OnceLock::new());
-    let loading = slot.clone();
-    std::thread::spawn(move || load(options, loading));
-    slot
+impl Options {
+    /// The name requests give for this model.
+    fn served(&self) -> String {
+        let path = || self.model.display().to_string();
+        self.name.clone().unwrap_or_else(path)
+    }
+
+    /// The table's rules, from these options and `TESSERA_MEMORY`.
+    fn seating(&self) -> Rules {
+        let memory = tessera_frontend_settings::read().memory;
+        Rules {
+            budget: match memory {
+                Memory::Bytes(bytes) => Some(bytes),
+                Memory::Device | Memory::Off => None,
+            },
+            learn: memory == Memory::Device,
+            quantum: self.quantum,
+        }
+    }
 }
 
-/// Loads the model, then answers requests until killed.
+/// Loads the model on a thread. The slot fills after.
+pub fn spawn(options: Options) -> Slot {
+    spawn_all(options).named[0].1.clone()
+}
+
+/// Loads each model on a thread. Slots fill after.
+fn spawn_all(mut options: Options) -> Models {
+    let turns = Turns::new(options.seating());
+    let also = std::mem::take(&mut options.also);
+    let mut named = Vec::new();
+    for options in std::iter::once(options).chain(also) {
+        let slot = Slot::default();
+        named.push((options.served(), slot.clone()));
+        let turns = turns.clone();
+        std::thread::spawn(move || load(options, slot, &turns));
+    }
+    Models { named, turns }
+}
+
+/// Loads the models, then answers requests until killed.
 pub fn run(mut options: Options) -> Result<(), String> {
     let (host, port) = (options.host.clone(), options.port);
     let limits = crate::http::Limits {
         max_connections: options.max_connections,
         ..Default::default()
     };
+    let alone = options.ranks.alone() && options.also.iter().all(|o| o.ranks.alone());
+    if !options.also.is_empty() && !alone {
+        return Err("--also cannot combine with ranks".into());
+    }
     if options.ranks.follows() {
-        load(options, Slot::default());
+        let turns = Turns::new(options.seating());
+        load(options, Slot::default(), &turns);
         return Ok(());
     }
     let open = Arc::new(Open::default());
     options.progress = options.progress.also(open.clone());
-    let slot = spawn(options);
+    for more in &mut options.also {
+        more.progress = more.progress.also(open.clone());
+    }
+    let models = spawn_all(options);
     let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
     eprintln!("listening on {host}:{port}");
     crate::http::run(listener, limits, move |request| {
-        crate::route_open(&slot, &open, request)
+        models.route(Some(&open), request)
     });
     Ok(())
 }
 
 /// Loads the model into `slot`. A failure ends the process.
-fn load(mut options: Options, slot: Slot) {
+fn load(mut options: Options, slot: Slot, turns: &Arc<Turns>) {
     let mut settings = tessera_frontend_settings::read();
     settings.names = options.names.clone().or(settings.names);
     let info = Info {
-        name: options
-            .name
-            .clone()
-            .unwrap_or_else(|| options.model.display().to_string()),
+        name: options.served(),
         context: options.max_model_len,
     };
     let name = options.name.as_deref().unwrap_or("model");
@@ -218,6 +268,7 @@ fn load(mut options: Options, slot: Slot) {
         slot: &slot,
         step: Mutex::new(Some(step)),
         asks: settings.asks.clone(),
+        turns,
     };
     let failed = task::pick(&options).and_then(|entry| (entry.open)(&load, settings));
     if let Err(e) = failed {

@@ -29,15 +29,55 @@ mod wire_test;
 
 use http::{Request, Response};
 pub use images::base64;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, OnceLock};
 use tessera_bundle::RenderOptions;
 use tessera_engine::progress::{Event, Open, Unit};
+use tessera_engine::turns::Turns;
 pub use tessera_tasks::api::Model;
 use wire::{Detokenize, Embeddings, Messages, Refusal, Tokenize, bad, refuse};
 
 /// The model once it loads. Until then routes answer 503.
 pub type Slot = Arc<OnceLock<Model>>;
+
+/// Each served model by name. The first is the default.
+pub(crate) struct Models {
+    pub(crate) named: Vec<(String, Slot)>,
+    pub(crate) turns: Arc<Turns>,
+}
+
+/// The one field of a request that picks its model.
+#[derive(Deserialize)]
+struct Named {
+    model: Option<String>,
+}
+
+impl Models {
+    /// The slot the body's `model` names, else the first.
+    fn pick(&self, body: &[u8]) -> &Slot {
+        let first = &self.named[0].1;
+        if self.named.len() == 1 {
+            return first;
+        }
+        let asked = serde_json::from_slice::<Named>(body).ok();
+        let asked = asked.and_then(|n| n.model);
+        let found = asked.and_then(|m| self.named.iter().find(|(name, _)| *name == m));
+        found.map_or(first, |(_, slot)| slot)
+    }
+
+    /// Answers one request. Health lists `open`'s load steps.
+    pub(crate) fn route(&self, open: Option<&Open>, request: &Request) -> Response {
+        let mut slots = self.named.iter().map(|(_, slot)| slot);
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", path) if HEALTH.contains(&path) => {
+                health(slots.all(|s| s.get().is_some()), open)
+            }
+            ("GET", "/v1/models") => cards(slots, Some(&self.turns)),
+            _ => route(self.pick(&request.body), request),
+        }
+    }
+}
 
 /// Runs `f` on the model, or refuses while it loads.
 fn with_model<T>(slot: &Slot, f: impl FnOnce(&Model) -> Result<T, Refusal>) -> Result<T, Refusal> {
@@ -90,8 +130,8 @@ fn reply(slot: &Slot, f: impl FnOnce(&Model) -> Result<Value, Refusal>) -> Respo
 const HEALTH: [&str; 4] = ["/health", "/v1/health", "/v1/health/ready", "/ping"];
 
 /// Ready or loading, matching llama.cpp's status, with load steps.
-fn health(slot: &Slot, open: Option<&Open>) -> Response {
-    if slot.get().is_some() {
+fn health(ready: bool, open: Option<&Open>) -> Response {
+    if ready {
         return Response::json(200, &json!({"status": "ok"}));
     }
     let error =
@@ -119,17 +159,11 @@ pub fn step(event: &Event) -> Value {
     })
 }
 
-/// As `route`. Health answers list the open load steps.
-pub(crate) fn route_open(slot: &Slot, open: &Open, request: &Request) -> Response {
-    match request.method == "GET" && HEALTH.contains(&request.path.as_str()) {
-        true => health(slot, Some(open)),
-        false => route(slot, request),
-    }
-}
-
-fn models(slot: &Slot) -> Response {
-    reply(slot, |m| {
-        let card = json!({
+/// A card for each loaded model, with its seat's numbers.
+fn cards<'a>(slots: impl Iterator<Item = &'a Slot>, turns: Option<&Turns>) -> Response {
+    let mut data = Vec::new();
+    for m in slots.filter_map(|slot| slot.get()) {
+        let mut card = json!({
             "id": m.info.name,
             "object": "model",
             "created": wire::now(),
@@ -137,8 +171,18 @@ fn models(slot: &Slot) -> Response {
             "root": m.info.name,
             "max_model_len": m.info.context,
         });
-        Ok(json!({"object": "list", "data": [card]}))
-    })
+        if let Some(seat) = turns.and_then(|t| t.status(&m.info.name)) {
+            card["resident"] = seat.resident.into();
+            card["bytes"] = seat.bytes.into();
+            card["load_seconds"] = seat.seconds.into();
+            card["loads"] = seat.loads.into();
+        }
+        data.push(card);
+    }
+    match data.is_empty() {
+        true => refuse(503, "the model is loading", None).into(),
+        false => Response::json(200, &json!({"object": "list", "data": data})),
+    }
 }
 
 fn tokenize(slot: &Slot, body: &[u8]) -> Response {
@@ -193,9 +237,9 @@ tessera_engine::metric!(IMAGES in API = Counter "tessera:image_requests_total", 
 pub fn route(slot: &Slot, request: &Request) -> Response {
     let body = request.body.as_slice();
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", path) if HEALTH.contains(&path) => health(slot, None),
+        ("GET", path) if HEALTH.contains(&path) => health(slot.get().is_some(), None),
         ("GET", "/version") => Response::json(200, &json!({"version": env!("CARGO_PKG_VERSION")})),
-        ("GET", "/v1/models") => models(slot),
+        ("GET", "/v1/models") => cards(std::iter::once(slot), None),
         ("GET", "/metrics") => metrics::metrics(),
         ("POST", "/tokenize") => tokenize(slot, body),
         ("POST", "/detokenize") => detokenize(slot, body),

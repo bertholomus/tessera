@@ -109,7 +109,7 @@ pub fn split(given: &[String]) -> Result<(Option<Origin>, Vec<String>), Stop> {
     let mut rest = Vec::new();
     let mut args = given.iter();
     while let Some(arg) = args.next() {
-        if arg == "--" {
+        if arg == "--" || arg == "--also" {
             rest.push(arg.clone());
             rest.extend(args.by_ref().cloned());
             break;
@@ -219,8 +219,23 @@ impl Source {
         Err(Stop::Failed(none))
     }
 
-    /// Serve options from the recipe, then from `rest`.
+    /// Serve options. Each `--also` starts one more model.
     pub fn options(&self, rest: &[String]) -> Result<Options, Stop> {
+        let Some(at) = rest.iter().position(|flag| flag == "--also") else {
+            return self.one(rest);
+        };
+        let mut options = self.one(&rest[..at])?;
+        let (origin, flags) = split(&rest[at + 1..])?;
+        let more = Source::open(origin, self.progress.clone())?;
+        let mut more = more.options(&flags)?;
+        let further = std::mem::take(&mut more.also);
+        options.also.push(more);
+        options.also.extend(further);
+        Ok(options)
+    }
+
+    /// Serve options for this model alone.
+    fn one(&self, rest: &[String]) -> Result<Options, Stop> {
         let mut options = Options::default();
         options.progress = self.progress.clone();
         if let Some(r) = &self.recipe {
