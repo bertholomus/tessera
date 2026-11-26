@@ -195,11 +195,10 @@ impl DraftCore {
         let inputs = plan.inputs.clone();
         let table = plan.table;
         self.runner.replan(plan)?;
-        if let Some((table, bytes)) = table
-            .zip(self.lanes.as_mut())
-            .and_then(|(t, l)| Some((t, l.changed()?)))
-        {
-            self.runner.held_mut().upload(table, &bytes)?;
+        if let (Some(table), Some(lanes)) = (table, self.lanes.as_mut()) {
+            for (offset, bytes) in lanes.take_dirty() {
+                self.runner.held_mut().upload_at(table, offset, &bytes)?;
+            }
         }
         self.runner.bind_all(&bound);
         if feeds.len() != inputs.len() {
