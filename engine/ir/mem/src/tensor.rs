@@ -67,10 +67,6 @@ impl Tensor {
         self.count
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
     /// Whether the shape accounts for every element.
     pub fn filled(&self) -> bool {
         self.layout.len() == self.count

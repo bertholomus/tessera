@@ -36,13 +36,12 @@ pub use guide::{
     Allowed, DEPTH, Edit, FEW, Fault, Guide, Move, Penalties, Prefix, Program, Runs, Scoped,
     Stacked, Tally, Term,
 };
-pub use kept::Totals;
 pub use model::Model;
 pub use mtp_draft::{MtpDrafter, MtpSpeculate};
 pub use ple::{PleConfig, PleStore};
-pub use probe::{Launch, Lowered, Probe};
-pub use sample::{Sampling, Target, Weights, accept};
-pub use schedule::{Batch, Fair, Parked, Policy, Seq};
+pub use probe::Launch;
+pub use sample::Sampling;
+pub use schedule::{Batch, Fair, Parked};
 pub use spec_len::{CostModel, SpecLen};
 pub use speculate::{Drafter, SpecStats, Speculate};
 pub(crate) use tessera_engine_hooks::Hooks;
@@ -394,11 +393,6 @@ impl Engine {
         self.runner.plan().share(at)
     }
 
-    /// This rank's first-axis rows of weight `at`, if split.
-    pub fn rows(&self, at: u32) -> Option<(usize, usize)> {
-        self.runner.plan().rows(at)
-    }
-
     /// Uploads weight `at` of the graph.
     pub fn load_weight(&mut self, at: u32, w: &Weight) -> Result<(), Error> {
         Ok(self.runner.load_weight(at, w)?)
@@ -454,18 +448,9 @@ impl Engine {
         Ok(all)
     }
 
-    /// Floats per tapped row, if the full entry emits taps.
-    pub fn tap_width(&self) -> Option<usize> {
-        self.taps
-    }
-
     /// Maximum sequence length in tokens.
     pub fn context(&self) -> usize {
         self.context
-    }
-
-    pub fn slots(&self) -> usize {
-        self.slots
     }
 
     /// One launch of `rows`: the likeliest token after each.

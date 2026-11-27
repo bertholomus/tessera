@@ -78,10 +78,6 @@ impl Timings {
         self.0.values().map(Vec::len).sum()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
     /// Whether `now` was timed with its current source.
     pub fn known(&self, name: &str, now: &Sample) -> bool {
         self.fresh(name, now, false)

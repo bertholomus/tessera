@@ -144,8 +144,4 @@ impl Cache {
     pub fn len(&self) -> usize {
         self.plans.len()
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.plans.is_empty()
-    }
 }

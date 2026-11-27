@@ -82,11 +82,6 @@ impl Site {
 }
 
 impl Region<'_> {
-    /// The value of `op`, if present and unique.
-    pub fn scalar(&self, op: &str) -> Option<f32> {
-        crate::site::scalar(self.scalars, op)
-    }
-
     /// The value set for `kernel:name`, if any.
     pub fn knob(&self, kernel: &str, name: &str) -> Option<usize> {
         crate::site::find_knob(self.knobs, kernel, name)
@@ -281,10 +276,6 @@ impl<'a> Weights<'a> {
     /// Distinct weight paths.
     pub fn len(&self) -> usize {
         self.at.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.at.is_empty()
     }
 }
 

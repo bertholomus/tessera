@@ -324,10 +324,6 @@ macro_rules! draft_methods {
             pub fn slots(&self) -> usize {
                 self.core.slots
             }
-
-            pub fn device(&self) -> String {
-                self.core.runner.device()
-            }
         }
     };
 }
@@ -502,10 +498,6 @@ impl Drafter {
 
     pub fn tap_width(&self) -> usize {
         self.tap_width
-    }
-
-    pub fn mask_token(&self) -> u32 {
-        self.mask_token
     }
 
     /// Sliding attention window in tokens, if configured.

@@ -713,10 +713,6 @@ impl<'a> Tree<'a> {
         self.nodes.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
-    }
-
     pub fn node(&self, t: T) -> &Node {
         &self.nodes[t.0 as usize]
     }

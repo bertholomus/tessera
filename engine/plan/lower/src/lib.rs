@@ -1,5 +1,10 @@
 //! Lowers a graph to kernel launches over device buffers.
 
+#![allow(
+    clippy::len_without_is_empty,
+    reason = "the workspace dead code check removes unused is_empty"
+)]
+
 mod abi;
 mod assign;
 mod body;
@@ -28,16 +33,16 @@ pub use cost::{ASKERS, Ask, Device, kernel_identity};
 pub use cut::{cut, cut_region};
 pub use error::{Size, Unsupported};
 pub use extent::Extent;
-pub use form::{Filed, Pins, Site, Spot, Weight};
+pub use form::{Filed, Pins, Site, Weight};
 pub use kernel::{COMMIT, Collective, Keeping, Kernel, KernelRef, Needs, PEEK, Resident, UNPROVEN};
 pub use plan::{KeptInfo, Loaded, Output, Plan, Share, Slot, Step};
 pub use recipe::{
     Compute, Dtype, KNOBS, Knob, Knobs, Launching, Recipe, Scoped, Wires, find_knob, labels,
     register_knob,
 };
-pub use rule::{Attn, Draft, Propose, RULES, Read, Rule, linked, rules};
+pub use rule::{Attn, Draft, Propose, Read, Rule, linked, rules};
 pub use schedule::{peak, schedule};
-pub use select::{Finding, Home, Op, Rejection, Report, Selected, Val, Value, Variants, select};
+pub use select::{Home, Op, Report, Selected, Val, Value, select};
 pub use tessera_codegen::kept;
 pub use tessera_codegen::{Dialect, Terms, hip_tiles, terms};
 pub use tessera_engine_settings::{Backend, ByBackend, Pick, Reads, Settings};
@@ -46,7 +51,7 @@ pub use tessera_mem::{Buffer, DType, Tensor, View};
 pub use tessera_platform::{Limits, Platform};
 pub use tessera_sim::{Cluster, Fit, Link, Zone, ZoneKind};
 pub use tessera_work::{Load, Ops};
-pub use tree::{Node, RING_CHUNK, T, Term, Tree, Wants, sliding_ring};
+pub use tree::{RING_CHUNK, T, Term, Tree, Wants, sliding_ring};
 
 use tessera_graph::{DimName, Graph};
 
