@@ -4,6 +4,7 @@ mod attend;
 mod conv;
 mod cpu;
 mod delta;
+mod delta_metal;
 mod flash;
 mod indexer;
 mod join_rope;

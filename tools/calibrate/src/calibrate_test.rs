@@ -36,6 +36,8 @@ fn grid_reaches_rules() {
     let device_rules = [
         "trellis_mma",
         "trellis_metal",
+        "delta_metal",
+        "conv_metal",
         "fast_gemv",
         "fast_mm",
         "fast_mm_mx8",
