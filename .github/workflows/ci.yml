@@ -24,6 +24,9 @@ jobs:
     # No Co-Authored-By lines crediting AI tools.
     if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,6 +35,8 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
         run: tools/scripts/check-coauthors.sh "$BASE..$HEAD"
+      - if: failure() && github.event_name == 'merge_group'
+        uses: ./.github/actions/cancel-on-failure
 
   # In a merge group the tier gate runs before the build jobs, so a
   # group that conflicts with a ranked PR fails at once. A pull request
@@ -151,6 +156,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      actions: write
     outputs:
       review: ${{ steps.gate.outputs.review }}
     steps:
@@ -190,12 +196,17 @@ jobs:
         with:
           name: checks-lint
           path: ${{ runner.temp }}/checks/lint.json
+      - if: failure() && github.event_name == 'merge_group'
+        uses: ./.github/actions/cancel-on-failure
 
   linux:
     # CPU and CUDA host code. The CUDA driver loads at runtime.
     needs: changes
     if: needs.changes.outputs.build == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
@@ -222,6 +233,8 @@ jobs:
           name: checks-tests
           path: ${{ runner.temp }}/checks/tests.json
           if-no-files-found: ignore
+      - if: failure() && github.event_name == 'merge_group'
+        uses: ./.github/actions/cancel-on-failure
 
   features:
     # Builds with no GPU backend and with each one alone, so
@@ -230,6 +243,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.build == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
     strategy:
       fail-fast: false
       matrix:
@@ -255,12 +271,17 @@ jobs:
         run: cargo run -q -p tessera-publish -- --lint
       - if: matrix.features != ''
         run: cargo check --manifest-path target/publish-lint/Cargo.toml --workspace --tests --features "${{ matrix.features }}"
+      - if: failure() && github.event_name == 'merge_group'
+        uses: ./.github/actions/cancel-on-failure
 
   grammar:
     # The llguidance guide, behind its off-by-default feature.
     needs: changes
     if: needs.changes.outputs.build == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
@@ -275,6 +296,8 @@ jobs:
         with:
           tool: cargo-nextest@0.9.152
       - run: cargo nextest run -p tessera-grammar --features llguidance --profile ci
+      - if: failure() && github.event_name == 'merge_group'
+        uses: ./.github/actions/cancel-on-failure
 
   macos:
     # Light on pull requests. The merge queue skips it, because macOS
@@ -296,6 +319,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.build == 'true'
     runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
@@ -311,6 +337,8 @@ jobs:
         with:
           tool: cargo-nextest@0.9.152
       - run: cargo nextest run --workspace --profile ci
+      - if: failure() && github.event_name == 'merge_group'
+        uses: ./.github/actions/cancel-on-failure
 
   similarity:
     # Near-copies of code (stickler simcheck), compared by embeddings,
@@ -383,12 +411,17 @@ jobs:
           gh cache list --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" --key simcheck2- --limit 100
           --json id,key --jq "if any(.[]; .key == \"$KEEP\") then .[] | select(.key != \"$KEEP\") | .id else empty end" |
           xargs -r -n1 gh cache delete --repo "$GITHUB_REPOSITORY"
+      - if: failure() && github.event_name == 'merge_group'
+        uses: ./.github/actions/cancel-on-failure
 
   style:
     # Comment and prose rules (stickler style) on a PR's added lines. The job
     # fails on any hit, and does nothing on pushes, so `success` can need it.
     if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
     env:
       PULL: ${{ github.event_name == 'pull_request' }}
       BASE: ${{ github.event.pull_request.base.sha }}
@@ -426,6 +459,8 @@ jobs:
         with:
           name: checks-style
           path: ${{ runner.temp }}/checks/style.json
+      - if: failure() && github.event_name == 'merge_group'
+        uses: ./.github/actions/cancel-on-failure
 
   report:
     # One PR comment for lint, similarity, style and tests (stickler).
@@ -466,6 +501,9 @@ jobs:
     if: needs.changes.outputs.build == 'true'
     # CUDA 13.0 packages target 24.04. Newer glibc breaks nvcc.
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
@@ -486,6 +524,8 @@ jobs:
           tool: cargo-nextest@0.9.152
       - run: cargo nextest run -p tessera-linear --test platforms_test --profile ci --no-capture
       - run: cargo nextest run -p tessera-models --test kernels_test --profile ci --no-capture
+      - if: failure() && github.event_name == 'merge_group'
+        uses: ./.github/actions/cancel-on-failure
 
   docker:
     # Each image runs without a GPU and finds the libraries tesserax
@@ -505,6 +545,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
       - run: >
@@ -580,23 +621,8 @@ jobs:
           tag="$TAG-$(git rev-parse 'HEAD^{tree}')"
           docker tag tesserax:ci "$tag"
           docker push "$tag"
-
-  # In a merge group, success waits for every job it needs, the slowest
-  # too, even after one has failed. This job cancels the run at the first
-  # failure, so success reports at once and the queue drops the group.
-  fail-fast:
-    if: github.event_name == 'merge_group'
-    # It lives as long as the run. ubuntu-slim stops a job at 15 minutes.
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - env:
-          GH_TOKEN: ${{ github.token }}
-          SELF: fail-fast
-        run: tools/scripts/fail-fast.sh
+      - if: failure() && github.event_name == 'merge_group'
+        uses: ./.github/actions/cancel-on-failure
 
   success:
     # The one check to require: every job above passed or was skipped

@@ -1,0 +1,12 @@
+name: Cancel on failure
+description: >
+  Cancels the whole run. A merge group job calls it as its last step when
+  it fails, so the success job reports at once and the queue drops the
+  group without waiting for the slowest jobs. The job needs actions: write.
+runs:
+  using: composite
+  steps:
+    - shell: sh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh run cancel "$GITHUB_RUN_ID" -R "$GITHUB_REPOSITORY"
