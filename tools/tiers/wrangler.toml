@@ -1,0 +1,9 @@
+name = "tessera-tiers"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+[build]
+command = "cargo install -q --locked worker-build@0.9.0 && worker-build --release"
+
+[vars]
+REPO = "kindlingai/tessera"
