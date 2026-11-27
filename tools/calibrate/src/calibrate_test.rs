@@ -44,6 +44,7 @@ fn grid_reaches_rules() {
         "conv_span",
         "flash_sunk",
         "listed_split",
+        "block_metal",
         "fast_gemv",
         "fast_mm",
         "fast_mm_bf128",

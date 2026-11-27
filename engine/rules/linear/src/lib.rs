@@ -1,5 +1,6 @@
 //! Generated matmul kernels, registered as lowering rules.
 
+mod block_metal;
 mod dense;
 mod lanes;
 mod lanes_metal;
