@@ -30,6 +30,7 @@ type Buf = Retained<ProtocolObject<dyn MTLBuffer>>;
 struct Allocs {
     next: u64,
     by_base: BTreeMap<u64, Buf>,
+    by_host: BTreeMap<u64, u64>,
 }
 
 /// Address space in pages, so offsets never cross buffers.
@@ -201,6 +202,19 @@ impl Context {
         Ok(unsafe { buffer.contents().cast::<u8>().add(at) })
     }
 
+    /// Allocates a zeroed shared Metal buffer.
+    fn make_buffer(&self, size: usize) -> Result<Buf, Error> {
+        let shared = MTLResourceOptions::StorageModeShared;
+        let buffer = self
+            .0
+            .device
+            .newBufferWithLength_options(size.max(4), shared)
+            .ok_or(Error::Gpu("buffer allocation"))?;
+        let all = buffer.length();
+        unsafe { std::ptr::write_bytes(buffer.contents().as_ptr().cast::<u8>(), 0, all) };
+        Ok(buffer)
+    }
+
     fn id(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
     }
@@ -322,19 +336,32 @@ impl Device for Context {
 
     /// Shared storage, zeroed, at least four bytes long.
     fn alloc(&self, size: usize) -> Result<u64, Error> {
-        let shared = MTLResourceOptions::StorageModeShared;
-        let buffer = self
-            .0
-            .device
-            .newBufferWithLength_options(size.max(4), shared);
-        let buffer = buffer.ok_or(Error::Gpu("buffer allocation"))?;
-        let all = buffer.length();
-        unsafe { std::ptr::write_bytes(buffer.contents().as_ptr().cast::<u8>(), 0, all) };
+        let buffer = self.make_buffer(size)?;
         Ok(lock(&self.0.allocs).add(buffer))
     }
 
     fn free(&self, ptr: u64) {
         lock(&self.0.allocs).by_base.remove(&ptr);
+    }
+
+    fn pin(&self, size: usize) -> Result<(u64, u64), Error> {
+        let buffer = self.make_buffer(size)?;
+        let host = buffer.contents().as_ptr() as u64;
+        let mut allocs = lock(&self.0.allocs);
+        let base = allocs.add(buffer);
+        allocs.by_host.insert(host, base);
+        Ok((host, base))
+    }
+
+    fn unpin(&self, host: u64) {
+        let mut allocs = lock(&self.0.allocs);
+        if let Some(base) = allocs.by_host.remove(&host) {
+            allocs.by_base.remove(&base);
+        }
+    }
+
+    fn unified(&self) -> bool {
+        self.0.device.hasUnifiedMemory()
     }
 
     fn free_memory(&self) -> Option<u64> {
