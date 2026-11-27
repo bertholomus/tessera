@@ -42,6 +42,7 @@ fn grid_reaches_rules() {
         "fast_stacked",
         "fast_mla_attend",
         "fast_gqa_attend",
+        "attn_metal",
         "fast_indexer",
         "picked_trellis",
         "picked_bf16",
