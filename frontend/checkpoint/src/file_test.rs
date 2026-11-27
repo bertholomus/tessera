@@ -78,6 +78,7 @@ fn reads_filed_spans() {
     );
     let data: Vec<u8> = (0..2 + bytes).map(|i| (i % 251) as u8).collect();
     let path = write("filed", &header, &data);
+    assert!(crate::disk::is_local(&std::fs::File::open(&path).unwrap()));
     let span = File::open(&path).unwrap().filed("w").unwrap();
     for reads in [Reads::Cached, Reads::Direct] {
         let mut got = vec![0u8; span.bytes()];
