@@ -30,6 +30,7 @@ pub enum Meta {
 pub enum GgufType {
     F32,
     F16,
+    BF16,
     Q4_0,
     Q8_0,
 }
@@ -45,6 +46,7 @@ impl GgufType {
             1 => Ok(Self::F16),
             2 => Ok(Self::Q4_0),
             8 => Ok(Self::Q8_0),
+            30 => Ok(Self::BF16),
             _ => Err(Error::DType(format!("{name}: GGUF type {id}"))),
         }
     }
@@ -55,6 +57,7 @@ impl GgufType {
             Self::F16 => 1,
             Self::Q4_0 => 2,
             Self::Q8_0 => 8,
+            Self::BF16 => 30,
         }
     }
 
@@ -63,6 +66,7 @@ impl GgufType {
         let (block, bytes) = match self {
             Self::F32 => of(&storage::F32),
             Self::F16 => (1, size_of::<tessera_engine::F16>()),
+            Self::BF16 => (1, size_of::<tessera_engine::Bf16>()),
             Self::Q4_0 => of(&block::Q4_0),
             Self::Q8_0 => of(&block::Q8_0),
         };
@@ -360,7 +364,7 @@ impl Gguf {
 
     pub fn floats(&self, name: &str) -> Result<Vec<f32>, Error> {
         match self.tensor_type(name)? {
-            GgufType::F32 | GgufType::F16 => {}
+            GgufType::F32 | GgufType::F16 | GgufType::BF16 => {}
             ty => return Err(Error::DType(format!("{name}: {ty:?} is packed"))),
         }
         let (ty, _, bytes) = self.bytes(name)?;
@@ -370,6 +374,12 @@ impl Gguf {
                 .0
                 .iter()
                 .map(|b| f32::from_le_bytes(*b))
+                .collect(),
+            GgufType::BF16 => bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| f32::from(tessera_engine::Bf16(u16::from_le_bytes(*b))))
                 .collect(),
             _ => tessera_engine::F16::floats(&bytes),
         })
@@ -382,6 +392,7 @@ impl Offer for Gguf {
         let stored = |ty: GgufType| match ty {
             GgufType::F32 => Stored::F32,
             GgufType::F16 => Stored::F16,
+            GgufType::BF16 => Stored::BF16,
             GgufType::Q8_0 => Stored::Form(&block::Q8_0),
             GgufType::Q4_0 => Stored::Form(&block::Q4_0),
         };
