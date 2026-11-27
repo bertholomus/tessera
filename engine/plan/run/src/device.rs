@@ -4,7 +4,7 @@ use crate::Error;
 use crate::cache::{GraphKey, GraphSet, Lru, MAX_GRAPHS, MAX_PLANS, Prepared, store_graph};
 use crate::grid::{self, Grid};
 use crate::held::{Holds, KvStage};
-use crate::kernels::Kernels;
+use crate::kernels::{self, Kernels};
 use crate::lanes::LaneSync;
 use crate::marks;
 use crate::overrides::{self, Overrides};
@@ -13,18 +13,20 @@ use crate::profile::Marks;
 use crate::rank::{Capture, Sum, grid_cross};
 use crate::run::{Base, Reload, Run};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::Instant;
 use tessera_codegen::Dialect;
 use tessera_engine_settings::{Memory, Settings};
 use tessera_gpukit::backend::OnGpu;
-use tessera_gpukit::device::{Device, DeviceBuffer, cached_context, cached_source};
+use tessera_gpukit::device::{Device, DeviceBuffer, KernelAttrs, cached_context, cached_source};
 use tessera_gpukit::launch::{KernelArgs, Launch, launch_1d, launch_grid};
 use tessera_lower::kernels::crosses;
 use tessera_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot};
 use tessera_mem::{Buffer, DType};
+
+mod timing;
 
 pub(crate) struct Runner<D: Device> {
     ctx: &'static D,
@@ -65,6 +67,12 @@ pub(crate) struct Runner<D: Device> {
     grid: RefCell<Option<Box<dyn Grid>>>,
     /// Which steps a persistent grid runs.
     resident: Vec<bool>,
+    /// Compiled resource counts and occupancy for each step.
+    attrs: Vec<Option<KernelAttrs>>,
+    /// Whether load-time spill notices print without active profiling.
+    log_attrs: bool,
+    /// Spilling kernel entries already reported on load.
+    spills: HashSet<String>,
     /// Hot-cold expert weight pager, opened on VRAM overflow.
     pager: Option<Pager<D>>,
     /// Pinned host staging buffer for batched KV transfers.
@@ -116,6 +124,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             gated: Cell::new(0),
             grid: RefCell::new(None),
             resident: Vec::new(),
+            attrs: Vec::new(),
+            log_attrs: settings.profile.is_some() || settings.kernels.is_some(),
+            spills: HashSet::new(),
             pager: None,
             kv_stage: None,
         };
@@ -161,6 +172,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             uses: std::mem::take(&mut self.uses),
             waits: std::mem::take(&mut self.waits),
             resident: std::mem::take(&mut self.resident),
+            attrs: std::mem::take(&mut self.attrs),
         };
         self.plans.insert(id, saved);
     }
@@ -174,6 +186,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         self.uses = cached.uses;
         self.waits = cached.waits;
         self.resident = cached.resident;
+        self.attrs = cached.attrs;
     }
 
     /// Each argument by position, in the device's form.
@@ -276,88 +289,6 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         }
     }
 
-    /// Each step's seconds by waiting, or `None` when stamped.
-    fn walk(&self, steps: Range<usize>) -> Result<Option<Vec<f64>>, Error> {
-        let stamped = self.ctx.stamp()?;
-        let mut waited = Vec::new();
-        for i in steps {
-            let start = Instant::now();
-            for launch in self.base.launches(i)? {
-                self.launch(i, &launch)?;
-            }
-            match stamped {
-                true => _ = self.ctx.stamp()?,
-                false => {
-                    let clocked = self.ctx.finish()?;
-                    waited.push(clocked.unwrap_or_else(|| start.elapsed().as_secs_f64()));
-                }
-            }
-        }
-        Ok((!stamped).then_some(waited))
-    }
-
-    /// Opens the gate, then reads stamps. Errors discard stamps.
-    fn opened<T>(&self, done: Result<T, Error>) -> Result<(T, Vec<f64>), Error> {
-        self.open();
-        match done {
-            Ok(done) => Ok((done, self.ctx.stamps()?)),
-            Err(e) => {
-                _ = self.ctx.stamps();
-                Err(e)
-            }
-        }
-    }
-
-    fn grid_marks(&mut self) -> Vec<(String, Marks)> {
-        self.grid
-            .get_mut()
-            .as_mut()
-            .map_or_else(Vec::new, |g| g.take_marks())
-    }
-
-    /// Times each step by device stamps, else by waiting.
-    fn profiled(&mut self, steps: Range<usize>) -> Result<(), Error> {
-        self.close()?;
-        let walked = self.walk(steps.clone());
-        let (waited, stamps) = self.opened(walked)?;
-        for (i, s) in steps.zip(waited.unwrap_or(stamps)) {
-            self.note_step(i, s);
-        }
-        for (entry, found) in self.grid_marks() {
-            for region in &found.regions {
-                let (middle, _) = region.spread();
-                let label = format!("mark {entry}: L{}-L{}", region.from, region.to);
-                self.note(&label, middle);
-            }
-        }
-        Ok(())
-    }
-
-    /// Runs `work`, optionally waiting. Returns the device's seconds.
-    fn waited(
-        &self,
-        wait: bool,
-        timed: bool,
-        work: impl FnOnce(&Self) -> Result<(), Error>,
-    ) -> Result<Option<f64>, Error> {
-        if !wait || !timed {
-            work(self)?;
-            return Ok(if wait { self.ctx.finish()? } else { None });
-        }
-        self.close()?;
-        let stamped = self.ctx.stamp().map_err(Error::from).and_then(|stamped| {
-            work(self)?;
-            if stamped {
-                self.ctx.stamp()?;
-            }
-            Ok(stamped)
-        });
-        match self.opened(stamped)? {
-            (true, stamps) => Ok(stamps.first().copied()),
-            (false, _) => Ok(self.ctx.finish()?),
-        }
-    }
-
     /// Drains the device stream.
     pub(crate) fn finish_ctx(&self) -> Result<(), Error> {
         self.ctx.finish().map(|_| ()).map_err(Into::into)
@@ -370,36 +301,6 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             && self.ctx.graphs()
             && !self.resident[steps.clone()].contains(&true)
             && self.base.plan.id != 0
-    }
-
-    fn flush_stamps(&mut self) -> Result<(), Error> {
-        let Some(stamps) = &mut self.stamps else {
-            return Ok(());
-        };
-        stamps.flush(self.ctx, &self.base.plan, self.base.profile.as_mut())
-    }
-
-    fn ensure_stamps(
-        &mut self,
-        len: usize,
-        sums: &mut Option<&mut (dyn Sum + 'static)>,
-    ) -> Result<(), Error> {
-        let need = self.stamps.as_ref().is_none_or(|s| s.needs_grow(len));
-        if !need {
-            return Ok(());
-        }
-        self.flush_stamps()?;
-        if let Some(grid) = sums.as_deref_mut() {
-            grid.pause()?;
-        }
-        match &mut self.stamps {
-            Some(stamps) => {
-                stamps.grow(self.ctx, len)?;
-                self.clear_graphs();
-            }
-            None => self.stamps = Some(marks::Stamps::open(self.ctx, len)?),
-        }
-        Ok(())
     }
 
     /// Promotes hot experts after a completed full-plan step.
@@ -553,7 +454,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     fn reread(&mut self) -> Result<(), Error> {
         let found = self.reload()?;
         for reload in &found {
-            eprintln!("tessera: {reload}");
+            kernels::log_reload(reload, &self.entries, &self.attrs);
         }
         self.missed.extend(found);
         Ok(())
@@ -575,6 +476,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             // Recorded launches name the kernels they replaced.
             self.clear_graphs();
             self.apply();
+            self.attrs = kernels::step_attrs(ctx, &self.base.plan, &self.kernels, &self.resident);
             self.sync_grid();
         }
         Ok(reloads)
@@ -751,6 +653,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             self.stash_plan();
             self.restore_plan(cached);
             self.apply();
+            if self.overrides.is_some() {
+                self.attrs = kernels::step_attrs(ctx, plan, &self.kernels, &self.resident);
+            }
             self.sync_grid();
             self.ready(plan)?;
             return Ok(());
@@ -785,6 +690,10 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         self.resident = resident;
         self.index(plan);
         self.apply();
+        self.attrs = kernels::step_attrs(ctx, plan, &self.kernels, &self.resident);
+        if self.log_attrs || self.base.profile.is_some() {
+            kernels::log_spills(plan, &self.attrs, &mut self.spills);
+        }
         self.sync_grid();
         self.ready(plan)?;
         self.base.adopt(plan);
