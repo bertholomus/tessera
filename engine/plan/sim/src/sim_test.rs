@@ -1,4 +1,4 @@
-use crate::known::{generic, known, m3_pro};
+use crate::known::{generic, known, m3_pro, m4};
 use crate::nvidia::gb10;
 use crate::{Chip, Fit, Limit, Pool, Tag};
 use tessera_work::{Load, Ops};
@@ -143,6 +143,8 @@ fn known_chips_stream() {
     }
     assert_eq!(known("cuda NVIDIA GB10").unwrap().name(), gb10().name);
     assert_eq!(known("metal Apple M3 Pro").unwrap().name(), m3_pro().name);
+    assert_eq!(known("metal Apple M4").unwrap().name(), m4().name);
+    assert!(generic("metal", "metal Apple M4 Pro", 20, 2.73e11, 32768).is_some());
     assert!(known("rocm HIP device 0").is_none());
     let gpu = generic("cuda", "cuda Test", 188, 1.79e12, 48 * 1024).unwrap();
     assert_eq!(gpu.name(), "cuda Test");

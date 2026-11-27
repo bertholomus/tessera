@@ -6,9 +6,17 @@ use crate::{Chip, Fit, Pool};
 /// The name an Apple M3 Pro reports through Metal.
 const M3_PRO: &str = "metal Apple M3 Pro";
 
+/// The name an Apple M4 reports through Metal.
+const M4: &str = "metal Apple M4";
+
 /// An Apple M3 Pro, through Metal. Its step varies twofold.
 pub fn m3_pro() -> Pool {
     m3_pro_fit().pool(M3_PRO)
+}
+
+/// An Apple M4, through Metal.
+pub(crate) fn m4() -> Pool {
+    m4_fit().pool(M4)
 }
 
 /// Registers and group memory share one store per core.
@@ -38,14 +46,28 @@ fn m3_pro_fit() -> Fit {
     }
 }
 
+/// Apple M4 constants from Metal micro-probes.
+fn m4_fit() -> Fit {
+    let mut f = m3_pro_fit();
+    (f.floor, f.spawn, f.step, f.curve) = (2.8e-6, 3.1e-11, 2.5e-8, 1.24e-8);
+    (f.rate, f.wait, f.near, f.cached) = (3.65e11, 2.56e-7, 5.7e-8, 7.8e11);
+    (f.read, f.scan, f.write, f.tile, f.cores) = (1.02e11, 7.5e10, 9.0e10, 3.08e12, 10.0);
+    (f.shared, f.mma) = (2.3e-8, 4.0e-10);
+    f
+}
+
 /// The table's constants for a pool device, if any.
 pub(crate) fn fit(device: &str) -> Option<Fit> {
-    (device == M3_PRO).then(m3_pro_fit)
+    match device {
+        M3_PRO => Some(m3_pro_fit()),
+        M4 => Some(m4_fit()),
+        _ => None,
+    }
 }
 
 /// The table for a runner's device name. ROCm names none.
 pub fn known(device: &str) -> Option<Box<dyn Chip>> {
-    let chips: [Box<dyn Chip>; 2] = [Box::new(gb10()), Box::new(m3_pro())];
+    let chips: [Box<dyn Chip>; 3] = [Box::new(gb10()), Box::new(m3_pro()), Box::new(m4())];
     chips.into_iter().find(|c| c.name() == device)
 }
 
@@ -68,7 +90,11 @@ pub fn generic(
             group_bytes,
         ))),
         "metal" | "rocm" => {
-            let mut fit = m3_pro_fit();
+            let mut fit = if backend == "metal" {
+                m4_fit()
+            } else {
+                m3_pro_fit()
+            };
             let scale = units as f64 / fit.cores;
             fit.cores = units as f64;
             fit.read = bandwidth * 0.85;
