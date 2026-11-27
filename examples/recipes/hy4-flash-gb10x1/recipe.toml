@@ -1,0 +1,14 @@
+# Hy4-flash exlr8 k4 for 1x GB10 at 4x 1M context.
+name = "hy4-flash-gb10x1"
+about = "Hy4-flash exlr8 k4 for 1x GB10 (128 GB) with 4M pooled FP8 KV"
+
+[weights]
+path = "weights"
+
+[serve]
+task = "generate"
+manifest = "k4"
+max_model_len = 1048576
+slots = 4
+kv_dtype = "fp8"
+kv_cache_tokens = 4194304

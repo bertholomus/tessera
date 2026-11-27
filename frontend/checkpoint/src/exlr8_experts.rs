@@ -56,6 +56,13 @@ impl Widths {
         self.map.clear();
     }
 
+    pub(crate) fn layers(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = self.map.keys().map(|&(l, _, _)| l).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Width for `(layer, shared, proj)`, falling back to `default`.
     pub(crate) fn get(&self, layer: usize, shared: bool, proj: Proj, default: u32) -> u32 {
         if let Some(&k) = self.map.get(&(layer, shared, proj)) {
@@ -185,13 +192,14 @@ pub(crate) fn target(local: &str) -> Option<(bool, Proj)> {
     Some((shared, Proj::named(head)?))
 }
 
-/// Hidden width, expert count and expert width, from the index.
-pub(crate) fn sizes(idx: &File, gate_k: u32) -> Option<[usize; 3]> {
+/// Routed and shared widths, experts, and ffn from index.
+pub(crate) fn sizes(idx: &File, gate_k: u32) -> Option<[usize; 4]> {
     let hidden = idx.shape("signs.in")?[0];
+    let shared_hidden = idx.shape("shared.signs.in").map_or(hidden, |s| s[0]);
     let &[experts, ffn] = idx.shape(&format!("k{gate_k}.gate.svh"))? else {
         return None;
     };
-    Some([hidden, experts, ffn])
+    Some([hidden, shared_hidden, experts, ffn])
 }
 
 /// A projection's codebook, from its codes file tensor names.
@@ -208,7 +216,7 @@ pub(crate) fn offered(
     gate_k: u32,
     forms: Forms,
 ) -> Vec<Slice> {
-    let Some([hidden, experts, ffn]) = sizes(idx, gate_k) else {
+    let Some([hidden, shared_hidden, experts, ffn]) = sizes(idx, gate_k) else {
         return Vec::new();
     };
     let at = format!("{prefix}{layer}.mlp.");
@@ -218,10 +226,10 @@ pub(crate) fn offered(
         stored,
     };
     let mut out = Vec::new();
-    for (p, shape) in [
-        (Proj::Gate, [ffn, hidden]),
-        (Proj::Up, [ffn, hidden]),
-        (Proj::Down, [hidden, ffn]),
+    for (p, shape, shared_shape) in [
+        (Proj::Gate, [ffn, hidden], [ffn, shared_hidden]),
+        (Proj::Up, [ffn, hidden], [ffn, shared_hidden]),
+        (Proj::Down, [hidden, ffn], [shared_hidden, ffn]),
     ] {
         let name = p.name();
         let [rows, cols] = shape;
@@ -238,8 +246,18 @@ pub(crate) fn offered(
             let stem = format!("shared_experts.{name}_proj");
             out.push(slice(
                 format!("{stem}.weight"),
-                vec![rows, cols],
+                shared_shape.to_vec(),
                 Stored::Form(shared[p as usize]),
+            ));
+            out.push(slice(
+                format!("{stem}.suh"),
+                vec![shared_shape[1]],
+                Stored::F32,
+            ));
+            out.push(slice(
+                format!("{stem}.svh"),
+                vec![shared_shape[0]],
+                Stored::F32,
             ));
         }
     }
@@ -255,8 +273,8 @@ fn repeated(values: &[f32]) -> Vec<f32> {
 }
 
 /// The layer's signs, as floats.
-fn signs(idx: &File, which: &str) -> Result<Vec<f32>, Error> {
-    let bytes = idx.bytes(&format!("signs.{which}"))?;
+fn signs(idx: &File, prefix: &str, which: &str) -> Result<Vec<f32>, Error> {
+    let bytes = idx.bytes(&format!("{prefix}signs.{which}"))?;
     Ok(bytes.iter().map(|b| f32::from(*b as i8)).collect())
 }
 
@@ -264,12 +282,17 @@ fn signs(idx: &File, which: &str) -> Result<Vec<f32>, Error> {
 pub(crate) fn floats(idx: &File, local: &str, k: u32) -> Result<Vec<f32>, Error> {
     let half = |name: String| idx.floats(&name);
     let signed = |which: &str, v: Vec<f32>| -> Result<Vec<f32>, Error> {
-        let s = signs(idx, which)?;
+        let prefix = if idx.shape(&format!("shared.signs.{which}")).is_some() {
+            "shared."
+        } else {
+            ""
+        };
+        let s = signs(idx, prefix, which)?;
         Ok(v.iter().zip(s).map(|(a, b)| a * b).collect())
     };
     match local {
-        "experts.signs_in" => signs(idx, "in"),
-        "experts.signs_out" => signs(idx, "out"),
+        "experts.signs_in" => signs(idx, "", "in"),
+        "experts.signs_out" => signs(idx, "", "out"),
         "experts.gate.su" | "experts.up.su" => {
             let p = &local["experts.".len()..local.len() - 3];
             Ok(repeated(&half(format!("k{k}.{p}.su_block"))?))
@@ -302,7 +325,7 @@ pub(crate) fn floats(idx: &File, local: &str, k: u32) -> Result<Vec<f32>, Error>
 pub(crate) fn packed(
     codes: &File,
     local: &str,
-    [hidden, experts, ffn]: [usize; 3],
+    [routed_hidden, shared_hidden, experts, ffn]: [usize; 4],
     k: u32,
     slice: Option<(u32, usize, usize)>,
 ) -> Result<Vec<u8>, Error> {
@@ -314,6 +337,7 @@ pub(crate) fn packed(
             (false, rest.strip_suffix(".weight").ok_or_else(missing)?)
         }
     };
+    let hidden = if tensor { shared_hidden } else { routed_hidden };
     let head = if tensor { "shared." } else { "" };
     let name = coded(codes, &format!("{head}trellis.{p}"))?.0;
     let matrix = (hidden * ffn * k as usize / 8) as u64;

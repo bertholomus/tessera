@@ -918,17 +918,35 @@ impl Offer for Release {
             return out;
         };
         // Routed layers keep their experts apart.
+        let mut layers = dense.experts.layers();
+        for s in &out {
+            if let Some(n) = s
+                .name
+                .strip_prefix(&dense.prefix)
+                .and_then(|r| r.split('.').next())
+                .and_then(|d| d.parse::<usize>().ok())
+            {
+                layers.push(n);
+            }
+        }
         for layer in 0.. {
-            let index = experts::index_file(layer);
-            let has_index = self.with(&index, |_| Ok(())).is_ok();
+            let has_idx = self.with(&experts::index_file(layer), |_| Ok(())).is_ok();
             let has_dense = dense.single.is_none()
                 && self
                     .with(&format!("dense/exlr8-dense-{layer:03}"), |_| Ok(()))
                     .is_ok();
-            if !has_index && !has_dense {
+            if !has_idx && !has_dense {
                 break;
             }
-            if !has_index {
+            if has_idx {
+                layers.push(layer);
+            }
+        }
+        layers.sort_unstable();
+        layers.dedup();
+        for layer in layers {
+            let index = experts::index_file(layer);
+            if self.with(&index, |_| Ok(())).is_err() {
                 continue;
             }
             let Some(forms) = self.expert_forms(layer) else {

@@ -79,6 +79,39 @@ pub fn rules(c: &Config, rotated: bool) -> Vec<Rule> {
             rules.push((format!("{dst}.base"), format!("{src}.hc_base")));
             rules.push((format!("{dst}.scale"), format!("{src}.hc_scale")));
         }
+        if let Some(slot) = c.engram_slot(l) {
+            let ep = format!("engram.{slot}");
+            let src = format!("{at}.engram_layer");
+            rules.push((
+                format!("{ep}.head_norms"),
+                format!("{src}.lookup_per_head_norms.{{}}"),
+            ));
+            rules.push((format!("{ep}.val_w"), format!("{src}.value_proj")));
+            rules.push((format!("{ep}.val_b"), format!("{src}.value_proj.bias")));
+            rules.push((
+                format!("{ep}.pre_gamma"),
+                format!("{src}.unified_pre_gamma"),
+            ));
+            for hc in 0..c.hc_mult as usize {
+                rules.push((format!("{ep}.key_w.{hc}"), format!("{src}.key_projs.{hc}")));
+                rules.push((
+                    format!("{ep}.key_b.{hc}"),
+                    format!("{src}.key_projs.{hc}.bias"),
+                ));
+                rules.push((
+                    format!("{ep}.norm_key.{hc}"),
+                    format!("{src}.norm_key.{hc}"),
+                ));
+                rules.push((
+                    format!("{ep}.norm_query.{hc}"),
+                    format!("{src}.norm_query.{hc}"),
+                ));
+                rules.push((
+                    format!("{ep}.hc_scales.{hc}"),
+                    format!("{src}.unified_per_hc_scales.{hc}"),
+                ));
+            }
+        }
         let ap = if c.swa_pattern[l] {
             let p = format!("swa.{si}");
             si += 1;

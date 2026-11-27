@@ -1,0 +1,16 @@
+# Hy4-flash exlr8 k4 across 2x GB10 at 8x 1M context.
+name = "hy4-flash-gb10x2"
+about = "Hy4-flash exlr8 k4 for 2x GB10 TP=2 with 8M pooled FP8 KV"
+
+[weights]
+path = "weights"
+
+[serve]
+task = "generate"
+manifest = "k4"
+max_model_len = 1048576
+slots = 8
+kv_dtype = "fp8"
+kv_cache_tokens = 8388608
+moe = "tp"
+sums = "arx"
