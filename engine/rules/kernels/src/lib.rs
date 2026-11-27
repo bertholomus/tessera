@@ -17,6 +17,7 @@ mod log_scale;
 mod mask;
 mod mean;
 mod neighbours;
+mod radix;
 mod rms_norm;
 mod rope;
 mod softmax;
