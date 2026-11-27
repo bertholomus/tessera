@@ -1,6 +1,6 @@
 //! Generic continuous-batching MTP and dual speculative decoding.
 
-use crate::batch_dual::{DualPeer, PROMOTE_MIN_REM, push_tail};
+use crate::batch_dual::{DualPeer, push_tail};
 use crate::dual::DualState;
 use crate::kept::Kept;
 use crate::mtp_draft::{MtpDrafter, MtpJob, draft_mtp_batch, take_cols};
@@ -21,6 +21,10 @@ const BATCH_STEP_TAG: u32 = 2;
 
 /// Default maximum rows per prefill chunk.
 pub(crate) const DEFAULT_CHUNK: usize = tessera_device::FAST_MAX_ROWS;
+
+mod mode;
+#[cfg(test)]
+mod mode_test;
 
 /// Shared coordinator and follower lifecycle for batched speculative loops.
 pub(crate) trait RoundHost<'a> {
@@ -452,6 +456,7 @@ pub struct BatchMtp<'a> {
     pub(crate) prefilling: VecDeque<PrefillSeq>,
     pub(crate) active: Vec<ActiveSeq>,
     pub(crate) reuse: bool,
+    mode: Box<dyn mode::Mode>,
 }
 
 impl<'a> BatchMtp<'a> {
@@ -479,6 +484,7 @@ impl<'a> BatchMtp<'a> {
             prefilling: VecDeque::new(),
             active: Vec::new(),
             reuse: false,
+            mode: Box::new(mode::Lone::default()),
         })
     }
 
@@ -624,10 +630,7 @@ impl BatchMtp<'_> {
             if self.prefilling.len() == 1 && self.prefilling[0].solo_mode {
                 self.demote_prefill()?;
             }
-            let solo_admit = self.dual.is_some()
-                && self.active.is_empty()
-                && self.prefilling.is_empty()
-                && admitted.len() == 1;
+            let solo_admit = self.dual.is_some() && self.mode.solo(self.flight(), admitted.len());
             let can_reuse = self.can_reuse();
             let page = self.core.target.lanes.as_ref().map_or(0, |l| l.page);
             for mut item in admitted {
@@ -707,7 +710,10 @@ impl BatchMtp<'_> {
                         seq.m_tap_buf.extend_from_slice(&mt);
                     }
                 } else {
-                    if self.active.len() + self.prefilling.len() < 2 {
+                    if self
+                        .mode
+                        .tail(self.active.len() + self.prefilling.len() + 1)
+                    {
                         let dt = self.read_dual_d_taps(&taps, len)?;
                         push_tail(&mut seq.d_buf, &dt, d_w);
                     }
@@ -757,7 +763,9 @@ impl BatchMtp<'_> {
             return Ok(());
         }
         if let Some((d_w, _)) = dual_widths
-            && self.active.len() + self.prefilling.len() < 2
+            && self
+                .mode
+                .tail(self.active.len() + self.prefilling.len() + 1)
         {
             let dt = self.read_dual_d_taps(&taps, len)?;
             push_tail(&mut seq.d_buf, &dt, d_w);
@@ -833,13 +841,15 @@ impl BatchMtp<'_> {
             }
         }
         let survivors = finished.iter().filter(|&&f| !f).count();
-        let promote = survivors == 1
-            && self.prefilling.is_empty()
-            && jobs.len() == 1
+        let flight = mode::Flight {
+            active: survivors,
+            prefilling: self.prefilling.len(),
+        };
+        let promote = jobs.len() == 1
             && dual_info.is_some_and(|(_, block)| {
                 let seq = &self.active[jobs[0].active_idx];
-                let rem = seq.request.max_tokens.saturating_sub(seq.emitted);
-                seq.start + block <= self.core.max_ctx && rem >= PROMOTE_MIN_REM
+                let left = seq.request.max_tokens.saturating_sub(seq.emitted);
+                seq.start + block <= self.core.max_ctx && self.mode.promote(flight, left)
             });
         if promote {
             let job = jobs.remove(0);
@@ -851,7 +861,7 @@ impl BatchMtp<'_> {
             self.promote_solo(job, &m_all)?;
         } else if !jobs.is_empty() {
             if let Some((d_w, _)) = dual_info
-                && survivors + self.prefilling.len() <= 2
+                && self.mode.tail(survivors + self.prefilling.len())
             {
                 let d_all = self.read_dual_d_taps(&raw_taps, rows.len())?;
                 for job in &jobs {
