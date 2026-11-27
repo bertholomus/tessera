@@ -34,9 +34,53 @@ fn uncached(path: &Path) -> Option<fs::File> {
     open.read(true).custom_flags(DIRECT?).open(path).ok()
 }
 
+/// True when `file` resides on a local macOS mount.
+#[cfg(target_os = "macos")]
+pub(crate) fn is_local(file: &fs::File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    const MNT_LOCAL: u32 = 0x0000_1000;
+    #[repr(C)]
+    struct StatFs {
+        f_bsize: u32,
+        f_iosize: i32,
+        f_blocks: u64,
+        f_bfree: u64,
+        f_bavail: u64,
+        f_files: u64,
+        f_ffree: u64,
+        f_fsid: [i32; 2],
+        f_owner: u32,
+        f_type: u32,
+        f_flags: u32,
+        f_fssubtype: u32,
+        f_fstypename: [u8; 16],
+        f_mntonname: [u8; 1024],
+        f_mntfromname: [u8; 1024],
+        f_flags_ext: u32,
+        f_reserved: [u32; 7],
+    }
+    unsafe extern "C" {
+        fn fstatfs(fd: i32, buf: *mut StatFs) -> i32;
+    }
+    let mut st = std::mem::MaybeUninit::<StatFs>::zeroed();
+    let rc = unsafe { fstatfs(file.as_raw_fd(), st.as_mut_ptr()) };
+    if rc != 0 {
+        return true;
+    }
+    let st = unsafe { st.assume_init() };
+    (st.f_flags & MNT_LOCAL) != 0
+}
+
+/// Non-macOS targets keep threaded reads.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn is_local(_file: &fs::File) -> bool {
+    true
+}
+
 pub(crate) struct Disk {
     path: PathBuf,
     cached: fs::File,
+    local: bool,
     /// Opened on the first direct read.
     direct: OnceLock<Option<fs::File>>,
     /// Free staging buffers, kept for the next read.
@@ -45,21 +89,27 @@ pub(crate) struct Disk {
 
 impl Disk {
     pub(crate) fn new(path: &Path, cached: fs::File) -> Self {
+        let local = is_local(&cached);
         Self {
             path: path.to_path_buf(),
             cached,
+            local,
             direct: OnceLock::new(),
             stages: Mutex::new(Vec::new()),
         }
     }
 
-    /// Fills `into` from byte `at`. Long reads use several threads.
+    /// Fills `into` from `at`, single-stream on remote macOS mounts.
     pub(crate) fn read(&self, at: u64, into: &mut [u8], reads: Reads) -> io::Result<()> {
         let direct = match reads {
             Reads::Cached => None,
             Reads::Direct => self.direct.get_or_init(|| uncached(&self.path)).as_ref(),
         };
-        let threads = (into.len() / SHARE).clamp(1, READERS);
+        let threads = if self.local {
+            (into.len() / SHARE).clamp(1, READERS)
+        } else {
+            1
+        };
         if threads == 1 {
             return self.fill(at, into, direct);
         }
