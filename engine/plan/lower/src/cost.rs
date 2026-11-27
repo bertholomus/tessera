@@ -1,7 +1,8 @@
 //! Launch costs on one device, from timed samples.
 
+use crate::abi::Source;
 use crate::form::Pins;
-use crate::kernel::Kernel;
+use crate::kernel::{Kernel, KernelRef};
 use crate::kernels::{crosses, moved};
 use crate::plan::{Plan, Step};
 use crate::recipe::{Compute, Knobs, Recipe, Scoped};
@@ -98,29 +99,50 @@ pub struct Device {
     memo: RefCell<Memo>,
 }
 
-/// Source hash for `step`, cached by its printed kernel.
-fn source_hash(step: &Step, kernel: &str) -> u64 {
-    static HASHES: OnceLock<Mutex<HashMap<(&'static str, String), u64>>> = OnceLock::new();
-    let cache = HASHES.get_or_init(Mutex::default);
-    let key = (step.kernel.name(), kernel.to_string());
-    if let Some(&hash) = cache.lock().expect("source hashes").get(&key) {
-        return hash;
+type FixedKey = (usize, usize, [(usize, usize); Backend::ALL.len()]);
+type FixedIds = HashMap<FixedKey, (Arc<str>, u64)>;
+
+/// Cached `(entry, source_hash)` for `k`, distinguishing variants and sources.
+pub fn kernel_identity(k: &dyn Kernel) -> (Arc<str>, u64) {
+    static FIXED_IDS: OnceLock<Mutex<FixedIds>> = OnceLock::new();
+    let source = k.source();
+    match &source {
+        Source::Fixed { text, entry } => {
+            let fk = (
+                entry.as_ptr() as usize,
+                entry.len(),
+                text.0.map(|s| (s.as_ptr() as usize, s.len())),
+            );
+            let cache = FIXED_IDS.get_or_init(Mutex::default);
+            if let Some(id) = cache.lock().expect("kernel ids").get(&fk) {
+                return id.clone();
+            }
+            let id: (Arc<str>, u64) = (Arc::from(*entry), source.hash());
+            cache.lock().expect("kernel ids").insert(fk, id.clone());
+            id
+        }
+        Source::Made(body) => (Arc::from(body.entry.as_str()), source.hash()),
     }
-    let hash = step.kernel.source().hash();
-    cache.lock().expect("source hashes").insert(key, hash);
-    hash
+}
+
+/// Entry symbol name for `k` without hashing generated source.
+pub(crate) fn kernel_entry(k: &dyn Kernel) -> Arc<str> {
+    match k.source() {
+        Source::Fixed { entry, .. } => Arc::from(entry),
+        Source::Made(body) => Arc::from(body.entry),
+    }
 }
 
 /// A timed launch of `step`.
 fn sample(step: &Step, seconds: f64) -> Sample {
     let (sizes, work) = (step.kernel.sizes(), step.kernel.work(step.write.len));
     let kernel = format!("{:?}", step.kernel);
-    let source = source_hash(step, &kernel);
+    let (_, source) = step.kernel.identity();
     Sample::new(kernel, source, sizes, work, seconds)
 }
 
-/// Seconds by zone kind, kernel name, sizes, work and coldness.
-type Memo = HashMap<(ZoneKind, &'static str, Vec<usize>, u64, bool), f64>;
+/// Seconds by zone, name, entry, source, sizes, work, coldness.
+type Memo = HashMap<(ZoneKind, &'static str, Arc<str>, u64, Vec<usize>, u64, bool), f64>;
 
 /// Each generation is handed out once per process.
 static GENERATIONS: AtomicU64 = AtomicU64::new(1);
@@ -437,7 +459,19 @@ impl Device {
     /// Seconds for one launch in `zone`. Cold ones stream weights.
     pub fn seconds_in(&self, zone: u32, k: &dyn Kernel, len: usize, cold: bool) -> f64 {
         match (zone, self.cluster.kind(zone as usize)) {
-            (0, kind) | (_, kind @ ZoneKind::Cpu) => self.estimate(kind, k, len, cold),
+            (0, kind) | (_, kind @ ZoneKind::Cpu) => {
+                self.estimate_with(kind, k, || kernel_identity(k), len, cold)
+            }
+            _ => FIXED + k.guess() * k.work(len),
+        }
+    }
+
+    /// Seconds for one launch using a kernel's cached identity.
+    pub(crate) fn seconds_ref(&self, zone: u32, k: &KernelRef, len: usize, cold: bool) -> f64 {
+        match (zone, self.cluster.kind(zone as usize)) {
+            (0, kind) | (_, kind @ ZoneKind::Cpu) => {
+                self.estimate_with(kind, &**k, || k.identity(), len, cold)
+            }
             _ => FIXED + k.guess() * k.work(len),
         }
     }
@@ -460,19 +494,35 @@ impl Device {
     }
 
     /// Seconds from the samples of zones of `kind`.
-    fn estimate(&self, kind: ZoneKind, k: &dyn Kernel, len: usize, cold: bool) -> f64 {
+    fn estimate_with(
+        &self,
+        kind: ZoneKind,
+        k: &dyn Kernel,
+        identity: impl FnOnce() -> (Arc<str>, u64),
+        len: usize,
+        cold: bool,
+    ) -> f64 {
         if self.barred.iter().any(|b| b == k.name()) {
             return f64::INFINITY;
         }
         let work = k.work(len);
-        let key = (kind, k.name(), k.sizes(), work.to_bits(), cold);
+        let (entry, source) = identity();
+        let key = (
+            kind,
+            k.name(),
+            entry,
+            source,
+            k.sizes(),
+            work.to_bits(),
+            cold,
+        );
         if let Some(seconds) = self.memo.borrow().get(&key) {
             return *seconds;
         }
         // A host zone beside a GPU has its own samples.
         let own = kind == self.cluster.kind(0);
         let timed = if own { &self.timed } else { &self.host };
-        let near = timed.estimate(k.name(), &key.2, work, cold);
+        let near = timed.estimate(k.name(), Some(source), &key.4, work, cold);
         // With no sample of this kernel, the chip model speaks.
         let chip = self.model.as_ref().filter(|_| own);
         let modelled = || Some(chip?.estimate(&k.load(len)?).seconds);
@@ -502,7 +552,7 @@ impl Device {
                 "gather_rows" => self.half_ring(step.write.bytes()),
                 _ => self.all_reduce(moved(&*step.kernel, step.write.len, step.write.bytes())),
             },
-            None => Some(self.seconds_in(step.zone, &*step.kernel, step.write.len, cold)),
+            None => Some(self.seconds_ref(step.zone, &step.kernel, step.write.len, cold)),
         }
     }
 
