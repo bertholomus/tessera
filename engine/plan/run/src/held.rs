@@ -348,16 +348,19 @@ impl Held {
         plan: &Plan,
         alloc: impl FnMut(u32, usize, Holds) -> Result<Buffer, Error>,
     ) -> Result<bool, Error> {
-        self.bind_sized(plan, |_, _| None, alloc)
+        let mut retired = Vec::new();
+        self.bind_sized(plan, |_, _| None, &mut retired, alloc)?;
+        Ok(!retired.is_empty())
     }
 
-    /// As `bind`, allowing custom byte spans for paged weight descriptors.
-    pub fn bind_sized(
+    /// As `bind`, appending retired buffers for caller-deferred drop.
+    pub(crate) fn bind_sized(
         &mut self,
         plan: &Plan,
         sized: impl Fn(u32, Option<u8>) -> Option<usize>,
+        retired: &mut Vec<Buffer>,
         mut alloc: impl FnMut(u32, usize, Holds) -> Result<Buffer, Error>,
-    ) -> Result<bool, Error> {
+    ) -> Result<(), Error> {
         let count = plan.buffers.len();
         let mut weights: Vec<Vec<(WeightKey, usize, usize)>> = vec![Vec::new(); count];
         for l in &plan.weights {
@@ -369,9 +372,8 @@ impl Held {
         for &(index, slot) in &plan.kept {
             kept[slot.buffer as usize].push((index, slot.start()));
         }
-        self.bound.clear();
+        let mut bound = Vec::with_capacity(count);
         let mut seen: HashMap<u32, usize> = HashMap::new();
-        let mut replaced = false;
         for (b, &bytes) in plan.buffers.iter().enumerate() {
             let zone = plan.zone(b as u32);
             let is_table = plan.table.is_some_and(|s| s.buffer as usize == b);
@@ -386,16 +388,17 @@ impl Held {
                 let slot = seen.entry(zone).or_insert(0);
                 let idx = *slot;
                 *slot += 1;
-                self.bind_scratch(zone, idx, bytes, &mut alloc, &mut replaced)?
+                self.bind_scratch(zone, idx, bytes, &mut alloc, retired)?
             };
-            self.bound.push(at);
+            bound.push(at);
         }
-        let dropped = self.compact();
+        self.bound = bound;
+        self.compact(retired);
         self.kept_spans.clear();
         for p in self.kept.values() {
             self.kept_spans.insert((p.buffer, p.offset), p.bytes);
         }
-        Ok(replaced || dropped)
+        Ok(())
     }
 
     /// Reuses a zone's `slot`-th scratch buffer, growing in place.
@@ -405,7 +408,7 @@ impl Held {
         slot: usize,
         bytes: usize,
         alloc: &mut impl FnMut(u32, usize, Holds) -> Result<Buffer, Error>,
-        replaced: &mut bool,
+        retired: &mut Vec<Buffer>,
     ) -> Result<usize, Error> {
         let slots = self.scratch.entry(zone).or_default();
         if let Some(&at) = slots.get(slot) {
@@ -414,8 +417,8 @@ impl Held {
             }
             // Scratch grows in steps, so a growing context reuses it.
             let want = bytes.max(LEAST).next_power_of_two();
-            self.all[at] = alloc(zone, want, Holds::Other)?;
-            *replaced = true;
+            let fresh = alloc(zone, want, Holds::Other)?;
+            retired.push(std::mem::replace(&mut self.all[at], fresh));
             return Ok(at);
         }
         let want = bytes.max(LEAST).next_power_of_two();
@@ -425,8 +428,8 @@ impl Held {
         Ok(at)
     }
 
-    /// Drops unreferenced buffers in `all`. True if any dropped.
-    fn compact(&mut self) -> bool {
+    /// Moves unreferenced buffers in `all` into `retired`.
+    fn compact(&mut self, retired: &mut Vec<Buffer>) {
         let mut keep = vec![false; self.all.len()];
         for places in self.weights.values() {
             for p in places {
@@ -448,7 +451,7 @@ impl Held {
             keep[at] = true;
         }
         if keep.iter().all(|&k| k) {
-            return false;
+            return;
         }
         let old = std::mem::take(&mut self.all);
         let mut remap = vec![0usize; old.len()];
@@ -456,6 +459,8 @@ impl Held {
             if keep[at] {
                 remap[at] = self.all.len();
                 self.all.push(buf);
+            } else {
+                retired.push(buf);
             }
         }
         for places in self.weights.values_mut() {
@@ -477,7 +482,6 @@ impl Held {
         for at in &mut self.bound {
             *at = remap[*at];
         }
-        true
     }
 
     /// Reuses a matching weight arena, else allocates and copies.

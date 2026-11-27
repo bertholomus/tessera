@@ -1,15 +1,74 @@
-//! Step timing by device stamps or by waiting.
+//! Step timing, deferred graph/buffer retirement, and staged reloads.
 
-use super::Runner;
+use super::{Runner, device_buf};
 use crate::Error;
+use crate::cache::Lru;
+use crate::kernels;
 use crate::marks;
+use crate::overrides::{self, Pending, Ready};
 use crate::profile::Marks;
 use crate::rank::Sum;
-use crate::run::Run;
+use crate::run::{Reload, Run};
+use std::collections::HashSet;
+use std::fmt;
 use std::ops::Range;
 use std::time::Instant;
 use tessera_gpukit::device::Device;
 use tessera_gpukit::launch::Launch;
+
+impl<D: Device> Runner<D> {
+    /// Retains owned handles when teardown cannot quiesce.
+    pub(crate) fn retain(&mut self) {
+        std::mem::forget(std::mem::replace(&mut self.graphs, Lru::new(0)));
+        std::mem::forget(std::mem::take(&mut self.evicted));
+        std::mem::forget(std::mem::take(&mut self.retired));
+        std::mem::forget(std::mem::take(&mut self.kernels));
+        std::mem::forget(std::mem::take(&mut self.planned));
+        std::mem::forget(self.overrides.take());
+        std::mem::forget(std::mem::take(&mut self.marked));
+        std::mem::forget(std::mem::take(&mut self.compiled));
+        std::mem::forget(std::mem::replace(&mut self.plans, Lru::new(0)));
+        std::mem::forget(std::mem::take(&mut self.base.held));
+        std::mem::forget(self.ledger.take());
+        std::mem::forget(self.stamps.take());
+        std::mem::forget(self.pager.take());
+        std::mem::forget(std::mem::take(&mut self.kv));
+        std::mem::forget(self.grid.get_mut().take());
+    }
+}
+
+impl<D: Device> Drop for Runner<D> {
+    fn drop(&mut self) {
+        let live = !self.graphs.is_empty()
+            || !self.evicted.is_empty()
+            || !self.retired.is_empty()
+            || !self.kernels.is_empty()
+            || !self.planned.is_empty()
+            || self.overrides.is_some()
+            || !self.marked.is_empty()
+            || !self.compiled.is_empty()
+            || !self.plans.is_empty()
+            || self.base.held.total() > 0
+            || self.ledger.is_some()
+            || self.stamps.is_some()
+            || self.pager.is_some()
+            || self.kv.stage.is_some()
+            || self.kv.host.is_some()
+            || self.grid.get_mut().is_some();
+        if !live {
+            return;
+        }
+        if self.ctx.finish().is_err() {
+            self.retain();
+            return;
+        }
+        // Drop captured graphs and grid before buffers and kernels.
+        self.graphs.clear();
+        self.evicted.clear();
+        self.retired.clear();
+        let _ = self.grid.get_mut().take();
+    }
+}
 
 impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     /// Each step's seconds by waiting, or `None` when stamped.
@@ -109,6 +168,12 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         )
     }
 
+    pub(super) fn note_cold(&mut self, phase: &str, since: Instant, detail: impl fmt::Display) {
+        let secs = since.elapsed().as_secs_f64();
+        self.note(phase, secs);
+        eprintln!("tessera: cold {phase} ({detail}) {:.2}ms", secs * 1e3);
+    }
+
     pub(super) fn ensure_stamps(
         &mut self,
         len: usize,
@@ -125,10 +190,160 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         match &mut self.stamps {
             Some(stamps) => {
                 stamps.grow(self.ctx, len)?;
-                self.clear_graphs();
+                self.clear_graphs()?;
             }
             None => self.stamps = Some(marks::Stamps::open(self.ctx, len)?),
         }
         Ok(())
+    }
+
+    /// Rejects launches while prior binding or retirement is incomplete.
+    pub(super) fn check_ready(&self) -> Result<(), Error> {
+        if self.dirty || !self.evicted.is_empty() || !self.retired.is_empty() {
+            return Err(Error::Inconsistent);
+        }
+        Ok(())
+    }
+
+    /// Drains the stream before dropping evicted graphs and retired buffers.
+    pub(super) fn finish_evicted(&mut self) -> Result<(), Error> {
+        if self.evicted.is_empty() && self.retired.is_empty() {
+            return Ok(());
+        }
+        self.ctx.finish()?;
+        // Drop graphs before freeing buffers their captures referenced.
+        self.evicted.clear();
+        self.retired.clear();
+        Ok(())
+    }
+
+    /// Pauses `sum`, evicts stale graphs, syncs, then drops retired state.
+    pub(super) fn retire(
+        &mut self,
+        sum: Option<&mut (dyn Sum + 'static)>,
+        clear_all: bool,
+    ) -> Result<(), Error> {
+        if self.retired.is_empty()
+            && self.evicted.is_empty()
+            && !(clear_all && !self.graphs.is_empty())
+        {
+            return Ok(());
+        }
+        if let Some(g) = sum {
+            g.pause()?;
+        }
+        if clear_all {
+            for set in self.graphs.drain_if(|_| true) {
+                self.evicted.extend(set.ranges.into_values());
+            }
+        } else if !self.retired.is_empty() {
+            let dead: HashSet<u64> = self
+                .retired
+                .iter()
+                .map(|b| device_buf::<D>(b).device_ptr())
+                .collect();
+            // Drop only graphs referencing retired device addresses.
+            for set in self
+                .graphs
+                .drain_if(|set| set.ptrs.iter().any(|p| dead.contains(p)))
+            {
+                self.evicted.extend(set.ranges.into_values());
+            }
+        }
+        self.finish_evicted()
+    }
+
+    /// Clears all graphs after syncing. Keeps ownership on sync error.
+    pub(super) fn clear_graphs(&mut self) -> Result<(), Error> {
+        if self.graphs.is_empty() && self.evicted.is_empty() {
+            return Ok(());
+        }
+        for set in self.graphs.drain_if(|_| true) {
+            self.evicted.extend(set.ranges.into_values());
+        }
+        if let Err(e) = self.finish_evicted() {
+            self.dirty = true;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Clears graphs from non-fallible setters without unsafe drops.
+    pub(super) fn drop_graphs(&mut self) {
+        if self.clear_graphs().is_err() {
+            self.dirty = true;
+        }
+    }
+
+    /// Recompiles changed override files after pausing any running grid.
+    pub(super) fn reload_with(
+        &mut self,
+        sum: Option<&mut (dyn Sum + 'static)>,
+    ) -> Result<Vec<Reload>, Error> {
+        let Some(files) = self.overrides.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let plan = &self.base.plan;
+        let mut pending = Vec::new();
+        for (entry, step) in &self.entries {
+            let planned = || overrides::text(&plan.steps[*step], D::BACKEND);
+            if let Some(change) = files.scan(entry, planned) {
+                pending.push(change);
+            }
+        }
+        let needs_pause = pending
+            .iter()
+            .any(|p| matches!(p, Pending::Revert { .. } | Pending::Compile { .. }));
+        if needs_pause && let Some(grid) = sum {
+            grid.pause()?;
+        }
+        let ctx = self.ctx;
+        let mut ready = Vec::with_capacity(pending.len());
+        let mut changed = false;
+        for item in pending {
+            match item {
+                Pending::Unchanged { entry, seen } => ready.push(Ready::unchanged(entry, seen)),
+                Pending::Revert { entry, path, seen } => {
+                    changed = true;
+                    ready.push(Ready::reverted(entry, path, seen));
+                }
+                Pending::Compile {
+                    entry,
+                    path,
+                    seen,
+                    text,
+                } => match ctx.compile(&format!("{}{text}", marks::OFF), &entry) {
+                    Ok(kernel) => {
+                        changed = true;
+                        ready.push(Ready::loaded(entry, path, seen, kernel, text));
+                    }
+                    Err(e) => ready.push(Ready::failed(entry, path, seen, e.to_string())),
+                },
+            }
+        }
+        if changed {
+            // Recorded launches and eager kernels must finish before unload.
+            if self.graphs.is_empty() && self.evicted.is_empty() {
+                if let Err(e) = self.ctx.finish() {
+                    self.dirty = true;
+                    return Err(e.into());
+                }
+            } else {
+                self.clear_graphs()?;
+            }
+        }
+        let files = self.overrides.as_mut().expect("checked above");
+        let mut reloads = Vec::new();
+        for item in ready {
+            if let Some(reload) = files.commit(item) {
+                reloads.push(reload);
+            }
+        }
+        if changed {
+            self.apply();
+            self.attrs = kernels::step_attrs(ctx, &self.base.plan, &self.kernels, &self.resident);
+            self.sync_grid();
+        }
+        Ok(reloads)
     }
 }
