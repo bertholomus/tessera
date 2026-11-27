@@ -281,12 +281,97 @@ fn check_manifest_widths(dir: &Path) {
     assert!(err.to_string().contains("mixed widths"));
 }
 
+fn check_latent_moe(dir: &Path) {
+    let lm = "model.layers.";
+    write(
+        &dir.join("dense/exlr8-vocab.safetensors"),
+        &[("norm.weight", "F32", vec![1], floats(&[1.0]))],
+    );
+    write(
+        &dir.join("dense/exlr8-dense.safetensors"),
+        &[
+            (
+                &format!("{lm}0.norm.weight"),
+                "F32",
+                vec![1],
+                floats(&[1.0]),
+            ),
+            (
+                &format!("{lm}1.norm.weight"),
+                "F32",
+                vec![1],
+                floats(&[2.0]),
+            ),
+        ],
+    );
+    let mk = |n, m| {
+        (0..n)
+            .map(|i| if i % m == 0 { 0xFF } else { 1 })
+            .collect::<Vec<u8>>()
+    };
+    let (rs, ss) = (mk(128, 2), mk(256, 3));
+    let mut index: Vec<Tensor> = vec![
+        ("signs.in", "I8", vec![128], rs.clone()),
+        ("signs.out", "I8", vec![128], rs),
+        ("shared.signs.in", "I8", vec![256], ss.clone()),
+        ("shared.signs.out", "I8", vec![256], ss),
+    ];
+    let mut owned: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+    for (i, end) in ENDS.iter().enumerate() {
+        let (rw, sw) = if i < 3 { (1, 2) } else { (128, 128) };
+        owned.push((format!("k4.{end}"), vec![2, rw], halves(&vec![1.5; 2 * rw])));
+        owned.push((
+            format!("shared.k4.{end}"),
+            vec![1, sw],
+            halves(&vec![2.5; sw]),
+        ));
+    }
+    for (name, shape, bytes) in &owned {
+        index.push((name, "F16", shape.clone(), bytes.clone()));
+    }
+    write(
+        &dir.join("experts/exlr8-layer-001.index.safetensors"),
+        &index,
+    );
+    let (rset, sone) = (ramp(2 * 8192, 5), ramp(16384, 9));
+    let mut names = Vec::new();
+    for proj in ["gate", "up", "down"] {
+        names.push((format!("trellis.{proj}"), rset.clone()));
+        names.push((format!("shared.trellis.{proj}"), sone.clone()));
+    }
+    let stored: Vec<Tensor> = names
+        .iter()
+        .map(|(n, b)| (n.as_str(), "U8", vec![b.len()], b.clone()))
+        .collect();
+    write(&dir.join("experts/exlr8-layer-001.k4.safetensors"), &stored);
+    let rel = Release::open(dir).width(4);
+    let slices = rel.slices();
+    let shape = |n: &str| slices.iter().find(|s| s.name == n).unwrap().shape.clone();
+    let at = "model.layers.1.mlp.";
+    assert_eq!(shape(&format!("{at}experts.gate.weight")), [2, 128, 128]);
+    assert_eq!(
+        shape(&format!("{at}shared_experts.gate_proj.weight")),
+        [128, 256]
+    );
+    assert_eq!(shape(&format!("{at}shared_experts.gate_proj.suh")), [256]);
+    assert_eq!(shape(&format!("{at}shared_experts.down_proj.svh")), [256]);
+    let suh = rel
+        .floats(&format!("{at}shared_experts.gate_proj.suh"))
+        .unwrap();
+    assert_eq!((suh.len(), suh[0], suh[1]), (256, -2.5, 2.5));
+    let svh = rel
+        .floats(&format!("{at}shared_experts.down_proj.svh"))
+        .unwrap();
+    assert_eq!((svh.len(), svh[0], svh[1]), (256, -2.5, 2.5));
+}
+
 #[test]
 fn experts_and_manifests() {
     let dir = tessera_testkit::scratch(&format!("{}-exlr8-experts", std::process::id()));
     check_single_width(&dir.join("single"));
     check_axis_slicing(&dir.join("axis"));
     check_manifest_widths(&dir.join("manifest"));
+    check_latent_moe(&dir.join("latent"));
     std::fs::remove_dir_all(dir).unwrap();
 }
 

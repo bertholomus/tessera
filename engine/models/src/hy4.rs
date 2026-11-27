@@ -12,8 +12,8 @@ use tessera_trace::hf::{
 };
 use tessera_trace::{
     Act, CalibTap, Composite, DType, Dim, DimExpr, DimName, Embed, EntryKind, Graph, Kept, Linear,
-    Linears, Mask, Model, Norm, Pairs, PathSeg, Port, Role, Size, Tensor, TensorType, Vector,
-    Weights,
+    Linears, Mask, Model, Norm, Pairs, PathSeg, Port, Role, Shape, Size, Tensor, TensorType,
+    Vector, Weights,
 };
 use tessera_trace::{mask_port, pick};
 
@@ -221,7 +221,7 @@ impl Config {
         self.swa_pattern.iter().filter(|&&s| s).count() as u64
     }
 
-    fn engram_slot(&self, layer: usize) -> Option<usize> {
+    pub fn engram_slot(&self, layer: usize) -> Option<usize> {
         let eng = self.engram.as_ref()?;
         eng.layers.iter().position(|&l| l as usize == layer)
     }
@@ -354,77 +354,101 @@ impl HyperHead {
 }
 
 /// Engram n-gram gated injection into hyper-streams.
-#[derive(Weights)]
 struct EngramBlock {
-    #[shape(ENGRAM_HEADS * ENGRAM_HEAD_DIM)]
-    head_norms: Vector,
-    #[shape(ENGRAM_DIM, Hidden)]
+    head_norms: Tensor,
     val_w: Linear,
-    #[shape(Hidden)]
     val_b: Vector,
-    #[shape(ENGRAM_DIM, HC * Hidden)]
-    key_w: Linear,
-    #[shape(HC * Hidden)]
-    key_b: Vector,
-    #[shape(HC * Hidden)]
-    norm_key: Vector,
-    #[shape(HC * Hidden)]
-    norm_query: Vector,
-    #[shape(Hidden)]
+    key_w: Vec<Linear>,
+    key_b: Vec<Vector>,
+    norm_key: Vec<Norm>,
+    norm_query: Vec<Norm>,
     pre_gamma: Vector,
-    #[shape(HC * Hidden)]
-    hc_scales: Vector,
+    hc_scales: Vec<Vector>,
+}
+
+fn declare_parts<T: Weights>(
+    m: &Model,
+    p: &mut Vec<PathSeg>,
+    name: &str,
+    n: usize,
+    shape: &[DimExpr],
+) -> Vec<T> {
+    (0..n)
+        .map(|i| {
+            p.push(PathSeg::Field(name.into()));
+            p.push(PathSeg::Index(i as u32));
+            let item = T::declare(m, p, shape);
+            p.truncate(p.len() - 2);
+            item
+        })
+        .collect()
 }
 
 impl EngramBlock {
+    fn declare(m: &Model, p: &mut Vec<PathSeg>, c: &Config) -> Self {
+        let hid: DimExpr = Hidden.into();
+        let edim: DimExpr = ENGRAM_DIM.into();
+        let hc = c.hc_mult as usize;
+        p.push(PathSeg::Field("head_norms".into()));
+        let head_norms = m.weight(
+            p,
+            TensorType::new(
+                Shape(vec![ENGRAM_HEADS.into(), ENGRAM_HEAD_DIM.into()]),
+                DType::F32,
+            ),
+        );
+        p.pop();
+        Self {
+            head_norms,
+            val_w: part(m, p, "val_w", &[edim.clone(), hid.clone()]),
+            val_b: part(m, p, "val_b", std::slice::from_ref(&hid)),
+            key_w: declare_parts(m, p, "key_w", hc, &[edim, hid.clone()]),
+            key_b: declare_parts(m, p, "key_b", hc, std::slice::from_ref(&hid)),
+            norm_key: declare_parts(m, p, "norm_key", hc, std::slice::from_ref(&hid)),
+            norm_query: declare_parts(m, p, "norm_query", hc, std::slice::from_ref(&hid)),
+            pre_gamma: part(m, p, "pre_gamma", std::slice::from_ref(&hid)),
+            hc_scales: declare_parts(m, p, "hc_scales", hc, &[hid]),
+        }
+    }
+
     fn apply(&self, c: &Config, hyper: &Tensor, raw: &Tensor, lead: &[DimExpr]) -> Tensor {
         let axis = lead.len() as u32;
-        let hc_shape = cat(lead, [HC.into(), Hidden.into()]);
         let head_shape = cat(lead, [ENGRAM_HEADS.into(), ENGRAM_HEAD_DIM.into()]);
-        let hn_w = self
-            .head_norms
-            .stored()
-            .reshape(vec![ENGRAM_HEADS.into(), ENGRAM_HEAD_DIM.into()]);
         let emb = raw
             .reshape(head_shape)
             .rms(ENGRAM_EPS)
-            .mul(&hn_w)
+            .mul(&self.head_norms)
             .reshape(cat(lead, [ENGRAM_DIM.into()]));
         let val = emb.matmul(&self.val_w).add_vector(&self.val_b);
         let main_sig = val.rms(ENGRAM_EPS).mul_vector(&self.pre_gamma);
 
-        let key = emb
-            .matmul(&self.key_w)
-            .add_vector(&self.key_b)
-            .reshape(hc_shape);
-        let nk_w = self
-            .norm_key
-            .stored()
-            .reshape(vec![HC.into(), Hidden.into()]);
-        let nq_w = self
-            .norm_query
-            .stored()
-            .reshape(vec![HC.into(), Hidden.into()]);
-        let sc_w = self
-            .hc_scales
-            .stored()
-            .reshape(vec![HC.into(), Hidden.into()]);
-        let key_n = key.rms(ENGRAM_EPS).mul(&nk_w);
-        let q_n = hyper.rms(ENGRAM_EPS).mul(&nq_w);
-        let dot = key_n
-            .mul(&q_n)
-            .mean(axis + 1)
-            .scale((c.stack.hidden as f32).sqrt());
-        let gate = dot.act(Act::SignedSqrt).act(Act::Sigmoid);
-
-        let ms_exp = main_sig
-            .reshape(cat(lead, [1u64.into(), Hidden.into()]))
-            .expand(axis, HC);
-        let g_exp = gate
-            .reshape(cat(lead, [HC.into(), 1u64.into()]))
-            .expand(axis + 1, Hidden);
-        let branch = ms_exp.mul(&sc_w);
-        hyper.add(&ms_exp.mul(&g_exp)).add(&branch)
+        let flat = cat(lead, [Hidden.into()]);
+        let scalar = cat(lead, [1u64.into()]);
+        let scale = (c.stack.hidden as f32).sqrt();
+        let mut joined: Option<Tensor> = None;
+        for hc in 0..c.hc_mult as usize {
+            let key = emb.matmul(&self.key_w[hc]).add_vector(&self.key_b[hc]);
+            let key_n = key.rms_norm(&self.norm_key[hc], ENGRAM_EPS);
+            let h_hc = hyper.slice(axis, hc as u64, 1u64).reshape(flat.clone());
+            let q_n = h_hc.rms_norm(&self.norm_query[hc], ENGRAM_EPS);
+            let gate = key_n
+                .mul(&q_n)
+                .mean(axis)
+                .scale(scale)
+                .act(Act::SignedSqrt)
+                .act(Act::Sigmoid)
+                .reshape(scalar.clone())
+                .expand(axis, Hidden);
+            let branch = main_sig.mul_vector(&self.hc_scales[hc]);
+            let out = h_hc.add(&main_sig.mul(&gate)).add(&branch);
+            joined = Some(match joined {
+                None => out,
+                Some(prev) => prev.concat(&out),
+            });
+        }
+        joined
+            .expect("hc_mult > 0")
+            .reshape(cat(lead, [HC.into(), Hidden.into()]))
     }
 }
 
@@ -743,18 +767,6 @@ struct Hy4<E: LatentExperts> {
     head: Option<Linear>,
 }
 
-fn declare_list<T: Weights>(m: &Model, p: &mut Vec<PathSeg>, name: &str, n: usize) -> Vec<T> {
-    (0..n)
-        .map(|i| {
-            p.push(PathSeg::Field(name.into()));
-            p.push(PathSeg::Index(i as u32));
-            let item = T::declare(m, p, &[]);
-            p.truncate(p.len() - 2);
-            item
-        })
-        .collect()
-}
-
 impl<E: LatentExperts> Hy4<E> {
     fn declare(m: &Model, c: &Config) -> Self {
         let mut p = Vec::new();
@@ -764,13 +776,21 @@ impl<E: LatentExperts> Hy4<E> {
         let moe_n = c.stack.layers.saturating_sub(c.dense_layers) as usize;
         Self {
             embed: part(m, &mut p, "embed", &[Vocab.into(), hid.clone()]),
-            engram: declare_list(m, &mut p, "engram", eng_n),
-            attn_hc: declare_list(m, &mut p, "attn_hc", layers),
-            mlp_hc: declare_list(m, &mut p, "mlp_hc", layers),
-            dsa: declare_list(m, &mut p, "dsa", c.dsa_count() as usize),
-            swa: declare_list(m, &mut p, "swa", c.swa_count() as usize),
-            dense: declare_list(m, &mut p, "dense", c.dense_layers as usize),
-            moe: declare_list(m, &mut p, "moe", moe_n),
+            engram: (0..eng_n)
+                .map(|i| {
+                    p.push(PathSeg::Field("engram".into()));
+                    p.push(PathSeg::Index(i as u32));
+                    let item = EngramBlock::declare(m, &mut p, c);
+                    p.truncate(p.len() - 2);
+                    item
+                })
+                .collect(),
+            attn_hc: declare_parts(m, &mut p, "attn_hc", layers, &[]),
+            mlp_hc: declare_parts(m, &mut p, "mlp_hc", layers, &[]),
+            dsa: declare_parts(m, &mut p, "dsa", c.dsa_count() as usize, &[]),
+            swa: declare_parts(m, &mut p, "swa", c.swa_count() as usize, &[]),
+            dense: declare_parts(m, &mut p, "dense", c.dense_layers as usize, &[]),
+            moe: declare_parts(m, &mut p, "moe", moe_n, &[]),
             hc_head: part(m, &mut p, "hc_head", &[]),
             norm: part(m, &mut p, "norm", std::slice::from_ref(&hid)),
             head: (!c.tied).then(|| part(m, &mut p, "head", &[hid, Vocab.into()])),

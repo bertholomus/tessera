@@ -35,3 +35,39 @@ fn glm53_gb10x4_reads() {
         );
     }
 }
+
+#[test]
+fn hy4_flash_recipes_read() {
+    for (name, slots, pool, extra) in [
+        ("hy4-flash-pro6000", "4", "1048576", &[][..]),
+        ("hy4-flash-gb10x1", "4", "4194304", &[][..]),
+        (
+            "hy4-flash-gb10x2",
+            "8",
+            "8388608",
+            &[("--moe", Some("tp")), ("--sums", Some("arx"))][..],
+        ),
+    ] {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/recipes")
+            .join(name);
+        let recipe = Recipe::read(&dir).unwrap();
+        assert_eq!(recipe.name, name);
+        let flags = recipe.flags();
+        let mut want = vec![
+            ("--task", Some("generate")),
+            ("--manifest", Some("k4")),
+            ("--max-model-len", Some("1048576")),
+            ("--slots", Some(slots)),
+            ("--kv-dtype", Some("fp8")),
+            ("--kv-cache-tokens", Some(pool)),
+        ];
+        want.extend_from_slice(extra);
+        for (f, v) in want {
+            assert!(
+                flags.iter().any(|(k, val)| k == f && val.as_deref() == v),
+                "{name}: missing flag ({f:?}, {v:?})"
+            );
+        }
+    }
+}

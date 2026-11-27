@@ -1,0 +1,14 @@
+# Hy4-flash exlr8 k4 for 1x RTX PRO 6000 at 1M context.
+name = "hy4-flash-pro6000"
+about = "Hy4-flash exlr8 k4 for 1x RTX PRO 6000 (96 GB) at 1M context"
+
+[weights]
+path = "weights"
+
+[serve]
+task = "generate"
+manifest = "k4"
+max_model_len = 1048576
+slots = 4
+kv_dtype = "fp8"
+kv_cache_tokens = 1048576
