@@ -62,5 +62,6 @@ decoders! {
     "qwen3": Norm, Swiglu, ();
     "qwen3_moe": Norm, SparseMoe, (), rules: include_str!("../names/qwen3_moe.json");
     "llama": (), Swiglu, ();
+    "granite": (), Swiglu, ();
     "granitemoe": (), Moe, ();
 }
