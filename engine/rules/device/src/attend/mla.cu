@@ -183,6 +183,7 @@ static __device__ __forceinline__ u32 mla_pick_id(const u32* ids, u32 row, u32 p
 
 static __device__ __forceinline__ u64 kv_row_at(const u32* pt, u32 slot, u32 pos, u32 ctx, u32 sh) {
     if (sh == 0u) return u64(slot) * ctx + pos;
+    if (sh == 32u) return u64(slot) * ctx + (pos % ctx);
     return (u64(pt[u64(slot) * ctx + (pos >> sh)]) << sh) | u64(pos & ((1u << sh) - 1u));
 }
 

@@ -1,5 +1,8 @@
 //! Tensor-Core MLA, GQA, and Lightning Indexer rules for CUDA.
 
+#[cfg(test)]
+mod attend_test;
+
 use crate::flatten_cuda;
 use crate::{CUDA_LACKS, cuda_rule, f32_only};
 use std::sync::OnceLock;
@@ -14,6 +17,7 @@ use tessera_lower::{
 const KERNEL: &str = include_str!("mla.cu");
 const MLA_WIDTH: usize = 576;
 const GQA_WIDTH: usize = 128;
+const RING_SHIFT: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AttendKind {
@@ -90,7 +94,7 @@ fn split_count(kind: AttendKind, rows: usize, hgroups: usize) -> usize {
     }
 }
 
-/// Grouped-Q split-K MLA or GQA over dense or paged KV.
+/// Grouped-Q split-K MLA or GQA over KV.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = self.kind.names().0,
@@ -206,7 +210,7 @@ fn attend_launches(k: &SplitAttend, step: &Step) -> Vec<Launch> {
         }
         AttendKind::Gqa => args.push(Arg::count(k.kv_heads)),
     }
-    let page_shift = k.kept.page().map_or(0, |p| p.trailing_zeros() as usize);
+    let page_shift = page_shift(k.kept);
     let table = step.kept(k.kept).unwrap_or_else(|| step.read(3));
     args.extend([
         Arg::count(k.window.0),
@@ -294,8 +298,16 @@ fn red_launches(r: &SplitReduce, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
+fn page_shift(kept: &'static dyn Layout) -> usize {
+    if kept.name() == "ring" {
+        RING_SHIFT
+    } else {
+        kept.page().map_or(0, |p| p.trailing_zeros() as usize)
+    }
+}
+
 fn kept_stride(kept: &'static dyn Layout, context: usize) -> Option<(usize, &'static dyn Layout)> {
-    if kept.name() == "dense" {
+    if kept.name() == "dense" || kept.name() == "ring" {
         return Some((context, kept));
     }
     let page = kept.page()?;
@@ -403,7 +415,7 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
     let cache = kept_context(tree, k, v, most);
     require!(
         cache.is_some(),
-        "keys and values share no dense or paged cache"
+        "keys and values share no dense, ring, or paged cache"
     );
     let (context, kept) = cache?;
     let entry = entry?;
@@ -478,7 +490,7 @@ fn idx_tile_keys(rows: usize, qt: bool) -> usize {
     }
 }
 
-/// Tensor-Core Lightning Indexer over dense or paged keys.
+/// Tensor-Core Lightning Indexer over dense, ring, or paged keys.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = "fast_indexer",
@@ -553,7 +565,7 @@ fn idx_launches(k: &FastIndexer, step: &Step) -> Vec<Launch> {
         down: if k.qt { k.rows.div_ceil(8) } else { k.rows },
         threads: if k.qt { 256 } else { 128 },
     };
-    let page_shift = k.kept.page().map_or(0, |p| p.trailing_zeros() as usize);
+    let page_shift = page_shift(k.kept);
     let table = step.kept(k.kept).unwrap_or_else(|| step.read(3));
     let args = vec![
         step.read(0),
@@ -576,7 +588,7 @@ fn idx_launches(k: &FastIndexer, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-/// Matches stepped ragged Lightning Indexer over dense or paged keys.
+/// Matches stepped ragged Lightning Indexer over keys.
 fn check_indexer(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
     let node = tree.node(at);
     let (masked_pos, mut cur) = match &node.term {
@@ -653,7 +665,7 @@ fn check_indexer(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
     let layout = tree.kept.name();
     require!(
         paged.is_some(),
-        "kv layout {layout} is neither dense nor paged"
+        "kv layout {layout} is neither dense, ring, nor paged"
     );
     let ((context, kept), entry) = (paged?, entry?);
     let keys = k_node.extents[1];
