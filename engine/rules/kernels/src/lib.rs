@@ -17,6 +17,7 @@ mod norm;
 mod radix;
 mod rope;
 mod softmax;
+mod softmax_lanes;
 mod take;
 mod view;
 
