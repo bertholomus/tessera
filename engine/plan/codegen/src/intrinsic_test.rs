@@ -44,6 +44,16 @@ fn device_names(text: &str) -> Vec<String> {
 }
 
 #[test]
+fn metal_narrow_stores() {
+    let rendered = call(Intrinsic::Bf16Pair).text().render(Dialect::Metal);
+    assert!(rendered.contains("bfloat2((bfloat)lo, (bfloat)hi)"));
+    assert!(rendered.contains("*(device bfloat4 *)p = bfloat4(v)"));
+    assert!(rendered.contains("as_type<u16>((bfloat)x)"));
+    assert!(rendered.contains("0xc407ffffu"));
+    assert!(rendered.contains("select(norm, sub"));
+}
+
+#[test]
 fn every_intrinsic_spelled() {
     // A layout replaces `kept_row` before any text.
     let spelled = Intrinsic::ALL.iter().filter(|i| **i != Intrinsic::KeptRow);
