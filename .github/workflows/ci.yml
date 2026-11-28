@@ -466,7 +466,7 @@ jobs:
     # One PR comment for lint, similarity, style and tests (stickler).
     if: always() && github.event_name == 'pull_request' && github.event.pull_request.draft != true
     needs: [lint, linux, similarity, style]
-    runs-on: ubuntu-latest
+    runs-on: orble-1
     permissions:
       contents: read
       pull-requests: write
