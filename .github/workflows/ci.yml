@@ -163,7 +163,9 @@ jobs:
     # Code-shape rules and task maps (stickler lint), and formatting.
     needs: changes
     if: needs.changes.outputs.reuse != 'true'
-    runs-on: ubuntu-latest
+    # An orble runner for this org's branches. A fork's code runs on
+    # a hosted runner instead.
+    runs-on: ${{ (github.event.pull_request == null || github.event.pull_request.head.repo.owner.login == 'kindlingai') && 'orble-1' || 'ubuntu-slim' }}
     # Labels new size limit breaches for review.
     permissions:
       contents: read
