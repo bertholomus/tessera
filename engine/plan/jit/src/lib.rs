@@ -5,6 +5,9 @@ mod expr;
 mod lib_test;
 mod lower;
 mod runtime;
+mod scalar;
+#[cfg(test)]
+mod scalar_test;
 
 use cranelift_codegen::ir::{AbiParam, Signature, Type, types};
 use cranelift_codegen::settings::{self, Configurable};
