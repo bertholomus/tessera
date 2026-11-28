@@ -197,6 +197,71 @@ fn limits_bar_kernels() {
 }
 
 #[test]
+fn cast_wide_narrow_match() {
+    use tessera_graph::DimName::Hidden;
+    use tessera_graph::TensorType;
+    use tessera_lower::form::{FP8_FORM, Load};
+    use tessera_trace::{Act, Port};
+    let forms: [(&'static dyn Load, f32); 3] =
+        [(F32_FORM, 1e-5), (BF16_FORM, 2.0), (FP8_FORM, 4.0)];
+    for width in [8u64, 5u64] {
+        let m = Model::new(vec![Dim::bounded(Rows, 4), Dim::fixed(Hidden, width)]);
+        let [x] = m.entry(
+            EntryKind::Forward,
+            [Port {
+                role: Role::Logits,
+                ty: TensorType::new([Rows, Hidden], DType::F32),
+            }],
+        );
+        let g_u32 = m.finish([(Role::Tokens, &x.act(Act::Relu).cast(DType::U32))]);
+        let vals: Vec<f32> = (0..3 * width as usize)
+            .map(|i| match i % 4 {
+                0 => 0.0,
+                _ => (i as f32) * 1.5,
+            })
+            .collect();
+        let inp_f = Tensor::f32(vec![3, width as usize], vals);
+        let want_u = run(&g_u32, &[], 0, std::slice::from_ref(&inp_f)).unwrap();
+        let m2 = Model::new(vec![Dim::bounded(Rows, 4), Dim::fixed(Hidden, width)]);
+        let [u] = m2.entry(
+            EntryKind::Forward,
+            [Port {
+                role: Role::Tokens,
+                ty: TensorType::new([Rows, Hidden], DType::U32),
+            }],
+        );
+        let g_f32 = m2.finish([(Role::Logits, &u.cast(DType::F32))]);
+        let inp_u = Tensor::u32(
+            vec![3, width as usize],
+            (0..3 * width as u32).map(|i| i * 3).collect(),
+        );
+        let want_f = run(&g_f32, &[], 0, std::slice::from_ref(&inp_u)).unwrap();
+        for (form, tol) in forms {
+            let pins = Pins::default().activations(form).outputs(form);
+            for settings in runs() {
+                let dev = Device::guess(&settings).pinned(pins.clone());
+                let p_u = lower(&g_u32, 0, &[(Rows, 3)], &dev).unwrap();
+                let mut r_u = open(p_u, &settings).unwrap();
+                let got_u = r_u.run(&[inp_f.view()]).unwrap();
+                if form.name() == "f32" {
+                    assert_eq!(got_u[0].indices().unwrap(), want_u[0].indices().unwrap());
+                }
+                let p_f = lower(&g_f32, 0, &[(Rows, 3)], &dev).unwrap();
+                assert_eq!(p_f.steps.len(), 1, "direct narrow cast_f32");
+                let tessera_lower::Source::Made(body) = p_f.steps[0].kernel.source() else {
+                    panic!("expected Made source");
+                };
+                assert_eq!(body.entry.contains("_x4"), width.is_multiple_of(4));
+                let mut r_f = open(p_f, &settings).unwrap();
+                let got_f = r_f.run(&[inp_u.view()]).unwrap();
+                let diff = max_abs_diff(got_f[0].floats().unwrap(), want_f[0].floats().unwrap());
+                assert!(diff <= tol, "{} w={width}: {diff:e}", body.entry);
+            }
+        }
+    }
+}
+
+#[test]
 fn tables_keep_forms() {
     let g = graphs::table(&dims(), 32, 16);
     let guess = Device::guess(&host());
