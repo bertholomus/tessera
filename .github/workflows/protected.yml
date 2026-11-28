@@ -19,7 +19,7 @@ jobs:
   human-review:
     # A draft waits. The ready_for_review event starts the run CI's success needs.
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: orble-1
     env:
       GH_TOKEN: ${{ github.token }}
       PR: ${{ github.event.pull_request.number }}
