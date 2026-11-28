@@ -50,7 +50,7 @@ jobs:
   rerun:
     needs: scope
     if: needs.scope.outputs.rerun != ''
-    runs-on: ubuntu-slim
+    runs-on: orble-1
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
