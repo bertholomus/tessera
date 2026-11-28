@@ -2,6 +2,7 @@
 
 mod dense;
 mod lanes;
+mod lanes_metal;
 mod mm_metal;
 mod picked;
 mod product;
@@ -9,6 +10,7 @@ mod stacked;
 mod stacked_fused;
 mod thin;
 mod tiled;
+mod tiled_metal;
 mod trellis_metal;
 mod turned;
 
