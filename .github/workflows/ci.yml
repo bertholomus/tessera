@@ -442,7 +442,9 @@ jobs:
     # fails on any hit, so `success` can need it. A push to main fills
     # the spaCy cache, because a cache that a PR saves serves that PR alone.
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    # An orble runner for this org's branches. A fork's code runs on
+    # a hosted runner instead.
+    runs-on: ${{ (github.event.pull_request == null || github.event.pull_request.head.repo.owner.login == 'kindlingai') && 'orble-1' || 'ubuntu-slim' }}
     permissions:
       contents: read
       actions: write
