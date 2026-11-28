@@ -1,38 +1,8 @@
-#include <metal_stdlib>
-#include <metal_simdgroup_matrix>
-
-using namespace metal;
-
 constant uint MLA_MMA_THREADS = 512u;
 constant uint MLA_GEN_THREADS = 256u;
 constant float MLA_LOG2E = 1.4426950408889634f;
 constant uint MLA_D = 576u;
 constant uint MLA_STRIDE = 584u;
-
-enum MlaFmt : uint {
-    MLA_F32 = 0u,
-    MLA_BF16 = 1u,
-    MLA_F16 = 2u,
-    MLA_FP8 = 3u,
-};
-
-static inline uint mla_kept_row(
-    uint slot,
-    uint pos,
-    uint kept_mode,
-    uint kept_param,
-    uint page_shift,
-    uint page_mask,
-    device const uint *page_table) {
-    if (kept_mode == 0u) {
-        return slot * kept_param + pos;
-    }
-    if (kept_mode == 2u) {
-        return slot * kept_param + (pos % kept_param);
-    }
-    uint pg = page_table[slot * kept_param + (pos >> page_shift)];
-    return (pg << page_shift) | (pos & page_mask);
-}
 
 static inline uint mla_pick_id(
     device const uint *ids,
@@ -48,87 +18,22 @@ static inline uint mla_pick_id(
     return (c >= from && c < to) ? c : 0xFFFFFFFFu;
 }
 
-// Packed uint2 E4M3 to half4 decode.
-static inline half4 mla_fp8_h4(uchar4 raw) {
-    uint2 u = uint2(uint(raw.x) | (uint(raw.y) << 16u), uint(raw.z) | (uint(raw.w) << 16u));
-    uint2 s = (u & 0x00800080u) << 8u;
-    uint2 m = u & 0x007F007Fu;
-    half4 norm = as_type<half4>(s | ((m << 7u) + 0x20002000u));
-    half4 sub = as_type<half4>(s | 0x40004000u | m) - as_type<half4>(s | 0x40004000u);
-    return select(norm, sub, abs(norm) < half4(0.015625h));
-}
-
-template <uint FMT>
-static inline float4 mla_load4_f32(device const uchar *base, ulong elem_off) {
-    if constexpr (FMT == MLA_F32) {
-        return *(device const float4 *)(base + (elem_off << 2u));
-    } else if constexpr (FMT == MLA_BF16) {
-        ushort4 raw = *(device const ushort4 *)(base + (elem_off << 1u));
-        return as_type<float4>(uint4(raw) << 16u);
-    } else if constexpr (FMT == MLA_F16) {
-        return float4(*(device const half4 *)(base + (elem_off << 1u)));
-    } else {
-        return float4(mla_fp8_h4(*(device const uchar4 *)(base + elem_off)));
-    }
-}
-
-template <uint FMT>
-static inline half4 mla_load4_h4(device const uchar *base, ulong elem_off) {
-    if constexpr (FMT == MLA_F32) {
-        return half4(*(device const float4 *)(base + (elem_off << 2u)));
-    } else if constexpr (FMT == MLA_BF16) {
-        ushort4 raw = *(device const ushort4 *)(base + (elem_off << 1u));
-        return half4(as_type<float4>(uint4(raw) << 16u));
-    } else if constexpr (FMT == MLA_F16) {
-        return *(device const half4 *)(base + (elem_off << 1u));
-    } else {
-        return mla_fp8_h4(*(device const uchar4 *)(base + elem_off));
-    }
-}
-
-static inline float4 mla_load4_q(device const uchar *base, ulong elem_off, uint q_fmt) {
-    if (q_fmt == MLA_F32) {
-        return *(device const float4 *)(base + (elem_off << 2u));
-    }
-    if (q_fmt == MLA_BF16) {
-        ushort4 raw = *(device const ushort4 *)(base + (elem_off << 1u));
-        return as_type<float4>(uint4(raw) << 16u);
-    }
-    return float4(*(device const half4 *)(base + (elem_off << 1u)));
-}
-
-static inline ushort mla_f32_to_bf16(float x) {
-    uint u = as_type<uint>(x);
-    uint rnd = 0x7FFFu + ((u >> 16u) & 1u);
-    return ushort((u + rnd) >> 16u);
-}
-
-static inline void mla_store1(device uchar *base, ulong elem_off, float val, uint out_fmt) {
-    if (out_fmt == MLA_F32) {
-        *(device float *)(base + (elem_off << 2u)) = val;
-    } else if (out_fmt == MLA_BF16) {
-        *(device ushort *)(base + (elem_off << 1u)) = mla_f32_to_bf16(val);
-    } else {
-        *(device half *)(base + (elem_off << 1u)) = half(val);
-    }
-}
-
 static inline void mla_store2(device uchar *base, ulong elem_off, float2 v, uint out_fmt) {
-    if (out_fmt == MLA_F32) {
+    if (out_fmt == KV_F32) {
         *(device float2 *)(base + (elem_off << 2u)) = v;
-    } else if (out_fmt == MLA_BF16) {
-        *(device ushort2 *)(base + (elem_off << 1u)) = ushort2(mla_f32_to_bf16(v.x), mla_f32_to_bf16(v.y));
+    } else if (out_fmt == KV_BF16) {
+        *(device ushort2 *)(base + (elem_off << 1u)) = ushort2(kv_f32_to_bf16(v.x), kv_f32_to_bf16(v.y));
     } else {
         *(device half2 *)(base + (elem_off << 1u)) = half2(v);
     }
 }
 
 static inline void mla_store4(device uchar *base, ulong elem_off, float4 v, uint out_fmt) {
-    if (out_fmt == MLA_F32) {
+    if (out_fmt == KV_F32) {
         *(device float4 *)(base + (elem_off << 2u)) = v;
-    } else if (out_fmt == MLA_BF16) {
+    } else if (out_fmt == KV_BF16) {
         *(device ushort4 *)(base + (elem_off << 1u)) = ushort4(
-            mla_f32_to_bf16(v.x), mla_f32_to_bf16(v.y), mla_f32_to_bf16(v.z), mla_f32_to_bf16(v.w));
+            kv_f32_to_bf16(v.x), kv_f32_to_bf16(v.y), kv_f32_to_bf16(v.z), kv_f32_to_bf16(v.w));
     } else {
         *(device half4 *)(base + (elem_off << 1u)) = half4(v);
     }
@@ -431,7 +336,7 @@ static inline void mla_mma_body(
             ulong qb = (ulong(r.row) * c.heads + r.h0 + simd) * MLA_D;
             for (uint q4 = lane; q4 < 144u; q4 += 32u) {
                 *(threadgroup T4 *)(sm.kv_s + simd * MLA_STRIDE + q4 * 4u) =
-                    T4(mla_load4_q(c.q_buf, qb + q4 * 4u, r.q_fmt) * qscale);
+                    T4(kv_load4_plain(c.q_buf, qb + q4 * 4u, r.q_fmt) * qscale);
             }
         } else {
             for (uint q4 = lane; q4 < 144u; q4 += 32u) {
@@ -453,7 +358,7 @@ static inline void mla_mma_body(
                 ulong qb = (ulong(r.row) * c.heads + r.h0 + hr) * MLA_D;
                 for (uint q4 = kt; q4 < 144u; q4 += 64u) {
                     *(threadgroup T4 *)(sm.kv_s + kr * MLA_STRIDE + q4 * 4u) =
-                        T4(mla_load4_q(c.q_buf, qb + q4 * 4u, r.q_fmt) * qscale);
+                        T4(kv_load4_plain(c.q_buf, qb + q4 * 4u, r.q_fmt) * qscale);
                 }
             } else {
                 for (uint q4 = kt; q4 < 144u; q4 += 64u) {
@@ -487,16 +392,16 @@ static inline void mla_mma_body(
             sm.valid_s[kr] = (j_id != 0xFFFFFFFFu) ? 1u : 0u;
         }
         if (j_id != 0xFFFFFFFFu) {
-            uint kv_row = mla_kept_row(
+            uint kv_row = kv_kept_row(
                 r.slot, j_id, r.kept_mode, c.kept_param, c.page_shift, c.page_mask, c.page_table);
             ulong kv_base = ulong(kv_row) * MLA_D;
             for (uint q4 = kt; q4 < 144u; q4 += kstep) {
                 if constexpr (BK == 16u) {
                     *(threadgroup T4 *)(sm.kv_s + kr * MLA_STRIDE + q4 * 4u) =
-                        mla_load4_h4<KV_FMT>(c.kv_buf, kv_base + q4 * 4u);
+                        kv_load4_h4<KV_FMT>(c.kv_buf, kv_base + q4 * 4u);
                 } else {
                     *(threadgroup T4 *)(sm.kv_s + kr * MLA_STRIDE + q4 * 4u) =
-                        mla_load4_f32<KV_FMT>(c.kv_buf, kv_base + q4 * 4u);
+                        kv_load4_f32<KV_FMT>(c.kv_buf, kv_base + q4 * 4u);
                 }
             }
         } else {
@@ -644,7 +549,7 @@ static inline void mla_gen_body(
         #pragma unroll
         for (uint s = 0u; s < MAX_QUADS; s++) {
             uint d = s * 128u + lane * 4u;
-            qr[s] = (d < width) ? (mla_load4_q(q_buf, qb + d, q_fmt) * qscale) : float4(0.0f);
+            qr[s] = (d < width) ? (kv_load4_plain(q_buf, qb + d, q_fmt) * qscale) : float4(0.0f);
             acc[s] = float4(0.0f);
         }
     }
@@ -656,11 +561,11 @@ static inline void mla_gen_body(
         }
         if (j_id != 0xFFFFFFFFu) {
             uint kv_row =
-                mla_kept_row(slot, j_id, kept_mode, kept_param, page_shift, page_mask, page_table);
+                kv_kept_row(slot, j_id, kept_mode, kept_param, page_shift, page_mask, page_table);
             ulong kv_base = ulong(kv_row) * width;
             for (uint q4 = kt; q4 < quads; q4 += 64u) {
                 *(threadgroup float4 *)(kv_s + kr * MAX_W + q4 * 4u) =
-                    mla_load4_f32<KV_FMT>(kv_buf, kv_base + q4 * 4u);
+                    kv_load4_f32<KV_FMT>(kv_buf, kv_base + q4 * 4u);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -767,7 +672,7 @@ kernel void mla_reduce(
                 sum += part[base + ulong(s) * stride + 2u + d] * sc;
             }
         }
-        mla_store1(out_buf, ob + d, sum * inv, out_fmt);
+        kv_store1(out_buf, ob + d, sum * inv, out_fmt);
     }
 }
 
@@ -827,22 +732,22 @@ kernel void mla_reduce(
             page_shift, page_mask, flags, tg, tid, sm);                                      \
     }
 
-MLA_MMA_F32_ENTRY(mla_mma_512_f32, MLA_F32, 512u)
-MLA_MMA_HALF_ENTRY(mla_mma_512_bf16, MLA_BF16, 512u)
-MLA_MMA_HALF_ENTRY(mla_mma_512_f16, MLA_F16, 512u)
-MLA_MMA_HALF_ENTRY(mla_mma_512_fp8, MLA_FP8, 512u)
+MLA_MMA_F32_ENTRY(mla_mma_512_f32, KV_F32, 512u)
+MLA_MMA_HALF_ENTRY(mla_mma_512_bf16, KV_BF16, 512u)
+MLA_MMA_HALF_ENTRY(mla_mma_512_f16, KV_F16, 512u)
+MLA_MMA_HALF_ENTRY(mla_mma_512_fp8, KV_FP8, 512u)
 
-MLA_MMA_F32_ENTRY(mla_mma_576_f32, MLA_F32, 576u)
-MLA_MMA_HALF_ENTRY(mla_mma_576_bf16, MLA_BF16, 576u)
-MLA_MMA_HALF_ENTRY(mla_mma_576_f16, MLA_F16, 576u)
-MLA_MMA_HALF_ENTRY(mla_mma_576_fp8, MLA_FP8, 576u)
+MLA_MMA_F32_ENTRY(mla_mma_576_f32, KV_F32, 576u)
+MLA_MMA_HALF_ENTRY(mla_mma_576_bf16, KV_BF16, 576u)
+MLA_MMA_HALF_ENTRY(mla_mma_576_f16, KV_F16, 576u)
+MLA_MMA_HALF_ENTRY(mla_mma_576_fp8, KV_FP8, 576u)
 
-MLA_GEN_ENTRY(mla_gen_256_f32, MLA_F32, 256u)
-MLA_GEN_ENTRY(mla_gen_256_bf16, MLA_BF16, 256u)
-MLA_GEN_ENTRY(mla_gen_256_f16, MLA_F16, 256u)
-MLA_GEN_ENTRY(mla_gen_256_fp8, MLA_FP8, 256u)
+MLA_GEN_ENTRY(mla_gen_256_f32, KV_F32, 256u)
+MLA_GEN_ENTRY(mla_gen_256_bf16, KV_BF16, 256u)
+MLA_GEN_ENTRY(mla_gen_256_f16, KV_F16, 256u)
+MLA_GEN_ENTRY(mla_gen_256_fp8, KV_FP8, 256u)
 
-MLA_GEN_ENTRY(mla_gen_1024_f32, MLA_F32, 1024u)
-MLA_GEN_ENTRY(mla_gen_1024_bf16, MLA_BF16, 1024u)
-MLA_GEN_ENTRY(mla_gen_1024_f16, MLA_F16, 1024u)
-MLA_GEN_ENTRY(mla_gen_1024_fp8, MLA_FP8, 1024u)
+MLA_GEN_ENTRY(mla_gen_1024_f32, KV_F32, 1024u)
+MLA_GEN_ENTRY(mla_gen_1024_bf16, KV_BF16, 1024u)
+MLA_GEN_ENTRY(mla_gen_1024_f16, KV_F16, 1024u)
+MLA_GEN_ENTRY(mla_gen_1024_fp8, KV_FP8, 1024u)

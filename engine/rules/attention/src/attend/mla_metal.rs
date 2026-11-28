@@ -1,12 +1,11 @@
 //! Native Metal grouped-Q split-K MLA attention kernels.
 
+use crate::indexer::{k_fmt_idx, kept_params, plain_fmt};
 use tessera_codegen::kept::{Dense, Layout};
 use tessera_graph::{Op, Order, View};
-use tessera_lower::Backend;
 use tessera_lower::form::{Load as Stored, plain, writable};
 use tessera_lower::{
-    Arg, ByBackend, Draft, Extent, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term,
-    Tree,
+    Arg, Draft, Extent, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term, Tree,
 };
 
 const MMA_THREADS: usize = 512;
@@ -14,43 +13,16 @@ const GEN_THREADS: usize = 256;
 const MLA_WIDTH: usize = 576;
 const MLA_LATENT: usize = 512;
 const MAX_GEN_WIDTH: usize = 1024;
-const LACKS: &[Backend] = &[Backend::Cuda, Backend::Rocm];
-const SOURCE: &str = include_str!("mla_metal.metal");
+const SOURCE: &str = concat!(include_str!("../kv.metal"), include_str!("mla_metal.metal"));
 /// Low default guess so Metal prefers native MLA attention.
 const GUESS: f64 = 1.0e-12;
-
-fn fixed(entry: &'static str) -> Source {
-    Source::Fixed {
-        text: ByBackend([SOURCE, "", ""]),
-        entry,
-    }
-}
-
-fn plain_fmt_id(form: &dyn Stored) -> Option<usize> {
-    match form.name() {
-        "f32" => Some(0),
-        "bf16" => Some(1),
-        "f16" => Some(2),
-        _ => None,
-    }
-}
-
-fn kv_fmt_idx(form: &dyn Stored) -> Option<usize> {
-    match form.name() {
-        "f32" => Some(0),
-        "bf16" => Some(1),
-        "f16" => Some(2),
-        "fp8" => Some(3),
-        _ => None,
-    }
-}
 
 fn select_entry(
     width: usize,
     out_width: usize,
     kv_form: &dyn Stored,
 ) -> Option<(&'static str, usize, usize, usize)> {
-    let fi = kv_fmt_idx(kv_form)?;
+    let fi = k_fmt_idx(kv_form)?;
     if width == MLA_WIDTH && out_width == MLA_LATENT {
         const NAMES: [&str; 4] = [
             "mla_mma_512_f32",
@@ -90,25 +62,6 @@ fn select_entry(
         return Some((NAMES[fi], 8, GEN_THREADS, 17_408));
     }
     None
-}
-
-fn kept_params(
-    layout: &'static dyn Layout,
-    context: usize,
-) -> Option<(usize, usize, usize, usize)> {
-    if let Some(page) = layout.page() {
-        if !page.is_power_of_two() {
-            return None;
-        }
-        let pages = context.div_ceil(page);
-        Some((1, pages, page.trailing_zeros() as usize, page - 1))
-    } else if layout.name() == "dense" {
-        Some((0, context, 0, 0))
-    } else if layout.name() == "ring" {
-        Some((2, context, 0, 0))
-    } else {
-        None
-    }
 }
 
 fn split_kv(rows: usize, hgroups: usize, seen: usize) -> usize {
@@ -169,7 +122,7 @@ impl Spec {
     emits = mla_emits,
     needs = mla_needs(&self.0),
     order = Order::PerConfig,
-    source = fixed(self.0.entry),
+    source = Source::metal(SOURCE, self.0.entry),
     launches = mla_launches,
     load = mla_load,
 )]
@@ -194,14 +147,7 @@ fn mla_emits(k: &MetalMla, form: &dyn Stored) -> bool {
 }
 
 fn mla_needs(s: &Spec) -> Needs {
-    Needs {
-        lanes: 32,
-        group_bytes: s.smem,
-        group_threads: s.threads,
-        compiler: true,
-        lacks: LACKS,
-        ..Needs::default()
-    }
+    Needs::metal(s.threads, s.smem)
 }
 
 fn mla_load(k: &MetalMla, _: usize) -> Option<Load> {
@@ -232,9 +178,9 @@ fn mla_launches(k: &MetalMla, step: &Step) -> Vec<Launch> {
     let (kept_mode, kept_param, page_shift, page_mask) =
         kept_params(s.kept, s.context).expect("verified layout");
     let page_table = step.kept_for(s.kept, false).unwrap_or_else(|| step.read(3));
-    let q_fmt = plain_fmt_id(s.q_form).expect("verified q_form");
+    let q_fmt = plain_fmt(s.q_form).expect("verified q_form");
     let out_fmt = if s.splits == 1 {
-        plain_fmt_id(s.out_form).expect("verified out_form")
+        plain_fmt(s.out_form).expect("verified out_form")
     } else {
         0
     };
@@ -278,7 +224,7 @@ fn mla_launches(k: &MetalMla, step: &Step) -> Vec<Launch> {
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = "mla_metal_reduce",
-    source = fixed("mla_reduce"),
+    source = Source::metal(SOURCE, "mla_reduce"),
     order = Order::PerConfig,
     sizes = [self.lists, self.splits, self.out_width],
     work = self.lists * self.splits * self.out_width,
@@ -305,13 +251,7 @@ fn red_emits(r: &MetalMlaReduce, form: &dyn Stored) -> bool {
 }
 
 fn red_needs() -> Needs {
-    Needs {
-        lanes: 32,
-        group_threads: GEN_THREADS,
-        compiler: true,
-        lacks: LACKS,
-        ..Needs::default()
-    }
+    Needs::metal(GEN_THREADS, 0)
 }
 
 fn red_load(r: &MetalMlaReduce, _: usize) -> Option<Load> {
@@ -329,7 +269,7 @@ fn red_load(r: &MetalMlaReduce, _: usize) -> Option<Load> {
 }
 
 fn red_launches(r: &MetalMlaReduce, step: &Step) -> Vec<Launch> {
-    let out_fmt = plain_fmt_id(r.out_form).expect("verified out_form");
+    let out_fmt = plain_fmt(r.out_form).expect("verified out_form");
     let args = vec![
         step.read(0),
         step.out(),
@@ -381,8 +321,8 @@ pub(super) fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let q_form = plain(tree.node(q).form);
     let kv_form = plain(tree.node(k).form);
     let out_form = writable(outer.form);
-    plain_fmt_id(q_form)?;
-    plain_fmt_id(out_form)?;
+    plain_fmt(q_form)?;
+    plain_fmt(out_form)?;
     let (entry, group_heads, threads, smem) = select_entry(width, out_width, kv_form)?;
     let (kept, context): (&'static dyn Layout, usize) = match &tree.node(k).term {
         Term::Op(Op::Append(ki)) => {
@@ -440,7 +380,7 @@ pub(super) fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let out_len = lists * out_width;
     let reads = [q, k, ids, slots, positions, sinks];
     if splits == 1 {
-        Some(vec![Draft::new(MetalMla(spec), reads, out_len).choice(2)])
+        Some(vec![Draft::new(MetalMla(spec), reads, out_len)])
     } else {
         let part_len = lists * splits * (out_width + 2);
         let reduce = MetalMlaReduce {
@@ -450,8 +390,8 @@ pub(super) fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             out_form,
         };
         Some(vec![
-            Draft::new(MetalMla(spec), reads, part_len).choice(2),
-            Draft::new(reduce, [Read::Draft(0)], out_len).choice(2),
+            Draft::new(MetalMla(spec), reads, part_len),
+            Draft::new(reduce, [Read::Draft(0)], out_len),
         ])
     }
 }
