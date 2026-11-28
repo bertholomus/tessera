@@ -120,3 +120,43 @@ fn tiered_ram_ssd_cascade() {
     assert!(!reopened.has(keys[0]));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn spare_ram_caches() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("tessera-kv-spare-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let keys = page_keys([5, 9], &[1, 2, 3, 4], 4);
+    let payload = [7u8; 64];
+    let make_cfg = |floor: u64| KvConfig {
+        tiers: vec![tessera_kv::TierSpec {
+            name: "ssd".into(),
+            store: StoreKind::Ssd {
+                path: dir.clone(),
+                bytes: 256,
+                persist: false,
+            },
+            keep: Some(Keep::All),
+            spare_ram: Some(floor),
+        }],
+        ..KvConfig::default()
+    };
+
+    // A 1-byte floor caches pages in spare RAM.
+    let mut cached = TieredStore::open(&make_cfg(1), 0, 1).unwrap();
+    assert!(cached.save(keys[0], &payload).unwrap());
+    let mut got = [0u8; 64];
+    assert!(cached.load(keys[0], &mut got).unwrap());
+    assert_eq!(got, payload);
+    assert_eq!(cached.stats().hits, 0);
+    drop(cached);
+
+    // An unreachable floor bypasses spare RAM for disk.
+    let mut uncached = TieredStore::open(&make_cfg(u64::MAX), 0, 1).unwrap();
+    assert!(uncached.save(keys[0], &payload).unwrap());
+    let mut got2 = [0u8; 64];
+    assert!(uncached.load(keys[0], &mut got2).unwrap());
+    assert_eq!(got2, payload);
+    assert_eq!(uncached.stats().hits, 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
