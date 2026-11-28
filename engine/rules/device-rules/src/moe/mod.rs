@@ -62,6 +62,15 @@ fn trellis_source(k: &PickedTrellis) -> Source {
     source = trellis_source(self),
     launches = launches,
     load = load,
+    load_key = tessera_lower::load_key((
+        self.site.rows,
+        self.site.n,
+        self.site.k,
+        self.site.repeat,
+        self.site.turned,
+        self.site.post,
+        self.site.form.name(),
+    )),
     unproven,
 )]
 struct PickedTrellis {
