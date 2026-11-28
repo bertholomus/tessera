@@ -5,6 +5,7 @@ mod dense;
 mod lanes;
 mod lanes_metal;
 mod mm_metal;
+mod moe_metal;
 mod picked;
 mod product;
 mod stacked;
