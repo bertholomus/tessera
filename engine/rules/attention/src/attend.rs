@@ -452,4 +452,14 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     ])
 }
 
-tessera_lower::rule!("attend", propose);
+tessera_lower::rule!("attend", propose_all);
+
+mod mla_metal;
+
+fn propose_all(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let mut drafts = propose(tree, at).unwrap_or_default();
+    if let Some(mla) = mla_metal::propose(tree, at) {
+        drafts.extend(mla);
+    }
+    (!drafts.is_empty()).then_some(drafts)
+}
