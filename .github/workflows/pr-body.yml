@@ -13,7 +13,7 @@ jobs:
   coauthors:
     # No Co-Authored-By lines crediting AI tools.
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: orble-1
     steps:
       - uses: actions/checkout@v4
       - env:
