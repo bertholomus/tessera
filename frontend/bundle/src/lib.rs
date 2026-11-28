@@ -590,7 +590,46 @@ pub fn load_tapped(
     dressed(dir, built, Some(json), ple, overrides)
 }
 
-/// `graph`'s weights held from `ask`'s folder, `rules` first.
+/// Weights streamed one tensor at a time from an `Offer`.
+struct Staged {
+    graph: Graph,
+    offer: Box<dyn Offer>,
+    rules: Vec<Rule>,
+}
+
+impl Stream for Staged {
+    fn stream(
+        &self,
+        shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
+        take: &mut dyn FnMut(u32, Weight) -> Result<(), Failure>,
+    ) -> Result<(), Failure> {
+        numbered(
+            &self.graph,
+            self.offer.as_ref(),
+            &[&self.rules],
+            shares,
+            take,
+        )
+    }
+}
+
+/// Streams `graph`'s weights from `offer` with `rules`.
+pub(crate) fn streamed(
+    graph: Graph,
+    offer: Box<dyn Offer>,
+    layers: u64,
+    rules: Vec<Rule>,
+) -> Result<arch::Built, Box<dyn Error + Send + Sync>> {
+    let pins = pins(&graph, offer.as_ref(), layers, &[&rules])?;
+    let stream = Staged {
+        graph: graph.clone(),
+        offer,
+        rules,
+    };
+    Ok((graph, Weights::Streamed(Box::new(stream)), pins))
+}
+
+/// `graph`'s weights streamed from `ask`'s folder, `rules` first.
 pub(crate) fn held(
     ask: &arch::Ask,
     graph: Graph,
@@ -598,8 +637,9 @@ pub(crate) fn held(
     rules: &[Rule],
 ) -> Result<arch::Built, Box<dyn Error + Send + Sync>> {
     let offer = offer(ask.dir, ask.manifest)?;
-    let (weights, pins) = pull(&graph, offer.as_ref(), layers, &[rules, ask.user])?;
-    Ok((graph, Weights::Held(weights), pins))
+    let mut combined = rules.to_vec();
+    combined.extend_from_slice(ask.user);
+    streamed(graph, offer, layers, combined)
 }
 
 /// Builds the weight request used by `load_module`.

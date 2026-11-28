@@ -363,6 +363,35 @@ impl Gguf {
         Ok((entry.ty, entry.elements, bytes))
     }
 
+    /// Whether two tensors have the same type and bytes.
+    pub fn same_bytes(&self, a: &str, b: &str) -> Result<bool, Error> {
+        let (ea, eb) = (self.entry(a)?, self.entry(b)?);
+        if ea.ty != eb.ty || ea.elements != eb.elements || ea.bytes != eb.bytes {
+            return Ok(false);
+        }
+        if ea.offset == eb.offset {
+            return Ok(true);
+        }
+        const CHUNK: usize = 64 << 10;
+        let (mut ba, mut bb) = (vec![0u8; CHUNK], vec![0u8; CHUNK]);
+        let mut off = 0usize;
+        while off < ea.bytes {
+            let n = CHUNK.min(ea.bytes - off);
+            let at = self.data + off as u64;
+            self.file
+                .read_exact_at(&mut ba[..n], at + ea.offset)
+                .map_err(format)?;
+            self.file
+                .read_exact_at(&mut bb[..n], at + eb.offset)
+                .map_err(format)?;
+            if ba[..n] != bb[..n] {
+                return Ok(false);
+            }
+            off += n;
+        }
+        Ok(true)
+    }
+
     pub fn floats(&self, name: &str) -> Result<Vec<f32>, Error> {
         match self.tensor_type(name)? {
             GgufType::F32 | GgufType::F16 | GgufType::BF16 => {}
