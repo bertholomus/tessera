@@ -32,7 +32,7 @@ env:
 jobs:
   plan:
     # Lists the pull requests whose rebase needs only list joins.
-    runs-on: ubuntu-latest
+    runs-on: orble-1
     permissions:
       contents: read
       issues: write
