@@ -629,7 +629,9 @@ jobs:
     # by `changes`, and no human step is pending. Skipped on a draft.
     if: always() && github.event.pull_request.draft != true
     needs: [tiers, changes, commits, lint, linux, features, grammar, macos, arm64, similarity, platforms, docker, style]
-    runs-on: ubuntu-slim
+    # An orble runner, so success does not wait for one of the hosted
+    # runners that the build jobs fill.
+    runs-on: orble-1
     steps:
       # Full history without file contents, for merge bases. Test
       # merges against ranked PRs fetch the contents they read.
