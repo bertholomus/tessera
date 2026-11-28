@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   rerun:
-    runs-on: ubuntu-slim
+    runs-on: orble-1
     env:
       GH_TOKEN: ${{ github.token }}
       SCOPE: ${{ inputs.scope }}
