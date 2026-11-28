@@ -5,6 +5,7 @@ use crate::device::{Caches, Device};
 use crate::launch::{Bound, KernelArgs, Launch};
 use crate::metal::expand::expand;
 use crate::metal::pipeline_cache::Pipelines;
+use crate::pending::{Pending, PendingOps};
 use crate::platform::{Asked, Platform};
 use crate::{Error, Limits};
 use objc2::msg_send;
@@ -12,11 +13,11 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLibrary,
-    MTLResourceOptions, MTLSize,
+    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLDispatchType, MTLGPUFamily, MTLLibrary, MTLResourceOptions, MTLSize,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -56,25 +57,49 @@ impl Allocs {
     }
 }
 
-/// Launches encoded since the last `finish`.
-struct Pending {
-    /// The context whose queue holds it.
-    owner: usize,
-    cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-    enc: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+type CmdBuf = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
+type CompEnc = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
+type MetalPending = Pending<CmdBuf, CompEnc>;
+
+struct MetalOps<'a> {
+    queue: &'a ProtocolObject<dyn MTLCommandQueue>,
 }
 
-impl Pending {
-    /// Commits and waits. Returns the GPU's own seconds.
-    fn finish(self) -> f64 {
+impl PendingOps for MetalOps<'_> {
+    type Cmd = CmdBuf;
+    type Enc = CompEnc;
+
+    fn new_cmd(&mut self) -> Result<CmdBuf, Error> {
         autoreleasepool(|_| {
-            self.enc.endEncoding();
-            self.cmd.commit();
-            self.cmd.waitUntilCompleted();
+            self.queue
+                .commandBuffer()
+                .ok_or(Error::Gpu("command buffer"))
+        })
+    }
+
+    fn open_enc(&mut self, cmd: &CmdBuf, concurrent: bool) -> Result<CompEnc, Error> {
+        let kind = match concurrent {
+            true => MTLDispatchType::Concurrent,
+            false => MTLDispatchType::Serial,
+        };
+        autoreleasepool(|_| {
+            cmd.computeCommandEncoderWithDispatchType(kind)
+                .ok_or(Error::Gpu("encoder"))
+        })
+    }
+
+    fn end_enc(&mut self, enc: CompEnc) {
+        autoreleasepool(|_| enc.endEncoding());
+    }
+
+    fn commit(&mut self, cmd: CmdBuf) -> f64 {
+        autoreleasepool(|_| {
+            cmd.commit();
+            cmd.waitUntilCompleted();
             // The GPU's own clock leaves out the scheduling wait.
-            let cmd = &*self.cmd;
+            let raw = &*cmd;
             let (start, end): (f64, f64) =
-                unsafe { (msg_send![cmd, GPUStartTime], msg_send![cmd, GPUEndTime]) };
+                unsafe { (msg_send![raw, GPUStartTime], msg_send![raw, GPUEndTime]) };
             end - start
         })
     }
@@ -82,7 +107,9 @@ impl Pending {
 
 thread_local! {
     /// This thread's open command buffer. Encoders are not shared.
-    static PENDING: RefCell<Option<Pending>> = const { RefCell::new(None) };
+    static PENDING: RefCell<Option<MetalPending>> = const { RefCell::new(None) };
+    /// Whether this thread encodes launches concurrently with explicit barriers.
+    static CONCURRENT: Cell<bool> = const { Cell::new(false) };
 }
 
 struct Inner {
@@ -240,29 +267,26 @@ impl Context {
         Arc::as_ptr(&self.0) as usize
     }
 
-    /// This thread's open encoder, or a new command buffer's.
-    fn encoder(
-        &self,
-        pending: &mut Option<Pending>,
-    ) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, Error> {
-        match pending {
-            Some(p) if p.owner == self.id() => return Ok(p.enc.clone()),
-            // Another context's work ends before this one's starts.
-            Some(_) => drop(pending.take().map(Pending::finish)),
-            None => {}
+    fn ops(&self) -> MetalOps<'_> {
+        MetalOps {
+            queue: &self.0.queue,
         }
-        let (cmd, enc) = autoreleasepool(|_| {
-            let cmd = self
-                .0
-                .queue
-                .commandBuffer()
-                .ok_or(Error::Gpu("command buffer"))?;
-            let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("encoder"))?;
-            Ok::<_, Error>((cmd, enc))
-        })?;
-        let owner = self.id();
-        let made = pending.insert(Pending { owner, cmd, enc });
-        Ok(made.enc.clone())
+    }
+
+    /// This thread's open encoder, or a new command buffer's.
+    fn encoder(&self, pending: &mut Option<MetalPending>) -> Result<CompEnc, Error> {
+        let want = CONCURRENT.with(Cell::get);
+        Pending::acquire(pending, self.id(), want, &mut self.ops())
+    }
+
+    fn fence_concurrent(&self) {
+        PENDING.with(|p| {
+            if let Some(pending) = p.borrow_mut().as_mut()
+                && pending.owner == self.id()
+            {
+                pending.fence(|enc| enc.memoryBarrierWithScope(MTLBarrierScope::Buffers));
+            }
+        });
     }
 }
 
@@ -301,6 +325,13 @@ impl Launch for Context {
             depth: z as usize,
         };
         enc.dispatchThreadgroups_threadsPerThreadgroup(size(grid), size(block));
+        PENDING.with(|p| {
+            if let Some(pending) = p.borrow_mut().as_mut()
+                && pending.owner == self.id()
+            {
+                pending.dirty = true;
+            }
+        });
         Ok(())
     }
 }
@@ -444,6 +475,23 @@ impl Device for Context {
                 _ => None,
             }
         });
-        Ok(taken.map(Pending::finish))
+        let mut ops = self.ops();
+        Ok(taken.map(|p| p.finish(&mut ops)))
+    }
+
+    fn has_barriers(&self) -> bool {
+        true
+    }
+
+    fn set_concurrent(&self, on: bool) {
+        if !on {
+            self.fence_concurrent();
+        }
+        CONCURRENT.with(|c| c.set(on));
+    }
+
+    fn barrier(&self) -> Result<(), Error> {
+        self.fence_concurrent();
+        Ok(())
     }
 }
