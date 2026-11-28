@@ -3,7 +3,7 @@
 use tessera_graph::{Op, Order};
 use tessera_lower::Backend;
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Term, Tree};
+use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Step, T, Term, Tree};
 
 const THREADS: usize = 128;
 const COLS_PER_TG: usize = 16;
@@ -42,10 +42,6 @@ fn entry(form: &str, m: usize) -> Option<&'static str> {
     Some(names[idx])
 }
 
-fn fixed(entry: &'static str) -> Source {
-    crate::metal_fixed(SOURCE, entry)
-}
-
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = self.form.suffixed("block_metal"),
@@ -53,10 +49,10 @@ fn fixed(entry: &'static str) -> Source {
     work = self.m * self.n * self.k,
     guess = if self.m <= 8 { GUESS } else { tessera_lower::GUESS },
     accepts = accepts,
-    emits = f32_only,
+    emits = crate::f32_only,
     needs = metal_needs(),
     order = Order::PerConfig,
-    source = fixed(self.entry),
+    source = crate::metal_fixed(SOURCE, self.entry),
     launches = launches,
     load = load,
 )]
@@ -66,10 +62,6 @@ struct BlockMetal {
     k: usize,
     form: &'static dyn Stored,
     entry: &'static str,
-}
-
-fn f32_only(_: &BlockMetal, form: &dyn Stored) -> bool {
-    form.name() == "f32"
 }
 
 fn accepts(k: &BlockMetal, input: usize, form: &dyn Stored) -> bool {

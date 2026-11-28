@@ -27,3 +27,8 @@ pub(crate) fn metal_fixed(text: &'static str, entry: &'static str) -> tessera_lo
         entry,
     }
 }
+
+/// Emits only f32 values.
+pub(crate) fn f32_only<K>(_: &K, form: &dyn tessera_lower::form::Load) -> bool {
+    form.name() == "f32"
+}
