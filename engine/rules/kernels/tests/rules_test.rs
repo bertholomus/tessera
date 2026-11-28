@@ -630,3 +630,120 @@ fn fused_slice_ln() {
         }
     }
 }
+
+/// Rows of `width` floats, clipped to length 1.
+fn clip_rows(width: u64) -> Graph {
+    let m = Model::new(vec![Dim::bounded(Rows, 1024), Dim::fixed(HeadDim, width)]);
+    let [x] = m.entry(EntryKind::Forward, [floats([Rows, HeadDim])]);
+    m.finish([(Role::Logits, &x.l2_clip(1.0, 1e-3))])
+}
+
+#[test]
+fn lane_clip_is_picked() {
+    // The chip table prices both kernels.
+    let metal = Platform {
+        backend: "metal".into(),
+        arch: "apple9".into(),
+        name: "Apple M3 Pro".into(),
+        ..Platform::assumed(Limits::assumed())
+    };
+    let device = Device::guess(&host()).on(metal);
+    let shapes = [
+        (8, 128),
+        (24, 128),
+        (24, 16),
+        (4, 256),
+        (256, 128),
+        (768, 128),
+    ];
+    for (rows, width) in shapes {
+        let plan = lower(&clip_rows(width), 0, &[(Rows, rows)], &device).unwrap();
+        assert_eq!(plan.steps[0].rule, "lane_l2_clip", "{rows}x{width}");
+    }
+    // A row off the four-float grid stays scalar.
+    let plan = lower(&clip_rows(18), 0, &[(Rows, 8)], &device).unwrap();
+    assert_eq!(plan.steps[0].rule, "l2_clip");
+}
+
+#[test]
+fn lane_clip_matches() {
+    // Rows cycle: zero, shorter than 1, longer than 1.
+    const SCALE: [f32; 3] = [0.0, 0.01, 1.0];
+    for width in [16usize, 128, 144, 256] {
+        let x: Vec<f32> = (0..5 * width)
+            .map(|i| SCALE[i / width % 3] * ((i * 37 % 23) as f32 - 11.0) / 11.0)
+            .collect();
+        let inputs = [Tensor::f32(vec![5, width], x)];
+        let g = clip_rows(width as u64);
+        let want = run(&g, &[], 0, &inputs).unwrap();
+        let want = want[0].floats().unwrap();
+        assert!(want[..width].iter().all(|v| *v == 0.0));
+        for settings in runs() {
+            let device = Device::guess(&settings).favoring("lane_l2_clip");
+            let plan = lower(&g, 0, &[(Rows, 5)], &device).unwrap();
+            assert_eq!(plan.steps[0].rule, "lane_l2_clip");
+            let mut runner = open(plan, &settings).unwrap();
+            let got = runner.run(&[inputs[0].view()]).unwrap();
+            let off = max_abs_diff(got[0].floats().unwrap(), want);
+            assert!(off < 1e-6, "width {width} is off by {off:e}");
+        }
+    }
+}
+
+#[test]
+fn join_bounds() {
+    use tessera_graph::DimName::Hidden;
+    use tessera_graph::TensorType;
+    use tessera_lower::Shape;
+    use tessera_trace::Port;
+    let metal = Platform {
+        backend: "metal".into(),
+        arch: "apple9".into(),
+        name: "Apple M4 Pro".into(),
+        ..Platform::assumed(Limits::assumed())
+    };
+    let dev = Device::guess(&host()).on(metal);
+    let build = |rows: u64, width: u64| {
+        let m = Model::new(vec![Dim::bounded(Rows, rows), Dim::fixed(Hidden, width)]);
+        let port = || Port {
+            role: Role::Logits,
+            ty: TensorType::new([Rows, Hidden], DType::F32),
+        };
+        let [x, y] = m.entry(EntryKind::Forward, [port(), port()]);
+        m.finish([(Role::Logits, &x.concat(&y))])
+    };
+    for (rows, width, want_threads) in [
+        (2u64, 0u64, 0usize),
+        (1u64, 2_147_483_648u64, 1_073_741_824usize),
+        (32_769, 65_536, 1_073_774_592),
+    ] {
+        let g = build(rows, width);
+        let plan = lower(&g, 0, &[(Rows, rows)], &dev).unwrap();
+        let step = plan
+            .steps
+            .iter()
+            .find(|s| s.kernel.name() == "join")
+            .unwrap();
+        let launch = &step.launches()[0];
+        assert_eq!(launch.shape, Shape::Line(want_threads));
+        assert!(want_threads <= u32::MAX as usize);
+        assert_eq!(launch.args[3].u32(), Some(width as u32));
+        assert_eq!(launch.args[4].u32(), Some(width as u32));
+        let want_rows = if width == 0 { 0 } else { rows as u32 };
+        assert_eq!(launch.args[5].u32(), Some(want_rows));
+        assert_eq!(want_threads * 4, step.write.len);
+        if width == 0 {
+            let empty = Tensor::f32(vec![rows as usize, 0], vec![]);
+            let host_plan = lower(&g, 0, &[(Rows, rows)], &Device::guess(&host())).unwrap();
+            let mut runner = open(host_plan, &host()).unwrap();
+            let got = runner.run(&[empty.view(), empty.view()]).unwrap();
+            assert_eq!(got[0].shape, [rows as usize, 0]);
+        }
+    }
+    for (rows, width) in [(1u64, 4_294_967_296u64), (32_769, 65_535)] {
+        assert!(
+            lower(&build(rows, width), 0, &[(Rows, rows)], &dev).is_err(),
+            "expected join to reject {rows}x({width}+{width})"
+        );
+    }
+}
