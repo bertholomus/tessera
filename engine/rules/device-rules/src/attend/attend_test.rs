@@ -222,6 +222,193 @@ fn mla_attend_knobs() {
 }
 
 #[test]
+fn mla_fp8_opt() {
+    use tessera_graph::DimName::Ffn;
+    let mut g = ring_graph(32, 1, MLA_WIDTH as u64, true);
+    g.dims.push(Dim::fixed(Ffn, MLA_LATENT as u64));
+    let attend = g.entries[0].outputs[0].node;
+    let sliced = NodeId(g.nodes.len() as u32);
+    g.nodes.push(Node {
+        op: Op::View(View::Slice {
+            axis: 2,
+            start: 0.into(),
+            len: (MLA_LATENT as u64).into(),
+        }),
+        args: vec![attend],
+        ty: TensorType::new([Rows, Heads, Ffn], DType::F32),
+        numerics: None,
+    });
+    g.entries[0].outputs[0].node = sliced;
+    let base_dev = Device::default().pinned(Pins::default().kept(FP8_FORM));
+    let mut opt_dev = base_dev.clone();
+    opt_dev.knobs.parse("fast_mla_attend:fp8_q=1").unwrap();
+
+    let t_def = ring_tree(&g, &base_dev, 4);
+    let d_def = check_mla(&t_def, t_def.outputs[0].0).unwrap().unwrap();
+    let Source::Fixed { entry, .. } = d_def[0].kernel.source() else {
+        panic!("expected fixed source");
+    };
+    assert_eq!(entry, "tessera_mla_attend_512_fp8");
+
+    let t_opt = ring_tree(&g, &opt_dev, 4);
+    let d_opt = check_mla(&t_opt, t_opt.outputs[0].0).unwrap().unwrap();
+    let Source::Fixed { entry, .. } = d_opt[0].kernel.source() else {
+        panic!("expected fixed source");
+    };
+    assert_eq!(entry, MLA_FP8_V512_ENTRY);
+
+    // Nonuniform Q (+8.25/-8.0) needs default F16 Q precision.
+    let f16_round = |x: f32| -> f32 { f32::from_bits(x.to_bits() & !0x1FFF) };
+    let mut dot_ref = 0.0f32;
+    let mut dot_f16 = 0.0f32;
+    for i in 0..64 {
+        let q = if i % 2 == 1 { -8.0f32 } else { 8.25f32 };
+        dot_ref += q * 8.0;
+        dot_f16 += f16_round(q) * 8.0;
+    }
+    let p_ref = (-dot_ref / 24.0).exp();
+    let p_f16 = (-dot_f16 / 24.0).exp();
+    let out_ref = (1.0 - p_ref) / (1.0 + p_ref);
+    let out_f16 = (1.0 - p_f16) / (1.0 + p_f16);
+    assert!((out_ref - out_f16).abs() < 1e-4);
+    assert!(out_f16 > 0.85);
+}
+
+#[test]
+fn indexer_knobs() {
+    let mut g = Graph::new(vec![
+        Dim::bounded(Seqs, 2),
+        Dim::bounded(Rows, 8),
+        Dim::bounded(Context, 4096),
+        Dim::fixed(Heads, 32),
+        Dim::fixed(KvHeads, 1),
+        Dim::fixed(HeadDim, 128),
+    ]);
+    let q_ty = TensorType::new([Rows, Heads, HeadDim], DType::F32);
+    let k_in_ty = TensorType::new([Rows, HeadDim], DType::F32);
+    let kept_ty = TensorType::new([Seqs, Context, HeadDim], DType::F32);
+    let w_ty = TensorType::new([Rows, KvHeads, Heads], DType::F32);
+    let ids_ty = TensorType::new([Rows], DType::U32);
+    let push = |g: &mut Graph, op: Op, args: Vec<NodeId>, ty: TensorType| -> NodeId {
+        let id = NodeId(g.nodes.len() as u32);
+        g.nodes.push(Node {
+            op,
+            args,
+            ty,
+            numerics: None,
+        });
+        id
+    };
+    let inp = |port| Op::Input { entry: 0, port };
+    let q = push(&mut g, inp(0), vec![], q_ty.clone());
+    let k_in = push(&mut g, inp(1), vec![], k_in_ty.clone());
+    let w = push(&mut g, inp(2), vec![], w_ty.clone());
+    let slots = push(&mut g, inp(3), vec![], ids_ty.clone());
+    let pos = push(&mut g, inp(4), vec![], ids_ty.clone());
+    g.kept.push(kept_ty.clone());
+    let k_app = push(&mut g, Op::Append(0), vec![k_in, slots, pos], kept_ty);
+    let k_gath = push(
+        &mut g,
+        Op::Select(Select::Gather),
+        vec![k_app, slots],
+        TensorType::new([Rows, Context, HeadDim], DType::F32),
+    );
+    let hits = push(
+        &mut g,
+        Op::Matmul,
+        vec![q, k_gath],
+        TensorType::new([Rows, Heads, Context], DType::F32),
+    );
+    let relu = push(
+        &mut g,
+        Op::Row(tessera_graph::Row(vec![Stage::Act(Act::Relu)])),
+        vec![hits],
+        TensorType::new([Rows, Heads, Context], DType::F32),
+    );
+    let perm = push(
+        &mut g,
+        Op::View(View::Permute(vec![0, 2, 1])),
+        vec![relu],
+        TensorType::new([Rows, Context, Heads], DType::F32),
+    );
+    let scored = push(
+        &mut g,
+        Op::Matmul,
+        vec![perm, w],
+        TensorType::new([Rows, Context], DType::F32),
+    );
+    let out = push(
+        &mut g,
+        Op::Row(tessera_graph::Row(vec![Stage::Causal])),
+        vec![scored, pos],
+        TensorType::new([Rows, Context], DType::F32),
+    );
+    g.entries.push(Entry {
+        kind: EntryKind::Step,
+        inputs: vec![
+            Port {
+                role: Role::Tokens,
+                ty: q_ty,
+            },
+            Port {
+                role: Role::Tokens,
+                ty: k_in_ty,
+            },
+            Port {
+                role: Role::Tokens,
+                ty: w_ty,
+            },
+            Port {
+                role: Role::Slots,
+                ty: ids_ty.clone(),
+            },
+            Port {
+                role: Role::Positions,
+                ty: ids_ty,
+            },
+        ],
+        outputs: vec![Output {
+            role: Role::Logits,
+            node: out,
+        }],
+    });
+    let base_dev = Device::default().pinned(Pins::default().kept(FP8_FORM));
+    let mut opt_dev = base_dev.clone();
+    opt_dev.knobs.parse("fast_indexer:fp8_q=1").unwrap();
+    opt_dev.knobs.parse("fast_indexer:min_blocks=2").unwrap();
+    opt_dev.knobs.parse("fast_indexer:qt_min_blocks=3").unwrap();
+    for (rows, def_entry, opt_entry, macro_def) in [
+        (
+            1,
+            "tessera_indexer_fp8",
+            "tessera_indexer_mx8",
+            "#define IDX_MIN_BLOCKS 2",
+        ),
+        (
+            8,
+            "tessera_indexer_qt_fp8",
+            "tessera_indexer_qt_mx8",
+            "#define IDX_QT_MIN_BLOCKS 3",
+        ),
+    ] {
+        let t_def = ring_tree(&g, &base_dev, rows);
+        let d_def = check_indexer(&t_def, t_def.outputs[0].0).unwrap().unwrap();
+        let Source::Fixed { entry, .. } = d_def[0].kernel.source() else {
+            panic!("expected fixed source");
+        };
+        assert_eq!(entry, def_entry);
+
+        let t_opt = ring_tree(&g, &opt_dev, rows);
+        let d_opt = check_indexer(&t_opt, t_opt.outputs[0].0).unwrap().unwrap();
+        let Source::Fixed { entry, text } = d_opt[0].kernel.source() else {
+            panic!("expected fixed source");
+        };
+        assert_eq!(entry, opt_entry);
+        assert!(text[tessera_lower::Backend::Cuda].contains(macro_def));
+    }
+}
+
+#[test]
 fn kernel_flattens() {
     let options = tessera_device::Options::plain(tessera_device::Backend::Cuda);
     let flat = tessera_device::flatten("mla.cu", KERNEL, &|_| None, &options).unwrap();
@@ -230,7 +417,10 @@ fn kernel_flattens() {
         "GQA_DEF(tessera_gqa_attend_bf16,",
         "GQA_DEF(tessera_gqa_attend_f32,",
         "tessera_gqa_reduce(",
+        "tessera_mla_attend_fp8_v512(",
         "tessera_indexer_fp8",
+        "tessera_indexer_mx8(",
+        "tessera_indexer_qt_mx8(",
         "tessera_indexer_bf16",
         "tessera_indexer_f32",
     ] {
