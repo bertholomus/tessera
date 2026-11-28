@@ -208,11 +208,15 @@ impl Cover<'_> {
                     continue;
                 };
                 proposed = true;
-                if !drafts.iter().all(|d| fits(d, kind)) {
+                let fitting: Vec<Vec<Draft>> = ways(drafts)
+                    .into_iter()
+                    .filter(|w| w.iter().all(|d| fits(d, kind)))
+                    .collect();
+                if fitting.is_empty() {
                     continue;
                 }
                 offered.push(rule.name);
-                for drafts in ways(drafts) {
+                for drafts in fitting {
                     seen += 1;
                     if skip.contains(&seen) {
                         continue;
@@ -408,7 +412,7 @@ impl Cover<'_> {
             let runs = |d: &Draft| {
                 fits(d, kind) && d.kernel.needs().fits(platform) && grid_mismatch(d, kind).is_none()
             };
-            if drafts.iter().all(runs) {
+            if ways(drafts).into_iter().any(|w| w.iter().all(runs)) {
                 return true;
             }
         }
