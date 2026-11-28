@@ -23,7 +23,9 @@ jobs:
   commits:
     # No Co-Authored-By lines crediting AI tools.
     if: github.event.pull_request.draft != true
-    runs-on: orble-1
+    # An orble runner for this org's branches. A fork's code runs on
+    # a hosted runner instead.
+    runs-on: ${{ (github.event.pull_request == null || github.event.pull_request.head.repo.owner.login == 'kindlingai') && 'orble-1' || 'ubuntu-slim' }}
     permissions:
       contents: read
       actions: write
@@ -45,7 +47,9 @@ jobs:
   # job here would skip every job that needs `changes`.
   tiers:
     if: github.event.pull_request.draft != true
-    runs-on: orble-1
+    # An orble runner for this org's branches. A fork's code runs on
+    # a hosted runner instead.
+    runs-on: ${{ (github.event.pull_request == null || github.event.pull_request.head.repo.owner.login == 'kindlingai') && 'orble-1' || 'ubuntu-slim' }}
     steps:
       - if: github.event_name == 'merge_group'
         uses: actions/checkout@v4
@@ -61,7 +65,9 @@ jobs:
     # the tree its pull request already passed.
     needs: tiers
     if: ${{ !cancelled() && needs.tiers.result != 'failure' && github.event.pull_request.draft != true }}
-    runs-on: orble-1
+    # An orble runner for this org's branches. A fork's code runs on
+    # a hosted runner instead.
+    runs-on: ${{ (github.event.pull_request == null || github.event.pull_request.head.repo.owner.login == 'kindlingai') && 'orble-1' || 'ubuntu-slim' }}
     outputs:
       build: ${{ steps.reuse.outputs.build }}
       reuse: ${{ steps.reuse.outputs.reuse }}
@@ -466,7 +472,9 @@ jobs:
     # One PR comment for lint, similarity, style and tests (stickler).
     if: always() && github.event_name == 'pull_request' && github.event.pull_request.draft != true
     needs: [lint, linux, similarity, style]
-    runs-on: orble-1
+    # An orble runner for this org's branches. A fork's code runs on
+    # a hosted runner instead.
+    runs-on: ${{ (github.event.pull_request == null || github.event.pull_request.head.repo.owner.login == 'kindlingai') && 'orble-1' || 'ubuntu-slim' }}
     permissions:
       contents: read
       pull-requests: write
@@ -630,8 +638,9 @@ jobs:
     if: always() && github.event.pull_request.draft != true
     needs: [tiers, changes, commits, lint, linux, features, grammar, macos, arm64, similarity, platforms, docker, style]
     # An orble runner, so success does not wait for one of the hosted
-    # runners that the build jobs fill.
-    runs-on: orble-1
+    # runners that the build jobs fill. A fork's code runs on a hosted
+    # runner instead.
+    runs-on: ${{ (github.event.pull_request == null || github.event.pull_request.head.repo.owner.login == 'kindlingai') && 'orble-1' || 'ubuntu-slim' }}
     steps:
       # Full history without file contents, for merge bases. Test
       # merges against ranked PRs fetch the contents they read.
