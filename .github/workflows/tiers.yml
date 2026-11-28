@@ -31,7 +31,7 @@ jobs:
       (github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.triggering_actor.login != 'github-actions[bot]' &&
       !(github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion == 'success'))
-    runs-on: ubuntu-slim
+    runs-on: orble-1
     outputs:
       rerun: ${{ steps.scope.outputs.rerun }}
     steps:
