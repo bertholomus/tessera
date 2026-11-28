@@ -60,3 +60,106 @@ fn dots_match_sums() {
         }
     }
 }
+
+#[test]
+fn attend_matches_reference() {
+    use crate::attend::{Query, Rows, attend_f32};
+
+    type Case<'a> = (usize, usize, usize, usize, &'a [u32]);
+    let cases: &[Case<'_>] = &[
+        (13, 21, 0, 11, &[]),
+        (16, 16, 3, 17, &[]),
+        (128, 256, 2, 19, &[]),
+        (13, 13, 5, 5, &[]),
+        (13, 19, 2, 15, &[0, 3, 7, 14, 15, 11, 4, 2, 9]),
+        (32, 64, 1, 18, &[1, 5, 9, 13, 17, 2, 6, 10, 14, 3]),
+    ];
+    for &(width, stride, from, to, picks) in cases {
+        let total_keys = to.max(20);
+        let q: Vec<f32> = (0..width)
+            .map(|i| ((i * 7) % 13) as f32 * 0.1 - 0.5)
+            .collect();
+        let k: Vec<f32> = (0..total_keys * stride)
+            .map(|i| ((i * 11) % 17) as f32 * 0.07 - 0.4)
+            .collect();
+        let v: Vec<f32> = (0..total_keys * stride)
+            .map(|i| ((i * 5) % 19) as f32 * 0.06 - 0.3)
+            .collect();
+        let ids: Vec<u8> = picks.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let scale = (width as f32).sqrt().recip();
+
+        let keys: Vec<usize> = if picks.is_empty() {
+            (from..to).collect()
+        } else {
+            picks
+                .iter()
+                .map(|&j| j as usize)
+                .filter(|j| (from..to).contains(j))
+                .collect()
+        };
+        let mut scores: Vec<f32> = keys
+            .iter()
+            .map(|&j| {
+                let d: f32 = (0..width).map(|c| q[c] * k[j * stride + c]).sum();
+                d * scale
+            })
+            .collect();
+        let top = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut denom = 0.0f32;
+        for s in &mut scores {
+            *s = (*s - top).exp();
+            denom += *s;
+        }
+        let mut want = vec![0.0f32; width];
+        for (&j, &p) in keys.iter().zip(&scores) {
+            for c in 0..width {
+                want[c] += (p / denom) * v[j * stride + c];
+            }
+        }
+
+        let qb: Vec<u8> = q.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let kb: Vec<u8> = k.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let vb: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let query = Query {
+            out_at: 0,
+            q_at: 0,
+            k_at: 0,
+            v_at: 0,
+            stride,
+            from,
+            to,
+            width,
+            scale,
+            list_at: 0,
+            picks: picks.len(),
+        };
+        // Check both aligned and unaligned byte slices.
+        for pad in [0usize, 1] {
+            let mut ob = vec![0u8; pad + width * 4];
+            let mut qp = vec![0u8; pad];
+            qp.extend_from_slice(&qb);
+            let mut kp = vec![0u8; pad];
+            kp.extend_from_slice(&kb);
+            let mut vp = vec![0u8; pad];
+            vp.extend_from_slice(&vb);
+            attend_f32(
+                Rows {
+                    out: &mut ob[pad..],
+                    q: &qp[pad..],
+                    k: &kp[pad..],
+                    v: &vp[pad..],
+                    ids: &ids,
+                },
+                &query,
+            );
+            for (c, &expected) in want.iter().enumerate() {
+                let at = pad + c * 4;
+                let got = f32::from_le_bytes(ob[at..at + 4].try_into().unwrap());
+                assert!(
+                    (got - expected).abs() < 1e-5,
+                    "w={width} pad={pad} c={c}: {got} vs {expected}"
+                );
+            }
+        }
+    }
+}
