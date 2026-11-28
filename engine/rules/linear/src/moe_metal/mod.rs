@@ -4,9 +4,7 @@ use tessera_graph::Order;
 use tessera_lower::Backend;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::sites::{Matmul, Picked};
-use tessera_lower::{
-    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree,
-};
+use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Step, T, Tree};
 
 const THREADS: usize = 128;
 const COLS_PER_TG: usize = 16;
@@ -34,13 +32,6 @@ fn lookup(form: &str) -> Option<(&'static str, bool)> {
         .map(|(_, entry, block)| (*entry, *block))
 }
 
-fn fixed(entry: &'static str) -> Source {
-    Source::Fixed {
-        text: ByBackend([SOURCE, "", ""]),
-        entry,
-    }
-}
-
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = self.form.suffixed("moe_metal"),
@@ -48,10 +39,10 @@ fn fixed(entry: &'static str) -> Source {
     work = self.rows * self.n * self.k,
     guess = GUESS,
     accepts = moe_accepts,
-    emits = f32_only,
+    emits = crate::f32_only,
     needs = moe_needs(),
     order = Order::PerConfig,
-    source = fixed(self.entry),
+    source = crate::metal_fixed(SOURCE, self.entry),
     launches = moe_launches,
     load = moe_load,
 )]
@@ -66,10 +57,6 @@ struct MetalMoe {
     first: usize,
     form: &'static dyn Stored,
     entry: &'static str,
-}
-
-fn f32_only(_: &MetalMoe, form: &dyn Stored) -> bool {
-    form.name() == "f32"
 }
 
 fn moe_accepts(k: &MetalMoe, input: usize, form: &dyn Stored) -> bool {
