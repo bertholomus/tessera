@@ -61,7 +61,7 @@ jobs:
     # the tree its pull request already passed.
     needs: tiers
     if: ${{ !cancelled() && needs.tiers.result != 'failure' && github.event.pull_request.draft != true }}
-    runs-on: ubuntu-slim
+    runs-on: orble-1
     outputs:
       build: ${{ steps.reuse.outputs.build }}
       reuse: ${{ steps.reuse.outputs.reuse }}
