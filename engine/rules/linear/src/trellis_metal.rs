@@ -6,8 +6,7 @@ use tessera_lower::Backend;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::sites::Coded;
 use tessera_lower::{
-    Arg, ByBackend, Draft, Kernel, Knobs, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree,
-    knob,
+    Arg, Draft, Kernel, Knobs, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree, knob,
 };
 use tessera_mem::trellis::{parse_form, parse_mix_form};
 
@@ -55,10 +54,7 @@ fn split_k(knobs: &Knobs, m: usize, n: usize, k: usize) -> usize {
 }
 
 fn fixed(entry: &'static str) -> Source {
-    Source::Fixed {
-        text: ByBackend([SOURCE, "", ""]),
-        entry,
-    }
+    crate::metal_fixed(SOURCE, entry)
 }
 
 fn tile_rows(m: usize, mid_rows: usize) -> usize {
@@ -131,7 +127,7 @@ fn metal_needs(t: &TrellisMetal) -> Needs {
     work = self.shape[0] * self.shape[1] * self.shape[2],
     guess = GUESS,
     accepts = accepts,
-    emits = f32_only,
+    emits = crate::f32_only,
     needs = metal_needs(self),
     order = Order::PerConfig,
     source = fixed(entry(self)),
@@ -149,10 +145,6 @@ struct TrellisMetal {
     book: u32,
     turned: bool,
     form: &'static dyn Stored,
-}
-
-fn f32_only<K>(_: &K, form: &dyn Stored) -> bool {
-    form.name() == "f32"
 }
 
 fn accepts(k: &TrellisMetal, input: usize, form: &dyn Stored) -> bool {
@@ -204,7 +196,7 @@ fn launches(t: &TrellisMetal, step: &Step) -> Vec<Launch> {
     work = self.shape[0] * self.shape[1] * self.splits,
     guess = GUESS,
     accepts = reduce_accepts,
-    emits = f32_only,
+    emits = crate::f32_only,
     needs = reduce_needs(),
     order = Order::PerConfig,
     source = fixed("tm_reduce"),
@@ -312,7 +304,7 @@ tessera_lower::rule!("trellis_metal", propose, why = why, lacks = LACKS);
     work = self.site.rows * self.site.n * self.site.k,
     guess = GUESS,
     accepts = self.site.accepts(input, form),
-    emits = f32_only,
+    emits = crate::f32_only,
     needs = picked_needs(),
     order = Order::PerConfig,
     source = fixed(picked_entry(self)),
@@ -371,7 +363,7 @@ fn picked_launches(p: &PickedTrellisMetal, step: &Step) -> Vec<Launch> {
     work = self.rows + self.count,
     guess = GUESS,
     accepts = pick_group_accepts,
-    emits = f32_only,
+    emits = crate::f32_only,
     needs = pick_group_needs(),
     order = Order::PerConfig,
     source = fixed("tm_pick_group"),
@@ -444,7 +436,7 @@ fn pick_group_launches(g: &MetalPickGroup, step: &Step) -> Vec<Launch> {
     work = self.site.rows * self.site.n * self.site.k,
     guess = GUESS,
     accepts = picked_pf_accepts,
-    emits = f32_only,
+    emits = crate::f32_only,
     needs = picked_pf_needs(self),
     order = Order::PerConfig,
     source = fixed(picked_pf_entry(self)),

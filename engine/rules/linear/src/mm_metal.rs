@@ -3,9 +3,7 @@
 use tessera_graph::Order;
 use tessera_lower::Backend;
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{
-    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree, sites,
-};
+use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Step, T, Tree, sites};
 
 const THREADS_32: usize = 128;
 const THREADS_64: usize = 256;
@@ -70,22 +68,15 @@ const ENTRIES: &[EntrySet] = &[
     },
 ];
 
-fn fixed(entry: &'static str) -> Source {
-    Source::Fixed {
-        text: ByBackend([SOURCE, "", ""]),
-        entry,
-    }
-}
-
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = "mm_metal",
-    source = fixed(self.entry),
+    source = crate::metal_fixed(SOURCE, self.entry),
     order = Order::PerConfig,
     sizes = [self.m, self.n, self.k],
     work = self.m * self.n * self.k,
     guess = GUESS,
-    emits = f32_only,
+    emits = crate::f32_only,
     accepts = mm_accepts,
     needs = mm_needs(self),
     launches = mm_launches,
@@ -98,10 +89,6 @@ struct MetalMm {
     bm: usize,
     form: &'static dyn Stored,
     entry: &'static str,
-}
-
-fn f32_only(_: &MetalMm, form: &dyn Stored) -> bool {
-    form.name() == "f32"
 }
 
 fn mm_accepts(k: &MetalMm, input: usize, form: &dyn Stored) -> bool {
