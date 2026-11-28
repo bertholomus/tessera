@@ -374,14 +374,16 @@ impl Gguf {
         }
         const CHUNK: usize = 64 << 10;
         let (mut ba, mut bb) = (vec![0u8; CHUNK], vec![0u8; CHUNK]);
-        let mut file = &self.file;
         let mut off = 0usize;
         while off < ea.bytes {
             let n = CHUNK.min(ea.bytes - off);
-            file.seek(SeekFrom::Start(self.data + ea.offset + off as u64))?;
-            file.read_exact(&mut ba[..n]).map_err(format)?;
-            file.seek(SeekFrom::Start(self.data + eb.offset + off as u64))?;
-            file.read_exact(&mut bb[..n]).map_err(format)?;
+            let at = self.data + off as u64;
+            self.file
+                .read_exact_at(&mut ba[..n], at + ea.offset)
+                .map_err(format)?;
+            self.file
+                .read_exact_at(&mut bb[..n], at + eb.offset)
+                .map_err(format)?;
             if ba[..n] != bb[..n] {
                 return Ok(false);
             }
