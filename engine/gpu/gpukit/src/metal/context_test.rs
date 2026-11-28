@@ -52,10 +52,16 @@ kernel void inc(device float* v [[buffer(0)]], uint i [[thread_position_in_grid]
 /// Concurrent compiles share one set of pipelines.
 #[test]
 fn compile_race_free() {
-    if Context::new().is_err() {
+    let Ok(ctx) = Context::new() else {
         eprintln!("skip: no Metal device");
         return;
-    }
+    };
+    let a = ctx.compile_library(SRC).expect("first library compile");
+    let b = ctx.compile_library(SRC).expect("cached library compile");
+    assert!(std::ptr::eq(
+        objc2::rc::Retained::as_ptr(&a),
+        objc2::rc::Retained::as_ptr(&b)
+    ));
     let entries = ["pc_k0", "pc_k1", "pc_k2", "pc_k3"];
     let handles: Vec<_> = (0..8)
         .map(|_| {

@@ -284,20 +284,30 @@ kernel void p(device bfloat *a [[buffer(0)]]) {
         &self,
         source: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, Error> {
-        let ns_source = NSString::from_str(&expand(source, &[]));
-        self.0
+        let expanded = expand(source, &[]);
+        if let Some(lib) = self.0.pipelines.get_library(&expanded) {
+            return Ok(lib);
+        }
+        let ns_source = NSString::from_str(&expanded);
+        let lib = self
+            .0
             .device
             .newLibraryWithSource_options_error(&ns_source, None)
-            .map_err(compile_error)
+            .map_err(compile_error)?;
+        self.0.pipelines.insert_library(expanded, lib.clone());
+        Ok(lib)
     }
 
     /// Compile one kernel, cached by entry and text.
     pub fn compile_kernel(&self, source: &str, entry: &str) -> Result<ComputePipeline, Error> {
-        let library = self.compile_library(source)?;
         // Two texts may share an entry. The label holds both.
         let mut hasher = DefaultHasher::new();
         source.hash(&mut hasher);
         let label = format!("{entry}#{:016x}", hasher.finish());
+        if let Some(pipeline) = self.0.pipelines.get(&label) {
+            return Ok(ComputePipeline { pipeline });
+        }
+        let library = self.compile_library(source)?;
         self.pipeline(&library, entry, &label)
     }
 
