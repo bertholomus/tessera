@@ -1,6 +1,7 @@
 //! Attention rules for the CPU and GPU. Linking registers them.
 
 mod attend;
+mod attn_metal;
 mod conv;
 mod cpu;
 mod delta;
