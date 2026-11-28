@@ -44,11 +44,12 @@ pub struct Base {
 impl Base {
     /// Empty, with the plan budget `memory` gives on `platform`.
     pub(crate) fn new(memory: Memory, platform: &Platform) -> Self {
-        // A tenth of the device stays spare.
+        // Discrete GPUs keep a tenth spare.
         let budget = match memory {
             Memory::Off => None,
             Memory::Bytes(bytes) => Some(bytes),
             Memory::Device if platform.memory == 0 => None,
+            Memory::Device if platform.integrated => Some(platform.memory),
             Memory::Device => Some(platform.memory - platform.memory / 10),
         };
         Self {
