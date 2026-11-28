@@ -645,7 +645,7 @@ fn find_whole(
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let (sizes, reads) = find_site(tree, at)?;
     let out = sizes.out_len();
-    let mut drafts = Vec::new();
+    let mut drafts = metal::drafts(sizes, &reads, out);
     let fits_warp =
         sizes.dim.is_multiple_of(WIDE as usize) && sizes.dim <= MAX_DIM && sizes.rows <= MAX_WARPS;
     if fits_warp {
@@ -658,3 +658,5 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
 }
 
 tessera_lower::rule!("indexer", propose);
+
+mod metal;
