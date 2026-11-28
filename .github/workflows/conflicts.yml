@@ -25,7 +25,7 @@ concurrency:
 
 jobs:
   notice:
-    runs-on: ubuntu-slim
+    runs-on: orble-1
     steps:
       # Full history without file contents, for merge bases. Test
       # merges fetch the contents they read.
