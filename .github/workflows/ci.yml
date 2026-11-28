@@ -45,7 +45,7 @@ jobs:
   # job here would skip every job that needs `changes`.
   tiers:
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-slim
+    runs-on: orble-1
     steps:
       - if: github.event_name == 'merge_group'
         uses: actions/checkout@v4
