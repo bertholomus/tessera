@@ -4,7 +4,7 @@ use tessera_graph::Order;
 use tessera_lower::Backend;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
-    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree, sites,
+    Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree, sites,
 };
 
 const THREADS_32: usize = 128;
@@ -71,10 +71,7 @@ const ENTRIES: &[EntrySet] = &[
 ];
 
 fn fixed(entry: &'static str) -> Source {
-    Source::Fixed {
-        text: ByBackend([SOURCE, "", ""]),
-        entry,
-    }
+    crate::metal_fixed(SOURCE, entry)
 }
 
 #[derive(Clone, Copy, Debug, Kernel)]

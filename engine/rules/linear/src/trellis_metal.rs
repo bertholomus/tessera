@@ -6,8 +6,7 @@ use tessera_lower::Backend;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::sites::Coded;
 use tessera_lower::{
-    Arg, ByBackend, Draft, Kernel, Knobs, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree,
-    knob,
+    Arg, Draft, Kernel, Knobs, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree, knob,
 };
 use tessera_mem::trellis::{parse_form, parse_mix_form};
 
@@ -55,10 +54,7 @@ fn split_k(knobs: &Knobs, m: usize, n: usize, k: usize) -> usize {
 }
 
 fn fixed(entry: &'static str) -> Source {
-    Source::Fixed {
-        text: ByBackend([SOURCE, "", ""]),
-        entry,
-    }
+    crate::metal_fixed(SOURCE, entry)
 }
 
 fn tile_rows(m: usize, mid_rows: usize) -> usize {

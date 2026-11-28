@@ -3,9 +3,7 @@
 use tessera_graph::{Op, Order};
 use tessera_lower::Backend;
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{
-    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Term, Tree,
-};
+use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Term, Tree};
 
 const THREADS: usize = 128;
 const COLS_PER_TG: usize = 16;
@@ -44,11 +42,8 @@ fn entry(form: &str, m: usize) -> Option<&'static str> {
     Some(names[idx])
 }
 
-fn fixed(name: &'static str) -> Source {
-    Source::Fixed {
-        text: ByBackend([SOURCE, "", ""]),
-        entry: name,
-    }
+fn fixed(entry: &'static str) -> Source {
+    crate::metal_fixed(SOURCE, entry)
 }
 
 #[derive(Clone, Copy, Debug, Kernel)]
