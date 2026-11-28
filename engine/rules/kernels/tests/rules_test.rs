@@ -209,6 +209,128 @@ fn tables_keep_forms() {
 }
 
 #[test]
+fn wide_kept_join_matches() {
+    use tessera_graph::DimName::{Context, HeadDim};
+    use tessera_graph::{Size, TensorType};
+    use tessera_interp::{Store, run_kept};
+    use tessera_lower::form::{FP8_FORM, Load};
+    use tessera_lower::kept::{self, Layout};
+    use tessera_trace::Port;
+    let right_dim = tessera_graph::DimName::named("Right");
+    let build = |left: u64, right: u64, both: bool| {
+        let m = Model::new(vec![
+            Dim::bounded(Seqs, 2),
+            Dim::bounded(Rows, 64),
+            Dim::bounded(Context, 32),
+            Dim::fixed(HeadDim, left),
+            Dim {
+                name: right_dim,
+                size: Size::Fixed(right),
+            },
+        ]);
+        let b_ty = if both {
+            TensorType::new([Rows, right_dim], DType::F32)
+        } else {
+            TensorType::new([Seqs, Context, right_dim], DType::F32)
+        };
+        let [a_in, b_in, slots, pos] = m.entry(
+            EntryKind::Step,
+            [
+                Port {
+                    role: Role::Tokens,
+                    ty: TensorType::new([Rows, HeadDim], DType::F32),
+                },
+                Port {
+                    role: Role::Tokens,
+                    ty: b_ty,
+                },
+                Port {
+                    role: Role::Slots,
+                    ty: TensorType::new([Rows], DType::U32),
+                },
+                Port {
+                    role: Role::Positions,
+                    ty: TensorType::new([Rows], DType::U32),
+                },
+            ],
+        );
+        let ka = m.kept(TensorType::new([Seqs, Context, HeadDim], DType::F32));
+        let a = a_in.append(&ka, [&slots, &pos]);
+        let b = if both {
+            let kb = m.kept(TensorType::new([Seqs, Context, right_dim], DType::F32));
+            b_in.append(&kb, [&slots, &pos])
+        } else {
+            b_in
+        };
+        m.finish([(Role::Logits, &a.concat(&b))])
+    };
+    let mut noise = Noise(42);
+    for (left, right, both, expect_x4) in [
+        (16u64, 8u64, true, true),
+        (12, 8, false, true),
+        (7, 5, true, false),
+    ] {
+        let g = build(left, right, both);
+        let a = Tensor::f32(
+            vec![64, left as usize],
+            (0..64 * left as usize).map(|_| noise.draw()).collect(),
+        );
+        let b_shape = if both {
+            vec![64, right as usize]
+        } else {
+            vec![2, 32, right as usize]
+        };
+        let b = Tensor::f32(
+            b_shape,
+            (0..64 * right as usize).map(|_| noise.draw()).collect(),
+        );
+        let slots: Vec<u32> = (0..2u32).flat_map(|s| vec![s; 32]).collect();
+        let pos: Vec<u32> = (0..2).flat_map(|_| 0..32u32).collect();
+        let inputs = [
+            a,
+            b,
+            Tensor::u32(vec![64], slots),
+            Tensor::u32(vec![64], pos),
+        ];
+        let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
+        let want = run_kept(&g, &[], &mut Store::default(), 0, &inputs).unwrap();
+        let sizes = [(Seqs, 2), (Rows, 64), (Context, 32)];
+        let cases: [(&'static dyn Load, f32); 3] =
+            [(F32_FORM, 1e-5), (BF16_FORM, 2e-2), (FP8_FORM, 2e-1)];
+        for (form, tol) in cases {
+            for layout in [&kept::Dense as &'static dyn Layout, &kept::PAGED16] {
+                for settings in runs() {
+                    let pins = Pins::default().kept(form).activations(form).outputs(form);
+                    let mut dev = Device::guess(&settings).pinned(pins);
+                    dev.kept = layout;
+                    let plan = lower(&g, 0, &sizes, &dev).unwrap();
+                    let kj = plan
+                        .steps
+                        .iter()
+                        .find(|s| s.kernel.name() == "kept_join")
+                        .unwrap();
+                    let tessera_lower::Source::Made(body) = kj.kernel.source() else {
+                        panic!("expected Made source");
+                    };
+                    assert_eq!(body.entry.contains("_x4_"), expect_x4, "{}", body.entry);
+                    let mut runner = open(plan.clone(), &settings).unwrap();
+                    if let Some(tbl) = plan.table {
+                        let rev: Vec<u8> = (0..tbl.len as u32)
+                            .rev()
+                            .flat_map(u32::to_le_bytes)
+                            .collect();
+                        runner.held_mut().upload(tbl, &rev).unwrap();
+                    }
+                    let got = runner.run(&views).unwrap();
+                    let diff = max_abs_diff(got[0].floats().unwrap(), want[0].floats().unwrap());
+                    assert!(diff < tol, "{left}+{right} {}: {diff:e}", body.entry);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn stage_rules() {
     let rules = rules();
     for s in tessera_graph::STAGES {
