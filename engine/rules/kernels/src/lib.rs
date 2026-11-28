@@ -16,6 +16,7 @@ mod neighbours;
 mod rms_norm;
 mod rope;
 mod softmax;
+mod softmax_lanes;
 mod take;
 mod view;
 
