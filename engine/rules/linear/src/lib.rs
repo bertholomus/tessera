@@ -6,6 +6,7 @@ mod mm_metal;
 mod picked;
 mod product;
 mod stacked;
+mod stacked_fused;
 mod thin;
 mod tiled;
 mod trellis_metal;
