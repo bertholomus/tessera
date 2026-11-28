@@ -664,6 +664,16 @@ f_fn float f_e4m3(u32 w, u32 l) {{
             Bf16Pair = fn bf16_pair(f32, f32) -> u32 {
                 device: {
                     let soft = pair_bits("as_type<u32>");
+                    // Metal 3.1+ packs bf16 pairs natively via bfloat2.
+                    let metal = format!(
+                        "#if __METAL_VERSION__ >= 310
+f_fn u32 f_pair_bf16(float hi, float lo) {{
+    return as_type<u32>(bfloat2((bfloat)lo, (bfloat)hi));
+}}
+#else
+{soft}#endif
+"
+                    );
                     // Ampere on rounds a pair in one instruction.
                     let cuda = format!(
                         "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -679,7 +689,7 @@ f_fn u32 f_pair_bf16(float hi, float lo) {{
                     );
                     let call = "#define f_bf16_pair(hi, lo) f_pair_bf16(hi, lo)\n";
                     let cuda = hip(&pair_bits("__float_as_uint"), &cuda);
-                    spelled(&format!("{soft}{call}"), &format!("{cuda}{call}"))
+                    spelled(&format!("{metal}{call}"), &format!("{cuda}{call}"))
                 },
                 text: |p, args| p.spell("f_bf16_pair", args),
                 wgsl: None,
